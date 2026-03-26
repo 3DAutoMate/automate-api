@@ -28,7 +28,7 @@ app.MapGet("/debug-db", () =>
         hasDatabase = !string.IsNullOrWhiteSpace(db),
         hasUser = !string.IsNullOrWhiteSpace(user),
         hasPassword = !string.IsNullOrWhiteSpace(password),
-        hostPreview = string.IsNullOrWhiteSpace(host) ? null : host
+        hostPreview = host
     });
 });
 
