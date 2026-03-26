@@ -14,6 +14,15 @@ app.MapGet("/", () => Results.Ok("3D AutoMate API is running"));
 
 app.MapPost("/jobs/test-upload", (Dictionary<string, object> payload) =>
 {
+    string json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+    {
+        WriteIndented = true
+    });
+
+    Console.WriteLine("===== PAYLOAD RECEIVED =====");
+    Console.WriteLine(json);
+    Console.WriteLine("============================");
+
     return Results.Ok(new
     {
         success = true,
