@@ -22,7 +22,7 @@ app.MapGet("/debug-db", () =>
         hasDatabasePublicUrl = !string.IsNullOrWhiteSpace(raw),
         databasePublicUrlPreview = string.IsNullOrWhiteSpace(raw)
             ? null
-            : raw.Substring(0, Math.Min(raw.Length, 80))
+            : raw.Substring(0, Math.Min(raw.Length, 100))
     });
 });
 
@@ -30,11 +30,20 @@ app.MapPost("/jobs/test-upload", async (Dictionary<string, object> payload) =>
 {
     try
     {
-        var connectionString = Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL");
+        var raw = Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL");
 
-        if (string.IsNullOrWhiteSpace(connectionString))
+        if (string.IsNullOrWhiteSpace(raw))
         {
             return Results.Problem("DATABASE_PUBLIC_URL is missing.");
+        }
+
+        var connectionString = raw;
+
+        if (!connectionString.Contains("SSL Mode=", StringComparison.OrdinalIgnoreCase))
+        {
+            connectionString += connectionString.Contains('?')
+                ? "&sslmode=require"
+                : "?sslmode=require";
         }
 
         await using var conn = new NpgsqlConnection(connectionString);
