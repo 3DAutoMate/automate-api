@@ -11,39 +11,60 @@ var app = builder.Build();
 app.UseSwagger();
 app.UseSwaggerUI();
 
-app.MapGet("/", () => "3D AutoMate API is running");
+app.MapGet("/", () => Results.Ok("3D AutoMate API is running"));
 
-app.MapPost("/jobs/test-upload", async (HttpRequest request) =>
+app.MapPost("/jobs/test-upload", async (Dictionary<string, object> payload) =>
 {
-    using var reader = new StreamReader(request.Body);
-    var body = await reader.ReadToEndAsync();
+    try
+    {
+        var raw = Environment.GetEnvironmentVariable("DATABASE_URL");
 
-    var raw = Environment.GetEnvironmentVariable("DATABASE_URL");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return Results.Problem("DATABASE_URL is missing.");
+        }
 
-    var uri = new Uri(raw!);
-    var userInfo = uri.UserInfo.Split(':');
+        var uri = new Uri(raw);
+        var userInfo = uri.UserInfo.Split(':', 2);
 
-    var connectionString =
-        $"Host={uri.Host};" +
-        $"Port={uri.Port};" +
-        $"Username={userInfo[0]};" +
-        $"Password={userInfo[1]};" +
-        $"Database={uri.AbsolutePath.TrimStart('/')};" +
-        $"Ssl Mode=Require;Trust Server Certificate=true;";
+        if (userInfo.Length < 2)
+        {
+            return Results.Problem("DATABASE_URL user info is invalid.");
+        }
 
-    await using var conn = new NpgsqlConnection(connectionString);
-    await conn.OpenAsync();
+        var connectionString =
+            $"Host={uri.Host};" +
+            $"Port={uri.Port};" +
+            $"Username={userInfo[0]};" +
+            $"Password={userInfo[1]};" +
+            $"Database={uri.AbsolutePath.TrimStart('/')};" +
+            $"Ssl Mode=Require;" +
+            $"Trust Server Certificate=true;";
 
-    var cmd = new NpgsqlCommand(
-        "INSERT INTO connector_test_jobs (raw_payload) VALUES (CAST(@p AS jsonb));",
-        conn
-    );
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
 
-    cmd.Parameters.AddWithValue("p", body);
+        var json = JsonSerializer.Serialize(payload);
 
-    await cmd.ExecuteNonQueryAsync();
+        await using var cmd = new NpgsqlCommand(
+            "INSERT INTO connector_test_jobs (raw_payload) VALUES (CAST(@p AS jsonb));",
+            conn
+        );
 
-    return Results.Ok("Inserted");
+        cmd.Parameters.AddWithValue("p", json);
+
+        await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Inserted"
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Server error: {ex.Message}");
+    }
 });
 
 app.Run();
