@@ -15,20 +15,14 @@ app.MapGet("/", () => Results.Ok("3D AutoMate API is running"));
 
 app.MapGet("/debug-db", () =>
 {
-    var host = Environment.GetEnvironmentVariable("PGHOST");
-    var port = Environment.GetEnvironmentVariable("PGPORT");
-    var db = Environment.GetEnvironmentVariable("PGDATABASE");
-    var user = Environment.GetEnvironmentVariable("PGUSER");
-    var password = Environment.GetEnvironmentVariable("PGPASSWORD");
+    var raw = Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL");
 
     return Results.Ok(new
     {
-        hasHost = !string.IsNullOrWhiteSpace(host),
-        hasPort = !string.IsNullOrWhiteSpace(port),
-        hasDatabase = !string.IsNullOrWhiteSpace(db),
-        hasUser = !string.IsNullOrWhiteSpace(user),
-        hasPassword = !string.IsNullOrWhiteSpace(password),
-        hostPreview = host
+        hasDatabasePublicUrl = !string.IsNullOrWhiteSpace(raw),
+        databasePublicUrlPreview = string.IsNullOrWhiteSpace(raw)
+            ? null
+            : raw.Substring(0, Math.Min(raw.Length, 80))
     });
 });
 
@@ -36,29 +30,12 @@ app.MapPost("/jobs/test-upload", async (Dictionary<string, object> payload) =>
 {
     try
     {
-        var host = Environment.GetEnvironmentVariable("PGHOST");
-        var port = Environment.GetEnvironmentVariable("PGPORT");
-        var database = Environment.GetEnvironmentVariable("PGDATABASE");
-        var username = Environment.GetEnvironmentVariable("PGUSER");
-        var password = Environment.GetEnvironmentVariable("PGPASSWORD");
+        var connectionString = Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL");
 
-        if (string.IsNullOrWhiteSpace(host) ||
-            string.IsNullOrWhiteSpace(port) ||
-            string.IsNullOrWhiteSpace(database) ||
-            string.IsNullOrWhiteSpace(username) ||
-            string.IsNullOrWhiteSpace(password))
+        if (string.IsNullOrWhiteSpace(connectionString))
         {
-            return Results.Problem("One or more PG* environment variables are missing.");
+            return Results.Problem("DATABASE_PUBLIC_URL is missing.");
         }
-
-        var connectionString =
-            $"Host={host};" +
-            $"Port={port};" +
-            $"Database={database};" +
-            $"Username={username};" +
-            $"Password={password};" +
-            $"Ssl Mode=Require;" +
-            $"Trust Server Certificate=true;";
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
