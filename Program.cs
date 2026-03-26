@@ -13,6 +13,19 @@ app.UseSwaggerUI();
 
 app.MapGet("/", () => Results.Ok("3D AutoMate API is running"));
 
+app.MapGet("/debug-db", () =>
+{
+    var raw = Environment.GetEnvironmentVariable("DATABASE_URL");
+
+    return Results.Ok(new
+    {
+        hasDatabaseUrl = !string.IsNullOrWhiteSpace(raw),
+        databaseUrlPreview = string.IsNullOrWhiteSpace(raw)
+            ? null
+            : raw.Substring(0, Math.Min(raw.Length, 80))
+    });
+});
+
 app.MapPost("/jobs/test-upload", async (Dictionary<string, object> payload) =>
 {
     try
