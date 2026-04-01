@@ -1,44 +1,56 @@
-using System.Text.Json.Serialization;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Railway usually provides this as an environment variable.
-// Use your actual env var name if different.
+// Railway internal Postgres variables
+var host = builder.Configuration["PGHOST"];
+var port = builder.Configuration["PGPORT"];
+var database = builder.Configuration["PGDATABASE"];
+var username = builder.Configuration["PGUSER"];
+var password = builder.Configuration["PGPASSWORD"];
 
-var rawConnectionString =
-    builder.Configuration.GetConnectionString("Postgres")
-    ?? builder.Configuration["DATABASE_URL"]
-    ?? throw new Exception("Postgres connection string not found.");
-
-string connectionString;
-
-if (rawConnectionString.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
-    rawConnectionString.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+if (string.IsNullOrWhiteSpace(host) ||
+    string.IsNullOrWhiteSpace(port) ||
+    string.IsNullOrWhiteSpace(database) ||
+    string.IsNullOrWhiteSpace(username) ||
+    string.IsNullOrWhiteSpace(password))
 {
-    var databaseUri = new Uri(rawConnectionString);
-    var userInfo = databaseUri.UserInfo.Split(':', 2);
-
-    var username = Uri.UnescapeDataString(userInfo[0]);
-    var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
-
-    connectionString =
-        $"Host={databaseUri.Host};" +
-        $"Port={databaseUri.Port};" +
-        $"Database={databaseUri.AbsolutePath.TrimStart('/')};" +
-        $"Username={username};" +
-        $"Password={password};" +
-        $"SSL Mode=Require;" +
-        $"Trust Server Certificate=true;";
+    throw new Exception("One or more required PG* database environment variables are missing.");
 }
-else
-{
-    connectionString = rawConnectionString;
-}
+
+var connectionString =
+    $"Host={host};" +
+    $"Port={port};" +
+    $"Database={database};" +
+    $"Username={username};" +
+    $"Password={password};" +
+    $"SSL Mode=Require;" +
+    $"Trust Server Certificate=true;";
 
 var app = builder.Build();
 
-app.MapGet("/", () => Results.Ok(new { ok = true, service = "3D AutoMate API" }));
+app.MapGet("/", () => Results.Ok(new
+{
+    ok = true,
+    service = "3D AutoMate API"
+}));
+
+// Keep your old test endpoint if you want
+app.MapPost("/jobs/test-upload", async (HttpContext context) =>
+{
+    using var reader = new StreamReader(context.Request.Body);
+    var body = await reader.ReadToEndAsync();
+
+    Console.WriteLine("===== PAYLOAD RECEIVED =====");
+    Console.WriteLine(body);
+    Console.WriteLine("============================");
+
+    return Results.Ok(new
+    {
+        success = true,
+        message = "Test payload received."
+    });
+});
 
 app.MapPost("/jobs/upsert", async (JobUploadRequest payload) =>
 {
@@ -71,19 +83,7 @@ app.MapPost("/jobs/upsert", async (JobUploadRequest payload) =>
             });
         }
 
-        // Your jobs table requires inspector_id, but your connector currently sends TenantId.
-        // For now, this assumes inspectors.inspector_id = TenantId for your test tenant.
-        // If not, we can add a lookup layer next.
-        if (!Guid.TryParse(payload.TenantId, out var inspectorId))
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "TenantId is not a valid GUID."
-            });
-        }
-
-        if (!Guid.TryParse(payload.Job.JobId, out var jobId))
+        if (!Guid.TryParse(payload.Job.JobId, out Guid jobId))
         {
             return Results.BadRequest(new
             {
@@ -92,19 +92,32 @@ app.MapPost("/jobs/upsert", async (JobUploadRequest payload) =>
             });
         }
 
-        var sourceSystem = payload.SourceSystem ?? "THREED";
-        var jobName = payload.Job.JobName ?? "";
-        var siteAddress = payload.Job.SiteAddress ?? "";
-        var payloadVersion = "2.0";
-        var nowUtc = DateTime.UtcNow;
+        if (!Guid.TryParse(payload.TenantId, out Guid inspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "TenantId is not a valid GUID."
+            });
+        }
 
-        // Adjust these column names if your schema differs.
-        // This version assumes:
-        // jobs(job_id, inspector_id, source_system, job_name, file_number, payload_version,
-        //      last_synced_at, created_at, updated_at)
-        //
-        // file_number is being populated from JobName for now because your current connector
-        // payload does not send a separate file number yet.
+        string sourceSystem = string.IsNullOrWhiteSpace(payload.SourceSystem)
+            ? "THREED"
+            : payload.SourceSystem;
+
+        string jobName = payload.Job.JobName ?? "";
+        string fileNumber = payload.Job.JobName ?? "";
+        string payloadVersion = string.IsNullOrWhiteSpace(payload.Meta?.ConnectorVersion)
+            ? "2.0"
+            : payload.Meta.ConnectorVersion;
+
+        DateTime nowUtc = DateTime.UtcNow;
+
+        Console.WriteLine("===== UPSERT REQUEST =====");
+        Console.WriteLine($"JobId: {jobId}");
+        Console.WriteLine($"InspectorId: {inspectorId}");
+        Console.WriteLine($"JobName: {jobName}");
+        Console.WriteLine("==========================");
 
         const string sql = @"
 INSERT INTO jobs
@@ -133,13 +146,13 @@ VALUES
 )
 ON CONFLICT (job_id)
 DO UPDATE SET
-    inspector_id   = EXCLUDED.inspector_id,
-    source_system  = EXCLUDED.source_system,
-    job_name       = EXCLUDED.job_name,
-    file_number    = EXCLUDED.file_number,
-    payload_version= EXCLUDED.payload_version,
-    last_synced_at = EXCLUDED.last_synced_at,
-    updated_at     = EXCLUDED.updated_at;
+    inspector_id    = EXCLUDED.inspector_id,
+    source_system   = EXCLUDED.source_system,
+    job_name        = EXCLUDED.job_name,
+    file_number     = EXCLUDED.file_number,
+    payload_version = EXCLUDED.payload_version,
+    last_synced_at  = EXCLUDED.last_synced_at,
+    updated_at      = EXCLUDED.updated_at;
 ";
 
         await using var conn = new NpgsqlConnection(connectionString);
@@ -150,13 +163,17 @@ DO UPDATE SET
         cmd.Parameters.AddWithValue("inspector_id", inspectorId);
         cmd.Parameters.AddWithValue("source_system", sourceSystem);
         cmd.Parameters.AddWithValue("job_name", jobName);
-        cmd.Parameters.AddWithValue("file_number", jobName); // temporary mapping
+        cmd.Parameters.AddWithValue("file_number", fileNumber);
         cmd.Parameters.AddWithValue("payload_version", payloadVersion);
         cmd.Parameters.AddWithValue("last_synced_at", nowUtc);
         cmd.Parameters.AddWithValue("created_at", nowUtc);
         cmd.Parameters.AddWithValue("updated_at", nowUtc);
 
-        await cmd.ExecuteNonQueryAsync();
+        int rowsAffected = await cmd.ExecuteNonQueryAsync();
+
+        Console.WriteLine("===== UPSERT SUCCESS =====");
+        Console.WriteLine($"Rows affected: {rowsAffected}");
+        Console.WriteLine("==========================");
 
         return Results.Ok(new
         {
@@ -169,6 +186,10 @@ DO UPDATE SET
     }
     catch (PostgresException pgEx)
     {
+        Console.WriteLine("===== POSTGRES ERROR =====");
+        Console.WriteLine(pgEx.ToString());
+        Console.WriteLine("==========================");
+
         return Results.Problem(
             title: "Database error",
             detail: pgEx.MessageText,
@@ -177,6 +198,10 @@ DO UPDATE SET
     }
     catch (Exception ex)
     {
+        Console.WriteLine("===== SERVER ERROR =====");
+        Console.WriteLine(ex.ToString());
+        Console.WriteLine("========================");
+
         return Results.Problem(
             title: "Server error",
             detail: ex.Message,
@@ -191,11 +216,11 @@ public class JobUploadRequest
 {
     public string SourceSystem { get; set; } = "";
     public string TenantId { get; set; } = "";
-    public JobSection Job { get; set; } = new();
-    public ServicesSection Services { get; set; } = new();
-    public ContactFlat Contact1 { get; set; } = new();
-    public ContactFlat Contact2 { get; set; } = new();
-    public MetaSection Meta { get; set; } = new();
+    public JobSection Job { get; set; } = new JobSection();
+    public ServicesSection Services { get; set; } = new ServicesSection();
+    public ContactFlat Contact1 { get; set; } = new ContactFlat();
+    public ContactFlat Contact2 { get; set; } = new ContactFlat();
+    public MetaSection Meta { get; set; } = new MetaSection();
 }
 
 public class JobSection
