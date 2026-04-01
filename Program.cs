@@ -5,10 +5,36 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Railway usually provides this as an environment variable.
 // Use your actual env var name if different.
-var connectionString =
+
+var rawConnectionString =
     builder.Configuration.GetConnectionString("Postgres")
     ?? builder.Configuration["DATABASE_URL"]
     ?? throw new Exception("Postgres connection string not found.");
+
+string connectionString;
+
+if (rawConnectionString.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+    rawConnectionString.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+{
+    var databaseUri = new Uri(rawConnectionString);
+    var userInfo = databaseUri.UserInfo.Split(':', 2);
+
+    var username = Uri.UnescapeDataString(userInfo[0]);
+    var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+
+    connectionString =
+        $"Host={databaseUri.Host};" +
+        $"Port={databaseUri.Port};" +
+        $"Database={databaseUri.AbsolutePath.TrimStart('/')};" +
+        $"Username={username};" +
+        $"Password={password};" +
+        $"SSL Mode=Require;" +
+        $"Trust Server Certificate=true;";
+}
+else
+{
+    connectionString = rawConnectionString;
+}
 
 var app = builder.Build();
 
