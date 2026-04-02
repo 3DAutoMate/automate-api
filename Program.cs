@@ -63,17 +63,47 @@ app.MapGet("/db-test", async () =>
     try
     {
         await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
+await conn.OpenAsync();
 
-        await using var cmd = new NpgsqlCommand("SELECT NOW();", conn);
-        var result = await cmd.ExecuteScalarAsync();
+// 1. Ensure table exists
+const string createTableSql = @"
+CREATE TABLE IF NOT EXISTS public.jobs
+(
+    job_id uuid PRIMARY KEY,
+    inspector_id uuid NOT NULL,
+    job_name text,
+    site_address text,
+    created_at timestamptz DEFAULT NOW()
+);";
 
-        return Results.Ok(new
-        {
-            success = true,
-            message = "Database connection successful.",
-            serverTime = result?.ToString()
-        });
+await using (var createCmd = new NpgsqlCommand(createTableSql, conn))
+{
+    await createCmd.ExecuteNonQueryAsync();
+}
+
+// 2. SIMPLE INSERT (no upsert yet)
+const string insertSql = @"
+INSERT INTO public.jobs
+(job_id, inspector_id, job_name, site_address)
+VALUES
+(@job_id, @inspector_id, @job_name, @site_address);";
+
+await using (var cmd = new NpgsqlCommand(insertSql, conn))
+{
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
+    cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
+
+    await cmd.ExecuteNonQueryAsync();
+}
+
+return Results.Ok(new
+{
+    success = true,
+    message = "Inserted successfully",
+    jobId = payload.Job.JobId
+});
     }
     catch (Exception ex)
     {
