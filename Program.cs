@@ -10,19 +10,19 @@ app.MapGet("/", () => Results.Ok(new
     service = "3D AutoMate API"
 }));
 
-app.MapPost("/jobs/test-upload", async (HttpContext context) =>
+app.MapPost("/jobs/upsert", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
 
-    Console.WriteLine("===== PAYLOAD RECEIVED =====");
+    Console.WriteLine("===== UPSERT PAYLOAD =====");
     Console.WriteLine(body);
-    Console.WriteLine("============================");
+    Console.WriteLine("==========================");
 
     return Results.Ok(new
     {
         success = true,
-        message = "Test payload received."
+        message = "Upsert received (no DB yet)."
     });
 });
 
