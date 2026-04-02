@@ -44,6 +44,19 @@ app.MapGet("/", () => Results.Ok(new
     service = "3D AutoMate API"
 }));
 
+app.MapGet("/which-db-url", (IConfiguration config) =>
+{
+    var raw = config["DATABASE_URL"] ?? "";
+
+    return Results.Ok(new
+    {
+        hasDatabaseUrl = !string.IsNullOrWhiteSpace(raw),
+        startsWith = raw.Length > 40 ? raw.Substring(0, 40) : raw,
+        containsRailwayInternal = raw.Contains("railway.internal", StringComparison.OrdinalIgnoreCase),
+        containsProxyRlwyNet = raw.Contains("proxy.rlwy.net", StringComparison.OrdinalIgnoreCase)
+    });
+});
+
 app.MapGet("/db-test", async () =>
 {
     try
