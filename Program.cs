@@ -1,6 +1,5 @@
 using System.Text.Json;
 using Npgsql;
-using NpgsqlTypes;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -63,54 +62,20 @@ app.MapGet("/db-test", async () =>
     try
     {
         await using var conn = new NpgsqlConnection(connectionString);
-await conn.OpenAsync();
+        await conn.OpenAsync();
 
-// 1. Ensure table exists
-const string createTableSql = @"
-CREATE TABLE IF NOT EXISTS public.jobs
-(
-    job_id uuid PRIMARY KEY,
-    inspector_id uuid NOT NULL,
-    job_name text,
-    site_address text,
-    created_at timestamptz DEFAULT NOW()
-);";
+        await using var cmd = new NpgsqlCommand("SELECT NOW();", conn);
+        var result = await cmd.ExecuteScalarAsync();
 
-await using (var createCmd = new NpgsqlCommand(createTableSql, conn))
-{
-    await createCmd.ExecuteNonQueryAsync();
-}
-
-// 2. SIMPLE INSERT (no upsert yet)
-const string insertSql = @"
-INSERT INTO public.jobs
-(job_id, inspector_id, job_name, site_address)
-VALUES
-(@job_id, @inspector_id, @job_name, @site_address);";
-
-await using (var cmd = new NpgsqlCommand(insertSql, conn))
-{
-    cmd.Parameters.AddWithValue("job_id", jobId);
-    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
-    cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
-    cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
-
-    await cmd.ExecuteNonQueryAsync();
-}
-
-return Results.Ok(new
-{
-    success = true,
-    message = "Inserted successfully",
-    jobId = payload.Job.JobId
-});
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Database connection successful.",
+            serverTime = result?.ToString()
+        });
     }
     catch (Exception ex)
     {
-        Console.WriteLine("===== DB TEST ERROR =====");
-        Console.WriteLine(ex.ToString());
-        Console.WriteLine("=========================");
-
         return Results.Problem(
             title: "Database connection failed",
             detail: ex.Message,
@@ -132,18 +97,35 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
         });
 
         if (payload == null || payload.Job == null)
-            return Results.BadRequest("Invalid payload");
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid payload"
+            });
+        }
 
         if (!Guid.TryParse(payload.Job.JobId, out Guid jobId))
-            return Results.BadRequest("Invalid JobId");
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid JobId"
+            });
+        }
 
         if (!Guid.TryParse(payload.TenantId, out Guid inspectorId))
-            return Results.BadRequest("Invalid TenantId");
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid TenantId"
+            });
+        }
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
 
-        // ONLY CREATE TABLE
         const string createTableSql = @"
 CREATE TABLE IF NOT EXISTS public.jobs
 (
@@ -154,16 +136,41 @@ CREATE TABLE IF NOT EXISTS public.jobs
     created_at timestamptz DEFAULT NOW()
 );";
 
-        await using (var cmd = new NpgsqlCommand(createTableSql, conn))
+        await using (var createCmd = new NpgsqlCommand(createTableSql, conn))
         {
+            await createCmd.ExecuteNonQueryAsync();
+        }
+
+        const string insertSql = @"
+INSERT INTO public.jobs
+(job_id, inspector_id, job_name, site_address)
+VALUES
+(@job_id, @inspector_id, @job_name, @site_address);";
+
+        await using (var cmd = new NpgsqlCommand(insertSql, conn))
+        {
+            cmd.Parameters.AddWithValue("job_id", jobId);
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
+            cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
+
             await cmd.ExecuteNonQueryAsync();
         }
 
         return Results.Ok(new
         {
             success = true,
-            message = "Table creation OK"
+            message = "Inserted successfully",
+            jobId = payload.Job.JobId
         });
+    }
+    catch (PostgresException pgEx)
+    {
+        return Results.Problem(
+            title: "Database error",
+            detail: pgEx.ToString(),
+            statusCode: 500
+        );
     }
     catch (Exception ex)
     {
