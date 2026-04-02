@@ -4,54 +4,39 @@ using NpgsqlTypes;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Railway Postgres environment variables
-var host = builder.Configuration["PGHOST"];
-var port = builder.Configuration["PGPORT"];
-var database = builder.Configuration["PGDATABASE"];
-var username = builder.Configuration["PGUSER"];
-var password = builder.Configuration["PGPASSWORD"];
+var rawConnectionString = builder.Configuration["DATABASE_URL"];
 
-if (string.IsNullOrWhiteSpace(host) ||
-    string.IsNullOrWhiteSpace(port) ||
-    string.IsNullOrWhiteSpace(database) ||
-    string.IsNullOrWhiteSpace(username) ||
-    string.IsNullOrWhiteSpace(password))
+if (string.IsNullOrWhiteSpace(rawConnectionString))
 {
-    throw new Exception("One or more required PG* database environment variables are missing.");
+    throw new Exception("DATABASE_URL is missing.");
 }
 
-var connectionString =
-    $"Host={host};" +
-    $"Port={port};" +
-    $"Database={database};" +
-    $"Username={username};" +
-    $"Password={password};" +
-    $"SSL Mode=Require;" +
-    $"Trust Server Certificate=true;";
+string connectionString;
+
+if (rawConnectionString.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+    rawConnectionString.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+{
+    var databaseUri = new Uri(rawConnectionString);
+    var userInfo = databaseUri.UserInfo.Split(':', 2);
+
+    var username = Uri.UnescapeDataString(userInfo[0]);
+    var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+
+    connectionString =
+        $"Host={databaseUri.Host};" +
+        $"Port={databaseUri.Port};" +
+        $"Database={databaseUri.AbsolutePath.TrimStart('/')};" +
+        $"Username={username};" +
+        $"Password={password};" +
+        $"SSL Mode=Require;" +
+        $"Trust Server Certificate=true;";
+}
+else
+{
+    connectionString = rawConnectionString;
+}
 
 var app = builder.Build();
-
-app.MapGet("/env-check-2", (IConfiguration config) =>
-{
-    return Results.Ok(new
-    {
-        PGHOST = config["PGHOST"],
-        DATABASE_URL = string.IsNullOrWhiteSpace(config["DATABASE_URL"]) ? "(missing)" : "(present)",
-        DATABASE_PUBLIC_URL = string.IsNullOrWhiteSpace(config["DATABASE_PUBLIC_URL"]) ? "(missing)" : "(present)"
-    });
-});
-
-app.MapGet("/env-check", (IConfiguration config) =>
-{
-    return Results.Ok(new
-    {
-        PGHOST = config["PGHOST"],
-        PGPORT = config["PGPORT"],
-        PGDATABASE = config["PGDATABASE"],
-        PGUSER = config["PGUSER"],
-        HasPassword = !string.IsNullOrWhiteSpace(config["PGPASSWORD"])
-    });
-});
 
 app.MapGet("/", () => Results.Ok(new
 {
