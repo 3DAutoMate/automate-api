@@ -96,111 +96,49 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
         using var reader = new StreamReader(context.Request.Body);
         var body = await reader.ReadToEndAsync();
 
-        Console.WriteLine("===== UPSERT PAYLOAD =====");
-        Console.WriteLine(body);
-        Console.WriteLine("==========================");
-
-        JobUploadRequest? payload = null;
-
-        try
+        var payload = JsonSerializer.Deserialize<JobUploadRequest>(body, new JsonSerializerOptions
         {
-            payload = JsonSerializer.Deserialize<JobUploadRequest>(body, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            });
-        }
-        catch (Exception ex)
-        {
-            return Results.Problem(
-                title: "Deserialize failed",
-                detail: ex.ToString(),
-                statusCode: 500
-            );
-        }
+            PropertyNameCaseInsensitive = true
+        });
 
-        if (payload == null)
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "Payload deserialized to null."
-            });
-        }
-
-        if (payload.Job == null)
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "Payload.Job is null."
-            });
-        }
-
-        if (string.IsNullOrWhiteSpace(payload.Job.JobId))
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "Job.JobId is blank."
-            });
-        }
-
-        if (string.IsNullOrWhiteSpace(payload.TenantId))
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "TenantId is blank."
-            });
-        }
+        if (payload == null || payload.Job == null)
+            return Results.BadRequest("Invalid payload");
 
         if (!Guid.TryParse(payload.Job.JobId, out Guid jobId))
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "Job.JobId is not a valid GUID.",
-                value = payload.Job.JobId
-            });
-        }
+            return Results.BadRequest("Invalid JobId");
 
         if (!Guid.TryParse(payload.TenantId, out Guid inspectorId))
+            return Results.BadRequest("Invalid TenantId");
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        // ONLY CREATE TABLE
+        const string createTableSql = @"
+CREATE TABLE IF NOT EXISTS public.jobs
+(
+    job_id uuid PRIMARY KEY,
+    inspector_id uuid NOT NULL,
+    job_name text,
+    site_address text,
+    created_at timestamptz DEFAULT NOW()
+);";
+
+        await using (var cmd = new NpgsqlCommand(createTableSql, conn))
         {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "TenantId is not a valid GUID.",
-                value = payload.TenantId
-            });
+            await cmd.ExecuteNonQueryAsync();
         }
 
-        try
+        return Results.Ok(new
         {
-            await using var conn = new NpgsqlConnection(connectionString);
-            await conn.OpenAsync();
-
-            return Results.Ok(new
-            {
-                success = true,
-                message = "Payload validated and DB connection opened successfully.",
-                jobId = payload.Job.JobId,
-                tenantId = payload.TenantId,
-                jobName = payload.Job.JobName
-            });
-        }
-        catch (Exception ex)
-        {
-            return Results.Problem(
-                title: "DB open failed",
-                detail: ex.ToString(),
-                statusCode: 500
-            );
-        }
+            success = true,
+            message = "Table creation OK"
+        });
     }
     catch (Exception ex)
     {
         return Results.Problem(
-            title: "Unhandled server error",
+            title: "Server error",
             detail: ex.ToString(),
             statusCode: 500
         );
