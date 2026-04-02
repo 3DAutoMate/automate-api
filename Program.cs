@@ -38,6 +38,148 @@ else
 
 var app = builder.Build();
 
+// =============================
+// ENSURE WORKFLOW COLUMNS
+// =============================
+app.MapPost("/jobs/ensure-columns", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_sent boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_sent boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_sent boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS paid boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_sent boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Workflow columns ensured"
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Ensure columns failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+
+// =============================
+// GET PENDING BOOKING EMAIL JOBS
+// =============================
+app.MapGet("/jobs/pending-booking-email", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+SELECT
+    job_id,
+    inspector_id,
+    job_name,
+    site_address,
+    updated_at
+FROM public.jobs_staging
+WHERE booking_email_sent = false
+ORDER BY updated_at ASC
+LIMIT 50;";
+
+        var rows = new List<object>();
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            rows.Add(new
+            {
+                job_id = reader["job_id"]?.ToString(),
+                inspector_id = reader["inspector_id"]?.ToString(),
+                job_name = reader["job_name"]?.ToString(),
+                site_address = reader["site_address"]?.ToString(),
+                updated_at = reader["updated_at"]?.ToString()
+            });
+        }
+
+        return Results.Ok(rows);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Pending query failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+
+// =============================
+// MARK BOOKING EMAIL SENT
+// =============================
+app.MapPost("/jobs/{jobId}/mark-booking-email-sent", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    booking_email_sent = true,
+    workflow_updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId = jobId
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Update failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
 app.MapGet("/", () => Results.Ok(new
 {
     ok = true,
