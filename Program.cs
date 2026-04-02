@@ -44,19 +44,6 @@ app.MapGet("/", () => Results.Ok(new
     service = "3D AutoMate API"
 }));
 
-app.MapGet("/which-db-url", (IConfiguration config) =>
-{
-    var raw = config["DATABASE_PUBLIC_URL"] ?? "";
-
-    return Results.Ok(new
-    {
-        hasDatabasePublicUrl = !string.IsNullOrWhiteSpace(raw),
-        startsWith = raw.Length > 40 ? raw.Substring(0, 40) : raw,
-        containsRailwayInternal = raw.Contains("railway.internal", StringComparison.OrdinalIgnoreCase),
-        containsProxyRlwyNet = raw.Contains("proxy.rlwy.net", StringComparison.OrdinalIgnoreCase)
-    });
-});
-
 app.MapGet("/db-test", async () =>
 {
     try
@@ -126,55 +113,147 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
 
-        // 1. CREATE TABLES FIRST
-        const string createTablesSql = @"
-CREATE TABLE IF NOT EXISTS public.inspectors
-(
-    id uuid PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS public.jobs
+        const string createTableSql = @"
+CREATE TABLE IF NOT EXISTS public.jobs_staging
 (
     job_id uuid PRIMARY KEY,
     inspector_id uuid NOT NULL,
+    source_system text,
     job_name text,
     site_address text,
+    status text,
+    zap_processed text,
+    report_sent text,
+    primary_service text,
+    additional1 text,
+    additional2 text,
+    contact1_first_name text,
+    contact1_last_name text,
+    contact1_email text,
+    contact1_cellular text,
+    contact2_first_name text,
+    contact2_last_name text,
+    contact2_email text,
+    contact2_cellular text,
+    extracted_at_utc text,
+    connector_version text,
+    source_instance text,
+    raw_payload_json text,
     created_at timestamptz DEFAULT NOW(),
-    CONSTRAINT jobs_inspector_id_fkey
-        FOREIGN KEY (inspector_id)
-        REFERENCES public.inspectors(id)
+    updated_at timestamptz DEFAULT NOW()
 );";
 
-        await using (var createCmd = new NpgsqlCommand(createTablesSql, conn))
+        await using (var createCmd = new NpgsqlCommand(createTableSql, conn))
         {
             await createCmd.ExecuteNonQueryAsync();
         }
 
-        // 2. ENSURE INSPECTOR EXISTS
-        const string ensureInspectorSql = @"
-INSERT INTO public.inspectors (id)
-VALUES (@inspector_id)
-ON CONFLICT (id) DO NOTHING;";
-
-        await using (var ensureCmd = new NpgsqlCommand(ensureInspectorSql, conn))
-        {
-            ensureCmd.Parameters.AddWithValue("inspector_id", inspectorId);
-            await ensureCmd.ExecuteNonQueryAsync();
-        }
-
-        // 3. SIMPLE INSERT
-        const string insertSql = @"
-INSERT INTO public.jobs
-(job_id, inspector_id, job_name, site_address)
+        const string upsertSql = @"
+INSERT INTO public.jobs_staging
+(
+    job_id,
+    inspector_id,
+    source_system,
+    job_name,
+    site_address,
+    status,
+    zap_processed,
+    report_sent,
+    primary_service,
+    additional1,
+    additional2,
+    contact1_first_name,
+    contact1_last_name,
+    contact1_email,
+    contact1_cellular,
+    contact2_first_name,
+    contact2_last_name,
+    contact2_email,
+    contact2_cellular,
+    extracted_at_utc,
+    connector_version,
+    source_instance,
+    raw_payload_json,
+    updated_at
+)
 VALUES
-(@job_id, @inspector_id, @job_name, @site_address);";
+(
+    @job_id,
+    @inspector_id,
+    @source_system,
+    @job_name,
+    @site_address,
+    @status,
+    @zap_processed,
+    @report_sent,
+    @primary_service,
+    @additional1,
+    @additional2,
+    @contact1_first_name,
+    @contact1_last_name,
+    @contact1_email,
+    @contact1_cellular,
+    @contact2_first_name,
+    @contact2_last_name,
+    @contact2_email,
+    @contact2_cellular,
+    @extracted_at_utc,
+    @connector_version,
+    @source_instance,
+    @raw_payload_json,
+    NOW()
+)
+ON CONFLICT (job_id)
+DO UPDATE SET
+    inspector_id        = EXCLUDED.inspector_id,
+    source_system       = EXCLUDED.source_system,
+    job_name            = EXCLUDED.job_name,
+    site_address        = EXCLUDED.site_address,
+    status              = EXCLUDED.status,
+    zap_processed       = EXCLUDED.zap_processed,
+    report_sent         = EXCLUDED.report_sent,
+    primary_service     = EXCLUDED.primary_service,
+    additional1         = EXCLUDED.additional1,
+    additional2         = EXCLUDED.additional2,
+    contact1_first_name = EXCLUDED.contact1_first_name,
+    contact1_last_name  = EXCLUDED.contact1_last_name,
+    contact1_email      = EXCLUDED.contact1_email,
+    contact1_cellular   = EXCLUDED.contact1_cellular,
+    contact2_first_name = EXCLUDED.contact2_first_name,
+    contact2_last_name  = EXCLUDED.contact2_last_name,
+    contact2_email      = EXCLUDED.contact2_email,
+    contact2_cellular   = EXCLUDED.contact2_cellular,
+    extracted_at_utc    = EXCLUDED.extracted_at_utc,
+    connector_version   = EXCLUDED.connector_version,
+    source_instance     = EXCLUDED.source_instance,
+    raw_payload_json    = EXCLUDED.raw_payload_json,
+    updated_at          = NOW();";
 
-        await using (var cmd = new NpgsqlCommand(insertSql, conn))
+        await using (var cmd = new NpgsqlCommand(upsertSql, conn))
         {
             cmd.Parameters.AddWithValue("job_id", jobId);
             cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("source_system", payload.SourceSystem ?? "");
             cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
             cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
+            cmd.Parameters.AddWithValue("status", payload.Job.Status ?? "");
+            cmd.Parameters.AddWithValue("zap_processed", payload.Job.ZapProcessed ?? "");
+            cmd.Parameters.AddWithValue("report_sent", payload.Job.ReportSent ?? "");
+            cmd.Parameters.AddWithValue("primary_service", payload.Services?.Primary ?? "");
+            cmd.Parameters.AddWithValue("additional1", payload.Services?.Additional1 ?? "");
+            cmd.Parameters.AddWithValue("additional2", payload.Services?.Additional2 ?? "");
+            cmd.Parameters.AddWithValue("contact1_first_name", payload.Contact1?.FirstName ?? "");
+            cmd.Parameters.AddWithValue("contact1_last_name", payload.Contact1?.LastName ?? "");
+            cmd.Parameters.AddWithValue("contact1_email", payload.Contact1?.Email ?? "");
+            cmd.Parameters.AddWithValue("contact1_cellular", payload.Contact1?.Cellular ?? "");
+            cmd.Parameters.AddWithValue("contact2_first_name", payload.Contact2?.FirstName ?? "");
+            cmd.Parameters.AddWithValue("contact2_last_name", payload.Contact2?.LastName ?? "");
+            cmd.Parameters.AddWithValue("contact2_email", payload.Contact2?.Email ?? "");
+            cmd.Parameters.AddWithValue("contact2_cellular", payload.Contact2?.Cellular ?? "");
+            cmd.Parameters.AddWithValue("extracted_at_utc", payload.Meta?.ExtractedAtUtc ?? "");
+            cmd.Parameters.AddWithValue("connector_version", payload.Meta?.ConnectorVersion ?? "");
+            cmd.Parameters.AddWithValue("source_instance", payload.Meta?.SourceInstance ?? "");
+            cmd.Parameters.AddWithValue("raw_payload_json", body);
 
             await cmd.ExecuteNonQueryAsync();
         }
@@ -182,7 +261,7 @@ VALUES
         return Results.Ok(new
         {
             success = true,
-            message = "Inserted successfully",
+            message = "Job staged successfully",
             jobId = payload.Job.JobId
         });
     }
