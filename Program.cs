@@ -1,7 +1,6 @@
 using System.Text.Json;
 using Npgsql;
 
-
 var builder = WebApplication.CreateBuilder(args);
 
 // FORCE use of Railway public DB URL
@@ -126,33 +125,44 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
-// ✅ ensure inspector exists
-const string ensureInspectorSql = @"
-INSERT INTO public.inspectors (id)
-VALUES (@inspector_id)
-ON CONFLICT (id) DO NOTHING;
-";
 
-await using (var ensureCmd = new NpgsqlCommand(ensureInspectorSql, conn))
-{
-    ensureCmd.Parameters.AddWithValue("inspector_id", inspectorId);
-    await ensureCmd.ExecuteNonQueryAsync();
-}
-        const string createTableSql = @"
+        // 1. CREATE TABLES FIRST
+        const string createTablesSql = @"
+CREATE TABLE IF NOT EXISTS public.inspectors
+(
+    id uuid PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS public.jobs
 (
     job_id uuid PRIMARY KEY,
     inspector_id uuid NOT NULL,
     job_name text,
     site_address text,
-    created_at timestamptz DEFAULT NOW()
+    created_at timestamptz DEFAULT NOW(),
+    CONSTRAINT jobs_inspector_id_fkey
+        FOREIGN KEY (inspector_id)
+        REFERENCES public.inspectors(id)
 );";
 
-        await using (var createCmd = new NpgsqlCommand(createTableSql, conn))
+        await using (var createCmd = new NpgsqlCommand(createTablesSql, conn))
         {
             await createCmd.ExecuteNonQueryAsync();
         }
 
+        // 2. ENSURE INSPECTOR EXISTS
+        const string ensureInspectorSql = @"
+INSERT INTO public.inspectors (id)
+VALUES (@inspector_id)
+ON CONFLICT (id) DO NOTHING;";
+
+        await using (var ensureCmd = new NpgsqlCommand(ensureInspectorSql, conn))
+        {
+            ensureCmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            await ensureCmd.ExecuteNonQueryAsync();
+        }
+
+        // 3. SIMPLE INSERT
         const string insertSql = @"
 INSERT INTO public.jobs
 (job_id, inspector_id, job_name, site_address)
