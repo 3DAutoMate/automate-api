@@ -44,6 +44,48 @@ app.MapGet("/", () => Results.Ok(new
     service = "3D AutoMate API"
 }));
 
+app.MapGet("/jobs/latest", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+SELECT job_id, inspector_id, job_name, site_address, updated_at
+FROM public.jobs_staging
+ORDER BY updated_at DESC
+LIMIT 20;";
+
+        var rows = new List<object>();
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            rows.Add(new
+            {
+                job_id = reader["job_id"]?.ToString(),
+                inspector_id = reader["inspector_id"]?.ToString(),
+                job_name = reader["job_name"]?.ToString(),
+                site_address = reader["site_address"]?.ToString(),
+                updated_at = reader["updated_at"]?.ToString()
+            });
+        }
+
+        return Results.Ok(rows);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Latest jobs failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
 app.MapGet("/db-test", async () =>
 {
     try
