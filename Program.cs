@@ -31,6 +31,16 @@ var connectionString =
 
 var app = builder.Build();
 
+app.MapGet("/env-check-2", (IConfiguration config) =>
+{
+    return Results.Ok(new
+    {
+        PGHOST = config["PGHOST"],
+        DATABASE_URL = string.IsNullOrWhiteSpace(config["DATABASE_URL"]) ? "(missing)" : "(present)",
+        DATABASE_PUBLIC_URL = string.IsNullOrWhiteSpace(config["DATABASE_PUBLIC_URL"]) ? "(missing)" : "(present)"
+    });
+});
+
 app.MapGet("/env-check", (IConfiguration config) =>
 {
     return Results.Ok(new
