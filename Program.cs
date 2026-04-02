@@ -31,6 +31,18 @@ var connectionString =
 
 var app = builder.Build();
 
+app.MapGet("/env-check", (IConfiguration config) =>
+{
+    return Results.Ok(new
+    {
+        PGHOST = config["PGHOST"],
+        PGPORT = config["PGPORT"],
+        PGDATABASE = config["PGDATABASE"],
+        PGUSER = config["PGUSER"],
+        HasPassword = !string.IsNullOrWhiteSpace(config["PGPASSWORD"])
+    });
+});
+
 app.MapGet("/", () => Results.Ok(new
 {
     ok = true,
