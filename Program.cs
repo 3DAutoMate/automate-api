@@ -4,11 +4,12 @@ using NpgsqlTypes;
 
 var builder = WebApplication.CreateBuilder(args);
 
-var rawConnectionString = builder.Configuration["DATABASE_URL"];
+// FORCE use of Railway public DB URL
+var rawConnectionString = builder.Configuration["DATABASE_PUBLIC_URL"];
 
 if (string.IsNullOrWhiteSpace(rawConnectionString))
 {
-    throw new Exception("DATABASE_URL is missing.");
+    throw new Exception("DATABASE_PUBLIC_URL is missing.");
 }
 
 string connectionString;
@@ -46,11 +47,11 @@ app.MapGet("/", () => Results.Ok(new
 
 app.MapGet("/which-db-url", (IConfiguration config) =>
 {
-    var raw = config["DATABASE_URL"] ?? "";
+    var raw = config["DATABASE_PUBLIC_URL"] ?? "";
 
     return Results.Ok(new
     {
-        hasDatabaseUrl = !string.IsNullOrWhiteSpace(raw),
+        hasDatabasePublicUrl = !string.IsNullOrWhiteSpace(raw),
         startsWith = raw.Length > 40 ? raw.Substring(0, 40) : raw,
         containsRailwayInternal = raw.Contains("railway.internal", StringComparison.OrdinalIgnoreCase),
         containsProxyRlwyNet = raw.Contains("proxy.rlwy.net", StringComparison.OrdinalIgnoreCase)
