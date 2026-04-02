@@ -126,7 +126,18 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+// ✅ ensure inspector exists
+const string ensureInspectorSql = @"
+INSERT INTO public.inspectors (id)
+VALUES (@inspector_id)
+ON CONFLICT (id) DO NOTHING;
+";
 
+await using (var ensureCmd = new NpgsqlCommand(ensureInspectorSql, conn))
+{
+    ensureCmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    await ensureCmd.ExecuteNonQueryAsync();
+}
         const string createTableSql = @"
 CREATE TABLE IF NOT EXISTS public.jobs
 (
