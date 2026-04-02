@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Npgsql;
+using NpgsqlTypes;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,6 +30,9 @@ var connectionString =
     $"Trust Server Certificate=true;";
 
 var app = builder.Build();
+
+// Ensure database objects exist before serving requests
+await EnsureJobsTableExistsAsync(connectionString);
 
 app.MapGet("/", () => Results.Ok(new
 {
@@ -61,6 +65,36 @@ app.MapGet("/db-test", async () =>
 
         return Results.Problem(
             title: "Database connection failed",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+});
+
+app.MapGet("/jobs/debug-count", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await using var cmd = new NpgsqlCommand("SELECT COUNT(*) FROM public.jobs;", conn);
+        var count = await cmd.ExecuteScalarAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            jobsCount = count
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("===== DEBUG COUNT ERROR =====");
+        Console.WriteLine(ex.ToString());
+        Console.WriteLine("=============================");
+
+        return Results.Problem(
+            title: "Debug count failed",
             detail: ex.Message,
             statusCode: 500
         );
@@ -224,7 +258,7 @@ VALUES
     @contact2_last_name,
     @contact2_email,
     @contact2_cellular,
-    CAST(@raw_payload_json AS jsonb),
+    @raw_payload_json,
     @last_synced_at,
     @created_at,
     @updated_at
@@ -281,7 +315,7 @@ DO UPDATE SET
         cmd.Parameters.AddWithValue("contact2_last_name", contact2LastName);
         cmd.Parameters.AddWithValue("contact2_email", contact2Email);
         cmd.Parameters.AddWithValue("contact2_cellular", contact2Cellular);
-        cmd.Parameters.AddWithValue("raw_payload_json", rawPayloadJson);
+        cmd.Parameters.Add("raw_payload_json", NpgsqlDbType.Jsonb).Value = rawPayloadJson;
         cmd.Parameters.AddWithValue("last_synced_at", nowUtc);
         cmd.Parameters.AddWithValue("created_at", nowUtc);
         cmd.Parameters.AddWithValue("updated_at", nowUtc);
@@ -328,6 +362,49 @@ DO UPDATE SET
 });
 
 app.Run();
+
+static async Task EnsureJobsTableExistsAsync(string connectionString)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.jobs
+(
+    job_id uuid PRIMARY KEY,
+    inspector_id uuid NOT NULL,
+    source_system text NOT NULL DEFAULT '',
+    job_name text NOT NULL DEFAULT '',
+    file_number text NOT NULL DEFAULT '',
+    payload_version text NOT NULL DEFAULT '',
+    site_address text NOT NULL DEFAULT '',
+    status text NOT NULL DEFAULT '',
+    zap_processed text NOT NULL DEFAULT '',
+    report_sent text NOT NULL DEFAULT '',
+    primary_service text NOT NULL DEFAULT '',
+    additional1 text NOT NULL DEFAULT '',
+    additional2 text NOT NULL DEFAULT '',
+    contact1_first_name text NOT NULL DEFAULT '',
+    contact1_last_name text NOT NULL DEFAULT '',
+    contact1_email text NOT NULL DEFAULT '',
+    contact1_cellular text NOT NULL DEFAULT '',
+    contact2_first_name text NOT NULL DEFAULT '',
+    contact2_last_name text NOT NULL DEFAULT '',
+    contact2_email text NOT NULL DEFAULT '',
+    contact2_cellular text NOT NULL DEFAULT '',
+    raw_payload_json jsonb,
+    last_synced_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW()
+);";
+
+    await using var conn = new NpgsqlConnection(connectionString);
+    await conn.OpenAsync();
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+
+    Console.WriteLine("===== STARTUP CHECK =====");
+    Console.WriteLine("public.jobs table ensured.");
+    Console.WriteLine("=========================");
+}
 
 public class JobUploadRequest
 {
