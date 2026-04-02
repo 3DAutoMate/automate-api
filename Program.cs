@@ -1,8 +1,9 @@
+using System.Text.Json;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Railway internal Postgres variables
+// Railway Postgres environment variables
 var host = builder.Configuration["PGHOST"];
 var port = builder.Configuration["PGPORT"];
 var database = builder.Configuration["PGDATABASE"];
@@ -35,7 +36,37 @@ app.MapGet("/", () => Results.Ok(new
     service = "3D AutoMate API"
 }));
 
-// Keep your old test endpoint if you want
+app.MapGet("/db-test", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await using var cmd = new NpgsqlCommand("SELECT NOW();", conn);
+        var result = await cmd.ExecuteScalarAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Database connection successful.",
+            serverTime = result?.ToString()
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("===== DB TEST ERROR =====");
+        Console.WriteLine(ex.ToString());
+        Console.WriteLine("=========================");
+
+        return Results.Problem(
+            title: "Database connection failed",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+});
+
 app.MapPost("/jobs/test-upload", async (HttpContext context) =>
 {
     using var reader = new StreamReader(context.Request.Body);
@@ -111,16 +142,38 @@ app.MapPost("/jobs/upsert", async (JobUploadRequest payload) =>
             ? "2.0"
             : payload.Meta.ConnectorVersion;
 
+        string siteAddress = payload.Job.SiteAddress ?? "";
+        string status = payload.Job.Status ?? "";
+        string zapProcessed = payload.Job.ZapProcessed ?? "";
+        string reportSent = payload.Job.ReportSent ?? "";
+
+        string primaryService = payload.Services?.Primary ?? "";
+        string additional1 = payload.Services?.Additional1 ?? "";
+        string additional2 = payload.Services?.Additional2 ?? "";
+
+        string contact1FirstName = payload.Contact1?.FirstName ?? "";
+        string contact1LastName = payload.Contact1?.LastName ?? "";
+        string contact1Email = payload.Contact1?.Email ?? "";
+        string contact1Cellular = payload.Contact1?.Cellular ?? "";
+
+        string contact2FirstName = payload.Contact2?.FirstName ?? "";
+        string contact2LastName = payload.Contact2?.LastName ?? "";
+        string contact2Email = payload.Contact2?.Email ?? "";
+        string contact2Cellular = payload.Contact2?.Cellular ?? "";
+
+        string rawPayloadJson = JsonSerializer.Serialize(payload);
+
         DateTime nowUtc = DateTime.UtcNow;
 
         Console.WriteLine("===== UPSERT REQUEST =====");
         Console.WriteLine($"JobId: {jobId}");
         Console.WriteLine($"InspectorId: {inspectorId}");
         Console.WriteLine($"JobName: {jobName}");
+        Console.WriteLine($"SiteAddress: {siteAddress}");
         Console.WriteLine("==========================");
 
         const string sql = @"
-INSERT INTO jobs
+INSERT INTO public.jobs
 (
     job_id,
     inspector_id,
@@ -128,6 +181,22 @@ INSERT INTO jobs
     job_name,
     file_number,
     payload_version,
+    site_address,
+    status,
+    zap_processed,
+    report_sent,
+    primary_service,
+    additional1,
+    additional2,
+    contact1_first_name,
+    contact1_last_name,
+    contact1_email,
+    contact1_cellular,
+    contact2_first_name,
+    contact2_last_name,
+    contact2_email,
+    contact2_cellular,
+    raw_payload_json,
     last_synced_at,
     created_at,
     updated_at
@@ -140,19 +209,51 @@ VALUES
     @job_name,
     @file_number,
     @payload_version,
+    @site_address,
+    @status,
+    @zap_processed,
+    @report_sent,
+    @primary_service,
+    @additional1,
+    @additional2,
+    @contact1_first_name,
+    @contact1_last_name,
+    @contact1_email,
+    @contact1_cellular,
+    @contact2_first_name,
+    @contact2_last_name,
+    @contact2_email,
+    @contact2_cellular,
+    CAST(@raw_payload_json AS jsonb),
     @last_synced_at,
     @created_at,
     @updated_at
 )
 ON CONFLICT (job_id)
 DO UPDATE SET
-    inspector_id    = EXCLUDED.inspector_id,
-    source_system   = EXCLUDED.source_system,
-    job_name        = EXCLUDED.job_name,
-    file_number     = EXCLUDED.file_number,
-    payload_version = EXCLUDED.payload_version,
-    last_synced_at  = EXCLUDED.last_synced_at,
-    updated_at      = EXCLUDED.updated_at;
+    inspector_id        = EXCLUDED.inspector_id,
+    source_system       = EXCLUDED.source_system,
+    job_name            = EXCLUDED.job_name,
+    file_number         = EXCLUDED.file_number,
+    payload_version     = EXCLUDED.payload_version,
+    site_address        = EXCLUDED.site_address,
+    status              = EXCLUDED.status,
+    zap_processed       = EXCLUDED.zap_processed,
+    report_sent         = EXCLUDED.report_sent,
+    primary_service     = EXCLUDED.primary_service,
+    additional1         = EXCLUDED.additional1,
+    additional2         = EXCLUDED.additional2,
+    contact1_first_name = EXCLUDED.contact1_first_name,
+    contact1_last_name  = EXCLUDED.contact1_last_name,
+    contact1_email      = EXCLUDED.contact1_email,
+    contact1_cellular   = EXCLUDED.contact1_cellular,
+    contact2_first_name = EXCLUDED.contact2_first_name,
+    contact2_last_name  = EXCLUDED.contact2_last_name,
+    contact2_email      = EXCLUDED.contact2_email,
+    contact2_cellular   = EXCLUDED.contact2_cellular,
+    raw_payload_json    = EXCLUDED.raw_payload_json,
+    last_synced_at      = EXCLUDED.last_synced_at,
+    updated_at          = EXCLUDED.updated_at;
 ";
 
         await using var conn = new NpgsqlConnection(connectionString);
@@ -165,6 +266,22 @@ DO UPDATE SET
         cmd.Parameters.AddWithValue("job_name", jobName);
         cmd.Parameters.AddWithValue("file_number", fileNumber);
         cmd.Parameters.AddWithValue("payload_version", payloadVersion);
+        cmd.Parameters.AddWithValue("site_address", siteAddress);
+        cmd.Parameters.AddWithValue("status", status);
+        cmd.Parameters.AddWithValue("zap_processed", zapProcessed);
+        cmd.Parameters.AddWithValue("report_sent", reportSent);
+        cmd.Parameters.AddWithValue("primary_service", primaryService);
+        cmd.Parameters.AddWithValue("additional1", additional1);
+        cmd.Parameters.AddWithValue("additional2", additional2);
+        cmd.Parameters.AddWithValue("contact1_first_name", contact1FirstName);
+        cmd.Parameters.AddWithValue("contact1_last_name", contact1LastName);
+        cmd.Parameters.AddWithValue("contact1_email", contact1Email);
+        cmd.Parameters.AddWithValue("contact1_cellular", contact1Cellular);
+        cmd.Parameters.AddWithValue("contact2_first_name", contact2FirstName);
+        cmd.Parameters.AddWithValue("contact2_last_name", contact2LastName);
+        cmd.Parameters.AddWithValue("contact2_email", contact2Email);
+        cmd.Parameters.AddWithValue("contact2_cellular", contact2Cellular);
+        cmd.Parameters.AddWithValue("raw_payload_json", rawPayloadJson);
         cmd.Parameters.AddWithValue("last_synced_at", nowUtc);
         cmd.Parameters.AddWithValue("created_at", nowUtc);
         cmd.Parameters.AddWithValue("updated_at", nowUtc);
@@ -192,7 +309,7 @@ DO UPDATE SET
 
         return Results.Problem(
             title: "Database error",
-            detail: pgEx.MessageText,
+            detail: $"Postgres: {pgEx.MessageText} | SQLSTATE: {pgEx.SqlState} | Table: {pgEx.TableName} | Constraint: {pgEx.ConstraintName}",
             statusCode: 500
         );
     }
