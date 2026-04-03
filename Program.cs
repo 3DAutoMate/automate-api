@@ -80,7 +80,58 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS paid boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS primary_service text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS additional1 text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS additional2 text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact1_first_name text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact1_last_name text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact1_email text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact1_cellular text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact2_first_name text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact2_last_name text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact2_email text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact2_cellular text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS extracted_at_utc text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS connector_version text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS source_instance text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS raw_payload_json text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT NOW();
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT NOW();
 ";
 
         await using var cmd = new NpgsqlCommand(sql, conn);
@@ -121,9 +172,25 @@ SELECT
     job_name,
     site_address,
     job_date,
+    inspection_duration_minutes,
+    primary_service,
+    additional1,
+    additional2,
+    contact1_first_name,
+    contact1_last_name,
+    contact1_email,
+    contact1_cellular,
+    contact2_first_name,
+    contact2_last_name,
+    contact2_email,
+    contact2_cellular,
+    booking_email_sent,
     updated_at
 FROM public.jobs_staging
 WHERE booking_email_sent = false
+  AND contact1_email IS NOT NULL
+  AND contact1_email <> ''
+  AND job_date IS NOT NULL
 ORDER BY updated_at ASC
 LIMIT 50;";
 
@@ -143,6 +210,19 @@ LIMIT 50;";
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
+                inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
+                primary_service = reader["primary_service"]?.ToString(),
+                additional1 = reader["additional1"]?.ToString(),
+                additional2 = reader["additional2"]?.ToString(),
+                contact1_first_name = reader["contact1_first_name"]?.ToString(),
+                contact1_last_name = reader["contact1_last_name"]?.ToString(),
+                contact1_email = reader["contact1_email"]?.ToString(),
+                contact1_cellular = reader["contact1_cellular"]?.ToString(),
+                contact2_first_name = reader["contact2_first_name"]?.ToString(),
+                contact2_last_name = reader["contact2_last_name"]?.ToString(),
+                contact2_email = reader["contact2_email"]?.ToString(),
+                contact2_cellular = reader["contact2_cellular"]?.ToString(),
+                booking_email_sent = reader["booking_email_sent"]?.ToString(),
                 updated_at = reader["updated_at"]?.ToString()
             });
         }
@@ -219,10 +299,36 @@ SELECT
     tenant_id,
     inspector_id,
     inspector_name,
+    source_system,
     job_name,
     site_address,
     job_date,
     inspection_duration_minutes,
+    source_updated_at,
+    date_added,
+    status,
+    zap_processed,
+    report_sent,
+    booking_email_sent,
+    terms_sent,
+    invoice_sent,
+    paid,
+    primary_service,
+    additional1,
+    additional2,
+    contact1_first_name,
+    contact1_last_name,
+    contact1_email,
+    contact1_cellular,
+    contact2_first_name,
+    contact2_last_name,
+    contact2_email,
+    contact2_cellular,
+    extracted_at_utc,
+    connector_version,
+    source_instance,
+    workflow_updated_at,
+    created_at,
     updated_at
 FROM public.jobs_staging
 ORDER BY updated_at DESC
@@ -241,10 +347,36 @@ LIMIT 20;";
                 tenant_id = reader["tenant_id"]?.ToString(),
                 inspector_id = reader["inspector_id"]?.ToString(),
                 inspector_name = reader["inspector_name"]?.ToString(),
+                source_system = reader["source_system"]?.ToString(),
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
                 inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
+                source_updated_at = reader["source_updated_at"]?.ToString(),
+                date_added = reader["date_added"]?.ToString(),
+                status = reader["status"]?.ToString(),
+                zap_processed = reader["zap_processed"]?.ToString(),
+                report_sent = reader["report_sent"]?.ToString(),
+                booking_email_sent = reader["booking_email_sent"]?.ToString(),
+                terms_sent = reader["terms_sent"]?.ToString(),
+                invoice_sent = reader["invoice_sent"]?.ToString(),
+                paid = reader["paid"]?.ToString(),
+                primary_service = reader["primary_service"]?.ToString(),
+                additional1 = reader["additional1"]?.ToString(),
+                additional2 = reader["additional2"]?.ToString(),
+                contact1_first_name = reader["contact1_first_name"]?.ToString(),
+                contact1_last_name = reader["contact1_last_name"]?.ToString(),
+                contact1_email = reader["contact1_email"]?.ToString(),
+                contact1_cellular = reader["contact1_cellular"]?.ToString(),
+                contact2_first_name = reader["contact2_first_name"]?.ToString(),
+                contact2_last_name = reader["contact2_last_name"]?.ToString(),
+                contact2_email = reader["contact2_email"]?.ToString(),
+                contact2_cellular = reader["contact2_cellular"]?.ToString(),
+                extracted_at_utc = reader["extracted_at_utc"]?.ToString(),
+                connector_version = reader["connector_version"]?.ToString(),
+                source_instance = reader["source_instance"]?.ToString(),
+                workflow_updated_at = reader["workflow_updated_at"]?.ToString(),
+                created_at = reader["created_at"]?.ToString(),
                 updated_at = reader["updated_at"]?.ToString()
             });
         }
