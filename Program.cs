@@ -191,6 +191,9 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS additional2 text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact1_salutation text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS contact1_first_name text NULL;
 
 ALTER TABLE public.jobs_staging
@@ -201,6 +204,9 @@ ADD COLUMN IF NOT EXISTS contact1_email text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS contact1_cellular text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS contact2_salutation text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS contact2_first_name text NULL;
@@ -328,10 +334,12 @@ SELECT
     primary_service,
     additional1,
     additional2,
+    contact1_salutation,
     contact1_first_name,
     contact1_last_name,
     contact1_email,
     contact1_cellular,
+    contact2_salutation,
     contact2_first_name,
     contact2_last_name,
     contact2_email,
@@ -418,11 +426,13 @@ LIMIT 100;";
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
 
+                contact1_salutation = reader["contact1_salutation"]?.ToString(),
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
                 contact1_last_name = reader["contact1_last_name"]?.ToString(),
                 contact1_email = reader["contact1_email"]?.ToString(),
                 contact1_cellular = reader["contact1_cellular"]?.ToString(),
 
+                contact2_salutation = reader["contact2_salutation"]?.ToString(),
                 contact2_first_name = reader["contact2_first_name"]?.ToString(),
                 contact2_last_name = reader["contact2_last_name"]?.ToString(),
                 contact2_email = reader["contact2_email"]?.ToString(),
@@ -642,10 +652,12 @@ SELECT
     primary_service,
     additional1,
     additional2,
+    contact1_salutation,
     contact1_first_name,
     contact1_last_name,
     contact1_email,
     contact1_cellular,
+    contact2_salutation,
     contact2_first_name,
     contact2_last_name,
     contact2_email,
@@ -724,11 +736,13 @@ LIMIT 20;";
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
 
+                contact1_salutation = reader["contact1_salutation"]?.ToString(),
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
                 contact1_last_name = reader["contact1_last_name"]?.ToString(),
                 contact1_email = reader["contact1_email"]?.ToString(),
                 contact1_cellular = reader["contact1_cellular"]?.ToString(),
 
+                contact2_salutation = reader["contact2_salutation"]?.ToString(),
                 contact2_first_name = reader["contact2_first_name"]?.ToString(),
                 contact2_last_name = reader["contact2_last_name"]?.ToString(),
                 contact2_email = reader["contact2_email"]?.ToString(),
@@ -862,10 +876,12 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     primary_service text,
     additional1 text,
     additional2 text,
+    contact1_salutation text,
     contact1_first_name text,
     contact1_last_name text,
     contact1_email text,
     contact1_cellular text,
+    contact2_salutation text,
     contact2_first_name text,
     contact2_last_name text,
     contact2_email text,
@@ -910,10 +926,12 @@ INSERT INTO public.jobs_staging
     primary_service,
     additional1,
     additional2,
+    contact1_salutation,
     contact1_first_name,
     contact1_last_name,
     contact1_email,
     contact1_cellular,
+    contact2_salutation,
     contact2_first_name,
     contact2_last_name,
     contact2_email,
@@ -943,10 +961,12 @@ VALUES
     @primary_service,
     @additional1,
     @additional2,
+    @contact1_salutation,
     @contact1_first_name,
     @contact1_last_name,
     @contact1_email,
     @contact1_cellular,
+    @contact2_salutation,
     @contact2_first_name,
     @contact2_last_name,
     @contact2_email,
@@ -975,10 +995,12 @@ DO UPDATE SET
     primary_service              = EXCLUDED.primary_service,
     additional1                  = EXCLUDED.additional1,
     additional2                  = EXCLUDED.additional2,
+    contact1_salutation          = EXCLUDED.contact1_salutation,
     contact1_first_name          = EXCLUDED.contact1_first_name,
     contact1_last_name           = EXCLUDED.contact1_last_name,
     contact1_email               = EXCLUDED.contact1_email,
     contact1_cellular            = EXCLUDED.contact1_cellular,
+    contact2_salutation          = EXCLUDED.contact2_salutation,
     contact2_first_name          = EXCLUDED.contact2_first_name,
     contact2_last_name           = EXCLUDED.contact2_last_name,
     contact2_email               = EXCLUDED.contact2_email,
@@ -1014,10 +1036,12 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("primary_service", payload.Services?.Primary ?? "");
             cmd.Parameters.AddWithValue("additional1", payload.Services?.Additional1 ?? "");
             cmd.Parameters.AddWithValue("additional2", payload.Services?.Additional2 ?? "");
+            cmd.Parameters.AddWithValue("contact1_salutation", payload.Contact1?.Salutation ?? "");
             cmd.Parameters.AddWithValue("contact1_first_name", payload.Contact1?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact1_last_name", payload.Contact1?.LastName ?? "");
             cmd.Parameters.AddWithValue("contact1_email", payload.Contact1?.Email ?? "");
             cmd.Parameters.AddWithValue("contact1_cellular", payload.Contact1?.Cellular ?? "");
+            cmd.Parameters.AddWithValue("contact2_salutation", payload.Contact2?.Salutation ?? "");
             cmd.Parameters.AddWithValue("contact2_first_name", payload.Contact2?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact2_last_name", payload.Contact2?.LastName ?? "");
             cmd.Parameters.AddWithValue("contact2_email", payload.Contact2?.Email ?? "");
