@@ -39,6 +39,45 @@ else
 var app = builder.Build();
 
 // =============================
+// ROOT
+// =============================
+app.MapGet("/", () => Results.Ok(new
+{
+    ok = true,
+    service = "3D AutoMate API"
+}));
+
+// =============================
+// DB TEST
+// =============================
+app.MapGet("/db-test", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await using var cmd = new NpgsqlCommand("SELECT NOW();", conn);
+        var result = await cmd.ExecuteScalarAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Database connection successful.",
+            serverTime = result?.ToString()
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Database connection failed",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // ENSURE WORKFLOW + PAYLOAD COLUMNS
 // =============================
 app.MapPost("/jobs/ensure-columns", async () =>
@@ -71,13 +110,76 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS booking_email_sent boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_sent_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_retry_requested boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_retry_requested_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_last_attempt_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_last_error text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS terms_sent boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_sent_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_retry_requested boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_retry_requested_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_last_attempt_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_last_error text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS invoice_sent boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_sent_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_retry_requested boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_retry_requested_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_last_attempt_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_last_error text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS paid boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_created boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_created_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_retry_requested boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_retry_requested_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_last_attempt_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_last_error text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS primary_service text NULL;
@@ -125,6 +227,24 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS raw_payload_json text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_workflow_sent boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_workflow_sent_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_retry_requested boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_retry_requested_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_last_attempt_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_last_error text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
 
 ALTER TABLE public.jobs_staging
@@ -154,9 +274,10 @@ ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT NOW();
 });
 
 // =============================
-// GET PENDING BOOKING EMAIL JOBS
+// GET PENDING WORKFLOWS
+// Full shared JSON for all current/future zaps
 // =============================
-app.MapGet("/jobs/pending-booking-email", async () =>
+app.MapGet("/jobs/pending-workflows", async () =>
 {
     try
     {
@@ -169,10 +290,41 @@ SELECT
     tenant_id,
     inspector_id,
     inspector_name,
+    source_system,
     job_name,
     site_address,
     job_date,
     inspection_duration_minutes,
+    source_updated_at,
+    date_added,
+    status,
+    zap_processed,
+    report_sent,
+    booking_email_sent,
+    booking_email_sent_at,
+    booking_email_retry_requested,
+    booking_email_retry_requested_at,
+    booking_email_last_attempt_at,
+    booking_email_last_error,
+    terms_sent,
+    terms_sent_at,
+    terms_retry_requested,
+    terms_retry_requested_at,
+    terms_last_attempt_at,
+    terms_last_error,
+    invoice_sent,
+    invoice_sent_at,
+    invoice_retry_requested,
+    invoice_retry_requested_at,
+    invoice_last_attempt_at,
+    invoice_last_error,
+    paid,
+    calendar_created,
+    calendar_created_at,
+    calendar_retry_requested,
+    calendar_retry_requested_at,
+    calendar_last_attempt_at,
+    calendar_last_error,
     primary_service,
     additional1,
     additional2,
@@ -184,15 +336,29 @@ SELECT
     contact2_last_name,
     contact2_email,
     contact2_cellular,
-    booking_email_sent,
+    extracted_at_utc,
+    connector_version,
+    source_instance,
+    report_workflow_sent,
+    report_workflow_sent_at,
+    report_retry_requested,
+    report_retry_requested_at,
+    report_last_attempt_at,
+    report_last_error,
+    workflow_updated_at,
+    created_at,
     updated_at
 FROM public.jobs_staging
-WHERE booking_email_sent = false
-  AND contact1_email IS NOT NULL
-  AND contact1_email <> ''
-  AND job_date IS NOT NULL
+WHERE
+(
+    (booking_email_sent = false OR booking_email_retry_requested = true)
+    OR (terms_sent = false OR terms_retry_requested = true)
+    OR (invoice_sent = false OR invoice_retry_requested = true)
+    OR (calendar_created = false OR calendar_retry_requested = true)
+    OR (report_workflow_sent = false OR report_retry_requested = true)
+)
 ORDER BY updated_at ASC
-LIMIT 50;";
+LIMIT 100;";
 
         var rows = new List<object>();
 
@@ -207,22 +373,74 @@ LIMIT 50;";
                 tenant_id = reader["tenant_id"]?.ToString(),
                 inspector_id = reader["inspector_id"]?.ToString(),
                 inspector_name = reader["inspector_name"]?.ToString(),
+                source_system = reader["source_system"]?.ToString(),
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
                 inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
+                source_updated_at = reader["source_updated_at"]?.ToString(),
+                date_added = reader["date_added"]?.ToString(),
+                status = reader["status"]?.ToString(),
+                zap_processed = reader["zap_processed"]?.ToString(),
+                report_sent = reader["report_sent"]?.ToString(),
+
+                booking_email_sent = reader["booking_email_sent"]?.ToString(),
+                booking_email_sent_at = reader["booking_email_sent_at"]?.ToString(),
+                booking_email_retry_requested = reader["booking_email_retry_requested"]?.ToString(),
+                booking_email_retry_requested_at = reader["booking_email_retry_requested_at"]?.ToString(),
+                booking_email_last_attempt_at = reader["booking_email_last_attempt_at"]?.ToString(),
+                booking_email_last_error = reader["booking_email_last_error"]?.ToString(),
+
+                terms_sent = reader["terms_sent"]?.ToString(),
+                terms_sent_at = reader["terms_sent_at"]?.ToString(),
+                terms_retry_requested = reader["terms_retry_requested"]?.ToString(),
+                terms_retry_requested_at = reader["terms_retry_requested_at"]?.ToString(),
+                terms_last_attempt_at = reader["terms_last_attempt_at"]?.ToString(),
+                terms_last_error = reader["terms_last_error"]?.ToString(),
+
+                invoice_sent = reader["invoice_sent"]?.ToString(),
+                invoice_sent_at = reader["invoice_sent_at"]?.ToString(),
+                invoice_retry_requested = reader["invoice_retry_requested"]?.ToString(),
+                invoice_retry_requested_at = reader["invoice_retry_requested_at"]?.ToString(),
+                invoice_last_attempt_at = reader["invoice_last_attempt_at"]?.ToString(),
+                invoice_last_error = reader["invoice_last_error"]?.ToString(),
+
+                paid = reader["paid"]?.ToString(),
+
+                calendar_created = reader["calendar_created"]?.ToString(),
+                calendar_created_at = reader["calendar_created_at"]?.ToString(),
+                calendar_retry_requested = reader["calendar_retry_requested"]?.ToString(),
+                calendar_retry_requested_at = reader["calendar_retry_requested_at"]?.ToString(),
+                calendar_last_attempt_at = reader["calendar_last_attempt_at"]?.ToString(),
+                calendar_last_error = reader["calendar_last_error"]?.ToString(),
+
                 primary_service = reader["primary_service"]?.ToString(),
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
+
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
                 contact1_last_name = reader["contact1_last_name"]?.ToString(),
                 contact1_email = reader["contact1_email"]?.ToString(),
                 contact1_cellular = reader["contact1_cellular"]?.ToString(),
+
                 contact2_first_name = reader["contact2_first_name"]?.ToString(),
                 contact2_last_name = reader["contact2_last_name"]?.ToString(),
                 contact2_email = reader["contact2_email"]?.ToString(),
                 contact2_cellular = reader["contact2_cellular"]?.ToString(),
-                booking_email_sent = reader["booking_email_sent"]?.ToString(),
+
+                extracted_at_utc = reader["extracted_at_utc"]?.ToString(),
+                connector_version = reader["connector_version"]?.ToString(),
+                source_instance = reader["source_instance"]?.ToString(),
+
+                report_workflow_sent = reader["report_workflow_sent"]?.ToString(),
+                report_workflow_sent_at = reader["report_workflow_sent_at"]?.ToString(),
+                report_retry_requested = reader["report_retry_requested"]?.ToString(),
+                report_retry_requested_at = reader["report_retry_requested_at"]?.ToString(),
+                report_last_attempt_at = reader["report_last_attempt_at"]?.ToString(),
+                report_last_error = reader["report_last_error"]?.ToString(),
+
+                workflow_updated_at = reader["workflow_updated_at"]?.ToString(),
+                created_at = reader["created_at"]?.ToString(),
                 updated_at = reader["updated_at"]?.ToString()
             });
         }
@@ -232,7 +450,7 @@ LIMIT 50;";
     catch (Exception ex)
     {
         return Results.Problem(
-            title: "Pending query failed",
+            title: "Pending workflows query failed",
             detail: ex.ToString(),
             statusCode: 500
         );
@@ -253,6 +471,11 @@ app.MapPost("/jobs/{jobId}/mark-booking-email-sent", async (Guid jobId) =>
 UPDATE public.jobs_staging
 SET
     booking_email_sent = true,
+    booking_email_sent_at = NOW(),
+    booking_email_retry_requested = false,
+    booking_email_retry_requested_at = NULL,
+    booking_email_last_attempt_at = NOW(),
+    booking_email_last_error = NULL,
     workflow_updated_at = NOW(),
     updated_at = NOW()
 WHERE job_id = @job_id;
@@ -273,19 +496,101 @@ WHERE job_id = @job_id;
     catch (Exception ex)
     {
         return Results.Problem(
-            title: "Update failed",
+            title: "Mark booking email sent failed",
             detail: ex.ToString(),
             statusCode: 500
         );
     }
 });
 
-app.MapGet("/", () => Results.Ok(new
+// =============================
+// REQUEST BOOKING EMAIL RETRY
+// =============================
+app.MapPost("/jobs/{jobId}/request-booking-email-retry", async (Guid jobId) =>
 {
-    ok = true,
-    service = "3D AutoMate API"
-}));
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
 
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    booking_email_retry_requested = true,
+    booking_email_retry_requested_at = NOW(),
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId = jobId
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request booking email retry failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK BOOKING EMAIL FAILED
+// =============================
+app.MapPost("/jobs/{jobId}/mark-booking-email-failed", async (Guid jobId, BookingEmailFailureRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    booking_email_last_attempt_at = NOW(),
+    booking_email_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("error_message", request.ErrorMessage ?? "");
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId = jobId
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark booking email failed failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// GET LATEST JOBS
+// =============================
 app.MapGet("/jobs/latest", async () =>
 {
     try
@@ -310,9 +615,30 @@ SELECT
     zap_processed,
     report_sent,
     booking_email_sent,
+    booking_email_sent_at,
+    booking_email_retry_requested,
+    booking_email_retry_requested_at,
+    booking_email_last_attempt_at,
+    booking_email_last_error,
     terms_sent,
+    terms_sent_at,
+    terms_retry_requested,
+    terms_retry_requested_at,
+    terms_last_attempt_at,
+    terms_last_error,
     invoice_sent,
+    invoice_sent_at,
+    invoice_retry_requested,
+    invoice_retry_requested_at,
+    invoice_last_attempt_at,
+    invoice_last_error,
     paid,
+    calendar_created,
+    calendar_created_at,
+    calendar_retry_requested,
+    calendar_retry_requested_at,
+    calendar_last_attempt_at,
+    calendar_last_error,
     primary_service,
     additional1,
     additional2,
@@ -327,6 +653,12 @@ SELECT
     extracted_at_utc,
     connector_version,
     source_instance,
+    report_workflow_sent,
+    report_workflow_sent_at,
+    report_retry_requested,
+    report_retry_requested_at,
+    report_last_attempt_at,
+    report_last_error,
     workflow_updated_at,
     created_at,
     updated_at
@@ -357,24 +689,62 @@ LIMIT 20;";
                 status = reader["status"]?.ToString(),
                 zap_processed = reader["zap_processed"]?.ToString(),
                 report_sent = reader["report_sent"]?.ToString(),
+
                 booking_email_sent = reader["booking_email_sent"]?.ToString(),
+                booking_email_sent_at = reader["booking_email_sent_at"]?.ToString(),
+                booking_email_retry_requested = reader["booking_email_retry_requested"]?.ToString(),
+                booking_email_retry_requested_at = reader["booking_email_retry_requested_at"]?.ToString(),
+                booking_email_last_attempt_at = reader["booking_email_last_attempt_at"]?.ToString(),
+                booking_email_last_error = reader["booking_email_last_error"]?.ToString(),
+
                 terms_sent = reader["terms_sent"]?.ToString(),
+                terms_sent_at = reader["terms_sent_at"]?.ToString(),
+                terms_retry_requested = reader["terms_retry_requested"]?.ToString(),
+                terms_retry_requested_at = reader["terms_retry_requested_at"]?.ToString(),
+                terms_last_attempt_at = reader["terms_last_attempt_at"]?.ToString(),
+                terms_last_error = reader["terms_last_error"]?.ToString(),
+
                 invoice_sent = reader["invoice_sent"]?.ToString(),
+                invoice_sent_at = reader["invoice_sent_at"]?.ToString(),
+                invoice_retry_requested = reader["invoice_retry_requested"]?.ToString(),
+                invoice_retry_requested_at = reader["invoice_retry_requested_at"]?.ToString(),
+                invoice_last_attempt_at = reader["invoice_last_attempt_at"]?.ToString(),
+                invoice_last_error = reader["invoice_last_error"]?.ToString(),
+
                 paid = reader["paid"]?.ToString(),
+
+                calendar_created = reader["calendar_created"]?.ToString(),
+                calendar_created_at = reader["calendar_created_at"]?.ToString(),
+                calendar_retry_requested = reader["calendar_retry_requested"]?.ToString(),
+                calendar_retry_requested_at = reader["calendar_retry_requested_at"]?.ToString(),
+                calendar_last_attempt_at = reader["calendar_last_attempt_at"]?.ToString(),
+                calendar_last_error = reader["calendar_last_error"]?.ToString(),
+
                 primary_service = reader["primary_service"]?.ToString(),
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
+
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
                 contact1_last_name = reader["contact1_last_name"]?.ToString(),
                 contact1_email = reader["contact1_email"]?.ToString(),
                 contact1_cellular = reader["contact1_cellular"]?.ToString(),
+
                 contact2_first_name = reader["contact2_first_name"]?.ToString(),
                 contact2_last_name = reader["contact2_last_name"]?.ToString(),
                 contact2_email = reader["contact2_email"]?.ToString(),
                 contact2_cellular = reader["contact2_cellular"]?.ToString(),
+
                 extracted_at_utc = reader["extracted_at_utc"]?.ToString(),
                 connector_version = reader["connector_version"]?.ToString(),
                 source_instance = reader["source_instance"]?.ToString(),
+
+                report_workflow_sent = reader["report_workflow_sent"]?.ToString(),
+                report_workflow_sent_at = reader["report_workflow_sent_at"]?.ToString(),
+                report_retry_requested = reader["report_retry_requested"]?.ToString(),
+                report_retry_requested_at = reader["report_retry_requested_at"]?.ToString(),
+                report_last_attempt_at = reader["report_last_attempt_at"]?.ToString(),
+                report_last_error = reader["report_last_error"]?.ToString(),
+
                 workflow_updated_at = reader["workflow_updated_at"]?.ToString(),
                 created_at = reader["created_at"]?.ToString(),
                 updated_at = reader["updated_at"]?.ToString()
@@ -393,33 +763,9 @@ LIMIT 20;";
     }
 });
 
-app.MapGet("/db-test", async () =>
-{
-    try
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-
-        await using var cmd = new NpgsqlCommand("SELECT NOW();", conn);
-        var result = await cmd.ExecuteScalarAsync();
-
-        return Results.Ok(new
-        {
-            success = true,
-            message = "Database connection successful.",
-            serverTime = result?.ToString()
-        });
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem(
-            title: "Database connection failed",
-            detail: ex.Message,
-            statusCode: 500
-        );
-    }
-});
-
+// =============================
+// UPSERT JOB FROM CONNECTOR
+// =============================
 app.MapPost("/jobs/upsert", async (HttpContext context) =>
 {
     try
@@ -489,9 +835,30 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     zap_processed text,
     report_sent text,
     booking_email_sent boolean NOT NULL DEFAULT false,
+    booking_email_sent_at timestamptz NULL,
+    booking_email_retry_requested boolean NOT NULL DEFAULT false,
+    booking_email_retry_requested_at timestamptz NULL,
+    booking_email_last_attempt_at timestamptz NULL,
+    booking_email_last_error text NULL,
     terms_sent boolean NOT NULL DEFAULT false,
+    terms_sent_at timestamptz NULL,
+    terms_retry_requested boolean NOT NULL DEFAULT false,
+    terms_retry_requested_at timestamptz NULL,
+    terms_last_attempt_at timestamptz NULL,
+    terms_last_error text NULL,
     invoice_sent boolean NOT NULL DEFAULT false,
+    invoice_sent_at timestamptz NULL,
+    invoice_retry_requested boolean NOT NULL DEFAULT false,
+    invoice_retry_requested_at timestamptz NULL,
+    invoice_last_attempt_at timestamptz NULL,
+    invoice_last_error text NULL,
     paid boolean NOT NULL DEFAULT false,
+    calendar_created boolean NOT NULL DEFAULT false,
+    calendar_created_at timestamptz NULL,
+    calendar_retry_requested boolean NOT NULL DEFAULT false,
+    calendar_retry_requested_at timestamptz NULL,
+    calendar_last_attempt_at timestamptz NULL,
+    calendar_last_error text NULL,
     primary_service text,
     additional1 text,
     additional2 text,
@@ -507,6 +874,12 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     connector_version text,
     source_instance text,
     raw_payload_json text,
+    report_workflow_sent boolean NOT NULL DEFAULT false,
+    report_workflow_sent_at timestamptz NULL,
+    report_retry_requested boolean NOT NULL DEFAULT false,
+    report_retry_requested_at timestamptz NULL,
+    report_last_attempt_at timestamptz NULL,
+    report_last_error text NULL,
     workflow_updated_at timestamptz NOT NULL DEFAULT NOW(),
     created_at timestamptz DEFAULT NOW(),
     updated_at timestamptz DEFAULT NOW()
@@ -695,6 +1068,11 @@ static DateTime? ParseNullableDateTime(string? value)
         return parsed;
 
     return null;
+}
+
+public class BookingEmailFailureRequest
+{
+    public string? ErrorMessage { get; set; }
 }
 
 public class JobUploadRequest
