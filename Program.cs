@@ -326,7 +326,7 @@ app.MapGet("/integrations/microsoft/connect-url", (string inspectorId) =>
         );
     }
 
-    if (!Guid.TryParse(inspectorId, out _))
+    if (!Guid.TryParse(inspectorId.Trim(), out _))
     {
         return Results.BadRequest(new
         {
@@ -344,12 +344,12 @@ app.MapGet("/integrations/microsoft/connect-url", (string inspectorId) =>
         $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
         $"&response_mode=query" +
         $"&scope={Uri.EscapeDataString(scopes)}" +
-        $"&state={Uri.EscapeDataString(inspectorId)}";
+        $"&state={Uri.EscapeDataString(inspectorId.Trim())}";
 
     return Results.Ok(new
     {
         success = true,
-        inspectorId,
+        inspectorId = inspectorId.Trim(),
         url
     });
 });
