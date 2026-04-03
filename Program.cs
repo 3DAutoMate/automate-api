@@ -39,7 +39,7 @@ else
 var app = builder.Build();
 
 // =============================
-// ENSURE WORKFLOW COLUMNS
+// ENSURE WORKFLOW + PAYLOAD COLUMNS
 // =============================
 app.MapPost("/jobs/ensure-columns", async () =>
 {
@@ -49,6 +49,24 @@ app.MapPost("/jobs/ensure-columns", async () =>
         await conn.OpenAsync();
 
         const string sql = @"
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS tenant_id uuid NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS inspector_name text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS job_date timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS inspection_duration_minutes integer NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS source_updated_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS date_added timestamptz NULL;
+
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS booking_email_sent boolean NOT NULL DEFAULT false;
 
@@ -62,9 +80,6 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS paid boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.jobs_staging
-ADD COLUMN IF NOT EXISTS report_sent boolean NOT NULL DEFAULT false;
-
-ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
 ";
 
@@ -74,7 +89,7 @@ ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
         return Results.Ok(new
         {
             success = true,
-            message = "Workflow columns ensured"
+            message = "Workflow and payload columns ensured"
         });
     }
     catch (Exception ex)
@@ -86,7 +101,6 @@ ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
         );
     }
 });
-
 
 // =============================
 // GET PENDING BOOKING EMAIL JOBS
@@ -101,9 +115,12 @@ app.MapGet("/jobs/pending-booking-email", async () =>
         const string sql = @"
 SELECT
     job_id,
+    tenant_id,
     inspector_id,
+    inspector_name,
     job_name,
     site_address,
+    job_date,
     updated_at
 FROM public.jobs_staging
 WHERE booking_email_sent = false
@@ -120,9 +137,12 @@ LIMIT 50;";
             rows.Add(new
             {
                 job_id = reader["job_id"]?.ToString(),
+                tenant_id = reader["tenant_id"]?.ToString(),
                 inspector_id = reader["inspector_id"]?.ToString(),
+                inspector_name = reader["inspector_name"]?.ToString(),
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
+                job_date = reader["job_date"]?.ToString(),
                 updated_at = reader["updated_at"]?.ToString()
             });
         }
@@ -139,7 +159,6 @@ LIMIT 50;";
     }
 });
 
-
 // =============================
 // MARK BOOKING EMAIL SENT
 // =============================
@@ -154,7 +173,8 @@ app.MapPost("/jobs/{jobId}/mark-booking-email-sent", async (Guid jobId) =>
 UPDATE public.jobs_staging
 SET
     booking_email_sent = true,
-    workflow_updated_at = NOW()
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
 WHERE job_id = @job_id;
 ";
 
@@ -194,7 +214,16 @@ app.MapGet("/jobs/latest", async () =>
         await conn.OpenAsync();
 
         const string sql = @"
-SELECT job_id, inspector_id, job_name, site_address, updated_at
+SELECT
+    job_id,
+    tenant_id,
+    inspector_id,
+    inspector_name,
+    job_name,
+    site_address,
+    job_date,
+    inspection_duration_minutes,
+    updated_at
 FROM public.jobs_staging
 ORDER BY updated_at DESC
 LIMIT 20;";
@@ -209,9 +238,13 @@ LIMIT 20;";
             rows.Add(new
             {
                 job_id = reader["job_id"]?.ToString(),
+                tenant_id = reader["tenant_id"]?.ToString(),
                 inspector_id = reader["inspector_id"]?.ToString(),
+                inspector_name = reader["inspector_name"]?.ToString(),
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
+                job_date = reader["job_date"]?.ToString(),
+                inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
                 updated_at = reader["updated_at"]?.ToString()
             });
         }
@@ -281,16 +314,25 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
             return Results.BadRequest(new
             {
                 success = false,
-                message = "Invalid JobId"
+                message = "Invalid Job.JobId"
             });
         }
 
-        if (!Guid.TryParse(payload.TenantId, out Guid inspectorId))
+        if (!Guid.TryParse(payload.TenantId, out Guid tenantId))
         {
             return Results.BadRequest(new
             {
                 success = false,
                 message = "Invalid TenantId"
+            });
+        }
+
+        if (!Guid.TryParse(payload.Job.InspectorId, out Guid inspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid Job.InspectorId"
             });
         }
 
@@ -301,13 +343,23 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
 CREATE TABLE IF NOT EXISTS public.jobs_staging
 (
     job_id uuid PRIMARY KEY,
+    tenant_id uuid NULL,
     inspector_id uuid NOT NULL,
+    inspector_name text NULL,
     source_system text,
     job_name text,
     site_address text,
+    job_date timestamptz NULL,
+    inspection_duration_minutes integer NULL,
+    source_updated_at timestamptz NULL,
+    date_added timestamptz NULL,
     status text,
     zap_processed text,
     report_sent text,
+    booking_email_sent boolean NOT NULL DEFAULT false,
+    terms_sent boolean NOT NULL DEFAULT false,
+    invoice_sent boolean NOT NULL DEFAULT false,
+    paid boolean NOT NULL DEFAULT false,
     primary_service text,
     additional1 text,
     additional2 text,
@@ -323,6 +375,7 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     connector_version text,
     source_instance text,
     raw_payload_json text,
+    workflow_updated_at timestamptz NOT NULL DEFAULT NOW(),
     created_at timestamptz DEFAULT NOW(),
     updated_at timestamptz DEFAULT NOW()
 );";
@@ -335,11 +388,17 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
         const string upsertSql = @"
 INSERT INTO public.jobs_staging
 (
+    tenant_id,
     job_id,
     inspector_id,
+    inspector_name,
     source_system,
     job_name,
     site_address,
+    job_date,
+    inspection_duration_minutes,
+    source_updated_at,
+    date_added,
     status,
     zap_processed,
     report_sent,
@@ -362,11 +421,17 @@ INSERT INTO public.jobs_staging
 )
 VALUES
 (
+    @tenant_id,
     @job_id,
     @inspector_id,
+    @inspector_name,
     @source_system,
     @job_name,
     @site_address,
+    @job_date,
+    @inspection_duration_minutes,
+    @source_updated_at,
+    @date_added,
     @status,
     @zap_processed,
     @report_sent,
@@ -389,37 +454,55 @@ VALUES
 )
 ON CONFLICT (job_id)
 DO UPDATE SET
-    inspector_id        = EXCLUDED.inspector_id,
-    source_system       = EXCLUDED.source_system,
-    job_name            = EXCLUDED.job_name,
-    site_address        = EXCLUDED.site_address,
-    status              = EXCLUDED.status,
-    zap_processed       = EXCLUDED.zap_processed,
-    report_sent         = EXCLUDED.report_sent,
-    primary_service     = EXCLUDED.primary_service,
-    additional1         = EXCLUDED.additional1,
-    additional2         = EXCLUDED.additional2,
-    contact1_first_name = EXCLUDED.contact1_first_name,
-    contact1_last_name  = EXCLUDED.contact1_last_name,
-    contact1_email      = EXCLUDED.contact1_email,
-    contact1_cellular   = EXCLUDED.contact1_cellular,
-    contact2_first_name = EXCLUDED.contact2_first_name,
-    contact2_last_name  = EXCLUDED.contact2_last_name,
-    contact2_email      = EXCLUDED.contact2_email,
-    contact2_cellular   = EXCLUDED.contact2_cellular,
-    extracted_at_utc    = EXCLUDED.extracted_at_utc,
-    connector_version   = EXCLUDED.connector_version,
-    source_instance     = EXCLUDED.source_instance,
-    raw_payload_json    = EXCLUDED.raw_payload_json,
-    updated_at          = NOW();";
+    tenant_id                    = EXCLUDED.tenant_id,
+    inspector_id                 = EXCLUDED.inspector_id,
+    inspector_name               = EXCLUDED.inspector_name,
+    source_system                = EXCLUDED.source_system,
+    job_name                     = EXCLUDED.job_name,
+    site_address                 = EXCLUDED.site_address,
+    job_date                     = EXCLUDED.job_date,
+    inspection_duration_minutes  = EXCLUDED.inspection_duration_minutes,
+    source_updated_at            = EXCLUDED.source_updated_at,
+    date_added                   = EXCLUDED.date_added,
+    status                       = EXCLUDED.status,
+    zap_processed                = EXCLUDED.zap_processed,
+    report_sent                  = EXCLUDED.report_sent,
+    primary_service              = EXCLUDED.primary_service,
+    additional1                  = EXCLUDED.additional1,
+    additional2                  = EXCLUDED.additional2,
+    contact1_first_name          = EXCLUDED.contact1_first_name,
+    contact1_last_name           = EXCLUDED.contact1_last_name,
+    contact1_email               = EXCLUDED.contact1_email,
+    contact1_cellular            = EXCLUDED.contact1_cellular,
+    contact2_first_name          = EXCLUDED.contact2_first_name,
+    contact2_last_name           = EXCLUDED.contact2_last_name,
+    contact2_email               = EXCLUDED.contact2_email,
+    contact2_cellular            = EXCLUDED.contact2_cellular,
+    extracted_at_utc             = EXCLUDED.extracted_at_utc,
+    connector_version            = EXCLUDED.connector_version,
+    source_instance              = EXCLUDED.source_instance,
+    raw_payload_json             = EXCLUDED.raw_payload_json,
+    updated_at                   = NOW();";
 
         await using (var cmd = new NpgsqlCommand(upsertSql, conn))
         {
+            cmd.Parameters.AddWithValue("tenant_id", tenantId);
             cmd.Parameters.AddWithValue("job_id", jobId);
             cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("inspector_name", payload.Job.InspectorName ?? "");
             cmd.Parameters.AddWithValue("source_system", payload.SourceSystem ?? "");
             cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
             cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
+
+            var jobDate = ParseNullableDateTime(payload.Job.JobDate);
+            var sourceUpdatedAt = ParseNullableDateTime(payload.Job.SourceUpdatedAtUtc);
+            var dateAdded = ParseNullableDateTime(payload.Job.DateAddedUtc);
+
+            cmd.Parameters.AddWithValue("job_date", jobDate.HasValue ? jobDate.Value : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("inspection_duration_minutes", payload.Job.InspectionDurationMinutes);
+            cmd.Parameters.AddWithValue("source_updated_at", sourceUpdatedAt.HasValue ? sourceUpdatedAt.Value : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("date_added", dateAdded.HasValue ? dateAdded.Value : (object)DBNull.Value);
+
             cmd.Parameters.AddWithValue("status", payload.Job.Status ?? "");
             cmd.Parameters.AddWithValue("zap_processed", payload.Job.ZapProcessed ?? "");
             cmd.Parameters.AddWithValue("report_sent", payload.Job.ReportSent ?? "");
@@ -446,7 +529,9 @@ DO UPDATE SET
         {
             success = true,
             message = "Job staged successfully",
-            jobId = payload.Job.JobId
+            jobId = payload.Job.JobId,
+            tenantId = payload.TenantId,
+            inspectorId = payload.Job.InspectorId
         });
     }
     catch (PostgresException pgEx)
@@ -469,6 +554,17 @@ DO UPDATE SET
 
 app.Run();
 
+static DateTime? ParseNullableDateTime(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return null;
+
+    if (DateTime.TryParse(value, out var parsed))
+        return parsed;
+
+    return null;
+}
+
 public class JobUploadRequest
 {
     public string SourceSystem { get; set; } = "";
@@ -483,8 +579,14 @@ public class JobUploadRequest
 public class JobSection
 {
     public string JobId { get; set; } = "";
+    public string InspectorId { get; set; } = "";
+    public string InspectorName { get; set; } = "";
     public string JobName { get; set; } = "";
     public string SiteAddress { get; set; } = "";
+    public string JobDate { get; set; } = "";
+    public int InspectionDurationMinutes { get; set; } = 0;
+    public string SourceUpdatedAtUtc { get; set; } = "";
+    public string DateAddedUtc { get; set; } = "";
     public string Status { get; set; } = "";
     public string ZapProcessed { get; set; } = "";
     public string ReportSent { get; set; } = "";
