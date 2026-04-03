@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -273,6 +275,463 @@ ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT NOW();
     {
         return Results.Problem(
             title: "Ensure columns failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// ENSURE INTEGRATION TABLES
+// =============================
+app.MapPost("/integrations/ensure-tables", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Integration tables ensured"
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Ensure integration tables failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MICROSOFT CONNECT URL
+// =============================
+app.MapGet("/integrations/microsoft/connect-url", (string inspectorId) =>
+{
+    var clientId = builder.Configuration["MS_CLIENT_ID"];
+    var redirectUri = builder.Configuration["MS_REDIRECT_URI"];
+
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(redirectUri))
+    {
+        return Results.Problem(
+            title: "Microsoft config missing",
+            detail: "MS_CLIENT_ID and/or MS_REDIRECT_URI are missing from Railway variables.",
+            statusCode: 500
+        );
+    }
+
+    if (!Guid.TryParse(inspectorId, out _))
+    {
+        return Results.BadRequest(new
+        {
+            success = false,
+            message = "Invalid inspectorId"
+        });
+    }
+
+    var scopes = "offline_access Mail.Send User.Read";
+
+    var url =
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize" +
+        $"?client_id={Uri.EscapeDataString(clientId)}" +
+        $"&response_type=code" +
+        $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+        $"&response_mode=query" +
+        $"&scope={Uri.EscapeDataString(scopes)}" +
+        $"&state={Uri.EscapeDataString(inspectorId)}";
+
+    return Results.Ok(new
+    {
+        success = true,
+        inspectorId,
+        url
+    });
+});
+
+// =============================
+// MICROSOFT CALLBACK
+// =============================
+app.MapGet("/api/integrations/microsoft/callback", async (HttpContext context) =>
+{
+    try
+    {
+        var code = context.Request.Query["code"].ToString();
+        var state = context.Request.Query["state"].ToString();
+
+        if (string.IsNullOrWhiteSpace(code))
+        {
+            return Results.BadRequest("Missing code");
+        }
+
+        if (!Guid.TryParse(state, out Guid inspectorId))
+        {
+            return Results.BadRequest("Invalid inspector ID in state");
+        }
+
+        var clientId = builder.Configuration["MS_CLIENT_ID"];
+        var clientSecret = builder.Configuration["MS_CLIENT_SECRET"];
+        var redirectUri = builder.Configuration["MS_REDIRECT_URI"];
+
+        if (string.IsNullOrWhiteSpace(clientId) ||
+            string.IsNullOrWhiteSpace(clientSecret) ||
+            string.IsNullOrWhiteSpace(redirectUri))
+        {
+            return Results.Problem(
+                title: "Microsoft config missing",
+                detail: "MS_CLIENT_ID, MS_CLIENT_SECRET and/or MS_REDIRECT_URI are missing from Railway variables.",
+                statusCode: 500
+            );
+        }
+
+        using var httpClient = new HttpClient();
+
+        var tokenResponse = await httpClient.PostAsync(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["client_id"] = clientId,
+                ["client_secret"] = clientSecret,
+                ["code"] = code,
+                ["redirect_uri"] = redirectUri,
+                ["grant_type"] = "authorization_code"
+            }));
+
+        var tokenJson = await tokenResponse.Content.ReadAsStringAsync();
+
+        if (!tokenResponse.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Microsoft token exchange failed",
+                detail: tokenJson,
+                statusCode: 500
+            );
+        }
+
+        var tokenDoc = JsonDocument.Parse(tokenJson).RootElement;
+
+        var accessToken = tokenDoc.GetProperty("access_token").GetString() ?? "";
+        var refreshToken = tokenDoc.TryGetProperty("refresh_token", out var refreshTokenProp)
+            ? refreshTokenProp.GetString() ?? ""
+            : "";
+        var expiresIn = tokenDoc.TryGetProperty("expires_in", out var expiresInProp)
+            ? expiresInProp.GetInt32()
+            : 3600;
+
+        var expiresAt = DateTime.UtcNow.AddSeconds(expiresIn);
+
+        string? externalAccountEmail = null;
+
+        // Try fetch mailbox/user identity
+        httpClient.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        var meResponse = await httpClient.GetAsync("https://graph.microsoft.com/v1.0/me");
+        if (meResponse.IsSuccessStatusCode)
+        {
+            var meJson = await meResponse.Content.ReadAsStringAsync();
+            var meDoc = JsonDocument.Parse(meJson).RootElement;
+
+            if (meDoc.TryGetProperty("mail", out var mailProp))
+            {
+                externalAccountEmail = mailProp.GetString();
+            }
+
+            if (string.IsNullOrWhiteSpace(externalAccountEmail) &&
+                meDoc.TryGetProperty("userPrincipalName", out var upnProp))
+            {
+                externalAccountEmail = upnProp.GetString();
+            }
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string upsertSql = @"
+INSERT INTO public.inspector_integrations
+(
+    inspector_id,
+    provider,
+    status,
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    external_tenant_id,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    'microsoft',
+    'connected',
+    @access_token,
+    @refresh_token,
+    @expires_at,
+    @external_account_email,
+    NULL,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (inspector_id, provider)
+DO UPDATE SET
+    status = 'connected',
+    access_token_encrypted = EXCLUDED.access_token_encrypted,
+    refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
+    expires_at = EXCLUDED.expires_at,
+    external_account_email = EXCLUDED.external_account_email,
+    updated_at = NOW();
+";
+
+        await using (var cmd = new NpgsqlCommand(upsertSql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("access_token", accessToken);
+            cmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("expires_at", expiresAt);
+            cmd.Parameters.AddWithValue("external_account_email", (object?)externalAccountEmail ?? DBNull.Value);
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        return Results.Content("Microsoft connected successfully. You can close this window.");
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Microsoft callback failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MICROSOFT SEND TEST EMAIL
+// =============================
+app.MapPost("/integrations/microsoft/send-test-email", async (SendTestEmailRequest request) =>
+{
+    try
+    {
+        if (!Guid.TryParse(request.InspectorId, out Guid inspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid InspectorId"
+            });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.ToEmail))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "ToEmail is required"
+            });
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    status
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = 'microsoft'
+LIMIT 1;";
+
+        string? accessToken = null;
+        string? refreshToken = null;
+        DateTime? expiresAt = null;
+        string? externalAccountEmail = null;
+        string? status = null;
+
+        await using (var cmd = new NpgsqlCommand(sql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+
+            await using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                accessToken = reader["access_token_encrypted"]?.ToString();
+                refreshToken = reader["refresh_token_encrypted"]?.ToString();
+                externalAccountEmail = reader["external_account_email"]?.ToString();
+                status = reader["status"]?.ToString();
+
+                if (reader["expires_at"] != DBNull.Value)
+                {
+                    expiresAt = Convert.ToDateTime(reader["expires_at"]);
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(accessToken) || !string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Microsoft is not connected for this inspector."
+            });
+        }
+
+        // VERY BASIC refresh handling
+        if (expiresAt.HasValue && expiresAt.Value <= DateTime.UtcNow.AddMinutes(5))
+        {
+            var clientId = builder.Configuration["MS_CLIENT_ID"];
+            var clientSecret = builder.Configuration["MS_CLIENT_SECRET"];
+            var redirectUri = builder.Configuration["MS_REDIRECT_URI"];
+
+            if (string.IsNullOrWhiteSpace(clientId) ||
+                string.IsNullOrWhiteSpace(clientSecret) ||
+                string.IsNullOrWhiteSpace(redirectUri))
+            {
+                return Results.Problem(
+                    title: "Microsoft config missing",
+                    detail: "MS_CLIENT_ID, MS_CLIENT_SECRET and/or MS_REDIRECT_URI are missing from Railway variables.",
+                    statusCode: 500
+                );
+            }
+
+            if (string.IsNullOrWhiteSpace(refreshToken))
+            {
+                return Results.BadRequest(new
+                {
+                    success = false,
+                    message = "Access token expired and no refresh token is stored."
+                });
+            }
+
+            using var refreshClient = new HttpClient();
+
+            var refreshResponse = await refreshClient.PostAsync(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                new FormUrlEncodedContent(new Dictionary<string, string>
+                {
+                    ["client_id"] = clientId,
+                    ["client_secret"] = clientSecret,
+                    ["refresh_token"] = refreshToken,
+                    ["grant_type"] = "refresh_token",
+                    ["redirect_uri"] = redirectUri,
+                    ["scope"] = "offline_access Mail.Send User.Read"
+                }));
+
+            var refreshJson = await refreshResponse.Content.ReadAsStringAsync();
+
+            if (!refreshResponse.IsSuccessStatusCode)
+            {
+                return Results.Problem(
+                    title: "Microsoft token refresh failed",
+                    detail: refreshJson,
+                    statusCode: 500
+                );
+            }
+
+            var refreshDoc = JsonDocument.Parse(refreshJson).RootElement;
+
+            accessToken = refreshDoc.GetProperty("access_token").GetString() ?? accessToken;
+            refreshToken = refreshDoc.TryGetProperty("refresh_token", out var refreshedTokenProp)
+                ? refreshedTokenProp.GetString() ?? refreshToken
+                : refreshToken;
+
+            var refreshedExpiresIn = refreshDoc.TryGetProperty("expires_in", out var refreshedExpiresInProp)
+                ? refreshedExpiresInProp.GetInt32()
+                : 3600;
+
+            expiresAt = DateTime.UtcNow.AddSeconds(refreshedExpiresIn);
+
+            const string updateSql = @"
+UPDATE public.inspector_integrations
+SET
+    access_token_encrypted = @access_token,
+    refresh_token_encrypted = @refresh_token,
+    expires_at = @expires_at,
+    updated_at = NOW()
+WHERE inspector_id = @inspector_id
+  AND provider = 'microsoft';";
+
+            await using var updateCmd = new NpgsqlCommand(updateSql, conn);
+            updateCmd.Parameters.AddWithValue("access_token", accessToken);
+            updateCmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+            updateCmd.Parameters.AddWithValue("expires_at", expiresAt.Value);
+            updateCmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            await updateCmd.ExecuteNonQueryAsync();
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        var emailBody = new
+        {
+            message = new
+            {
+                subject = string.IsNullOrWhiteSpace(request.Subject)
+                    ? "3D AutoMate Test Email"
+                    : request.Subject,
+                body = new
+                {
+                    contentType = "Text",
+                    content = string.IsNullOrWhiteSpace(request.Body)
+                        ? "This is a test email from 3D AutoMate."
+                        : request.Body
+                },
+                toRecipients = new[]
+                {
+                    new
+                    {
+                        emailAddress = new
+                        {
+                            address = request.ToEmail
+                        }
+                    }
+                }
+            }
+        };
+
+        var response = await httpClient.PostAsJsonAsync(
+            "https://graph.microsoft.com/v1.0/me/sendMail",
+            emailBody);
+
+        var responseText = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Microsoft send mail failed",
+                detail: responseText,
+                statusCode: 500
+            );
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Test email sent.",
+            inspectorId = request.InspectorId,
+            toEmail = request.ToEmail,
+            fromAccount = externalAccountEmail
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Send test email failed",
             detail: ex.ToString(),
             statusCode: 500
         );
@@ -1083,6 +1542,29 @@ DO UPDATE SET
 
 app.Run();
 
+static async Task EnsureInspectorIntegrationsTableAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.inspector_integrations
+(
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    inspector_id uuid NOT NULL,
+    provider text NOT NULL,
+    status text DEFAULT 'disconnected',
+    access_token_encrypted text NULL,
+    refresh_token_encrypted text NULL,
+    expires_at timestamptz NULL,
+    external_account_email text NULL,
+    external_tenant_id text NULL,
+    created_at timestamptz DEFAULT NOW(),
+    updated_at timestamptz DEFAULT NOW(),
+    CONSTRAINT uq_inspector_integrations_inspector_provider UNIQUE (inspector_id, provider)
+);";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
 static DateTime? ParseNullableDateTime(string? value)
 {
     if (string.IsNullOrWhiteSpace(value))
@@ -1097,6 +1579,14 @@ static DateTime? ParseNullableDateTime(string? value)
 public class BookingEmailFailureRequest
 {
     public string? ErrorMessage { get; set; }
+}
+
+public class SendTestEmailRequest
+{
+    public string InspectorId { get; set; } = "";
+    public string ToEmail { get; set; } = "";
+    public string Subject { get; set; } = "";
+    public string Body { get; set; } = "";
 }
 
 public class JobUploadRequest
