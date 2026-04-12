@@ -3168,6 +3168,33 @@ ADD COLUMN IF NOT EXISTS amount_outstanding decimal(10,2) NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS payment_status text NOT NULL DEFAULT 'unpaid';
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS primary_service_key text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS additional1_service_key text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS additional2_service_key text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_template_key text NOT NULL DEFAULT 'general_booking';
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_required boolean NOT NULL DEFAULT true;
 ";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
