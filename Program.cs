@@ -1409,6 +1409,8 @@ LIMIT 100;";
                 invoice_retry_requested_at = reader["invoice_retry_requested_at"]?.ToString(),
                 invoice_last_attempt_at = reader["invoice_last_attempt_at"]?.ToString(),
                 invoice_last_error = reader["invoice_last_error"]?.ToString(),
+                job_total = reader["job_total"]?.ToString(),
+                invoice_total = reader["job_total"]?.ToString(),
 
                 paid = reader["paid"]?.ToString(),
 
@@ -2353,6 +2355,8 @@ LIMIT 20;";
                 invoice_retry_requested_at = reader["invoice_retry_requested_at"]?.ToString(),
                 invoice_last_attempt_at = reader["invoice_last_attempt_at"]?.ToString(),
                 invoice_last_error = reader["invoice_last_error"]?.ToString(),
+                job_total = reader["job_total"]?.ToString(),
+                invoice_total = reader["job_total"]?.ToString(),
 
                 paid = reader["paid"]?.ToString(),
 
@@ -2590,6 +2594,7 @@ INSERT INTO public.jobs_staging
     status,
     zap_processed,
     report_sent,
+    job_total,
     primary_service,
     additional1,
     additional2,
@@ -2652,6 +2657,7 @@ VALUES
     @status,
     @zap_processed,
     @report_sent,
+    @job_total,
     @primary_service,
     @additional1,
     @additional2,
@@ -2713,6 +2719,7 @@ DO UPDATE SET
     status                       = EXCLUDED.status,
     zap_processed                = EXCLUDED.zap_processed,
     report_sent                  = EXCLUDED.report_sent,
+    job_total                    = EXCLUDED.job_total,
     primary_service              = EXCLUDED.primary_service,
     additional1                  = EXCLUDED.additional1,
     additional2                  = EXCLUDED.additional2,
@@ -2772,6 +2779,7 @@ DO UPDATE SET
             var jobDate = ParseNullableDateTime(payload.Job.JobDate);
             var sourceUpdatedAt = ParseNullableDateTime(payload.Job.SourceUpdatedAtUtc);
             var dateAdded = ParseNullableDateTime(payload.Job.DateAddedUtc);
+            var invoiceTotal = ParseNullableDecimal(payload.Job.InvoiceTotal);
 
             cmd.Parameters.AddWithValue("job_date", jobDate.HasValue ? jobDate.Value : (object)DBNull.Value);
             cmd.Parameters.AddWithValue("inspection_duration_minutes", payload.Job.InspectionDurationMinutes);
@@ -2781,6 +2789,7 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("status", payload.Job.Status ?? "");
             cmd.Parameters.AddWithValue("zap_processed", payload.Job.ZapProcessed ?? "");
             cmd.Parameters.AddWithValue("report_sent", payload.Job.ReportSent ?? "");
+            cmd.Parameters.AddWithValue("job_total", invoiceTotal.HasValue ? invoiceTotal.Value : (object)DBNull.Value);
             cmd.Parameters.AddWithValue("primary_service", payload.Services?.Primary ?? "");
             cmd.Parameters.AddWithValue("additional1", payload.Services?.Additional1 ?? "");
             cmd.Parameters.AddWithValue("additional2", payload.Services?.Additional2 ?? "");
@@ -3256,6 +3265,19 @@ static DateTime? ParseNullableDateTime(string? value)
     return null;
 }
 
+static decimal? ParseNullableDecimal(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return null;
+
+    var cleaned = value.Trim().Replace("$", "").Replace(",", "");
+
+    if (decimal.TryParse(cleaned, out var parsed))
+        return parsed;
+
+    return null;
+}
+
 static string BuildBookingTemplateKey(ServicesSection? services)
 {
     if (services == null)
@@ -3567,6 +3589,7 @@ public class JobSection
     public string Status { get; set; } = "";
     public string ZapProcessed { get; set; } = "";
     public string ReportSent { get; set; } = "";
+    public string InvoiceTotal { get; set; } = "";
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtraFields { get; set; }
 
