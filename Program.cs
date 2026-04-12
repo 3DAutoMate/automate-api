@@ -284,6 +284,24 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS report_last_error text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS marked_as_paid_override boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_available boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS job_total decimal(10,2) NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS amount_paid decimal(10,2) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS amount_outstanding decimal(10,2) NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS payment_status text NOT NULL DEFAULT 'unpaid';
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS workflow_updated_at timestamptz NOT NULL DEFAULT NOW();
 
 ALTER TABLE public.jobs_staging
@@ -814,6 +832,12 @@ SELECT
     j.invoice_last_attempt_at,
     j.invoice_last_error,
     j.paid,
+    j.marked_as_paid_override,
+    j.report_available,
+    j.job_total,
+    j.amount_paid,
+    j.amount_outstanding,
+    j.payment_status,
     j.calendar_created,
     j.calendar_created_at,
     j.calendar_retry_requested,
@@ -1148,6 +1172,575 @@ WHERE job_id = @job_id;
 });
 
 // =============================
+// MARK TERMS SENT
+// =============================
+app.MapPost("/jobs/{jobId}/mark-terms-sent", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    terms_sent = true,
+    terms_sent_at = NOW(),
+    terms_retry_requested = false,
+    terms_retry_requested_at = NULL,
+    terms_last_attempt_at = NOW(),
+    terms_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked terms sent for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark terms sent failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// REQUEST TERMS RETRY
+// =============================
+app.MapPost("/jobs/{jobId}/request-terms-retry", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    terms_retry_requested = true,
+    terms_retry_requested_at = NOW(),
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Requested terms retry for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request terms retry failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK TERMS FAILED
+// =============================
+
+app.MapPost("/jobs/{jobId}/mark-terms-failed", async (Guid jobId, TermsFailureRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    terms_last_attempt_at = NOW(),
+    terms_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("error_message", request.ErrorMessage ?? "Unknown error");
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked terms failed for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark terms failed failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK INVOICE SENT
+// =============================
+app.MapPost("/jobs/{jobId}/mark-invoice-sent", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    invoice_sent = true,
+    invoice_sent_at = NOW(),
+    invoice_retry_requested = false,
+    invoice_retry_requested_at = NULL,
+    invoice_last_attempt_at = NOW(),
+    invoice_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked invoice sent for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark invoice sent failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// REQUEST INVOICE RETRY
+// =============================
+app.MapPost("/jobs/{jobId}/request-invoice-retry", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    invoice_retry_requested = true,
+    invoice_retry_requested_at = NOW(),
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Requested invoice retry for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request invoice retry failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK INVOICE FAILED
+// =============================
+
+app.MapPost("/jobs/{jobId}/mark-invoice-failed", async (Guid jobId, InvoiceFailureRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    invoice_last_attempt_at = NOW(),
+    invoice_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("error_message", request.ErrorMessage ?? "Unknown error");
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked invoice failed for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark invoice failed failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK CALENDAR CREATED
+// =============================
+app.MapPost("/jobs/{jobId}/mark-calendar-created", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    calendar_created = true,
+    calendar_created_at = NOW(),
+    calendar_retry_requested = false,
+    calendar_retry_requested_at = NULL,
+    calendar_last_attempt_at = NOW(),
+    calendar_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked calendar created for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark calendar created failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// REQUEST CALENDAR RETRY
+// =============================
+app.MapPost("/jobs/{jobId}/request-calendar-retry", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    calendar_retry_requested = true,
+    calendar_retry_requested_at = NOW(),
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Requested calendar retry for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request calendar retry failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK CALENDAR FAILED
+// =============================
+
+app.MapPost("/jobs/{jobId}/mark-calendar-failed", async (Guid jobId, CalendarFailureRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    calendar_last_attempt_at = NOW(),
+    calendar_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("error_message", request.ErrorMessage ?? "Unknown error");
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked calendar failed for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark calendar failed failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK REPORT AVAILABLE
+// =============================
+app.MapPost("/jobs/{jobId}/mark-report-available", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    report_available = true,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked report available for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark report available failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK REPORT SENT
+// =============================
+app.MapPost("/jobs/{jobId}/mark-report-sent", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    report_workflow_sent = true,
+    report_workflow_sent_at = NOW(),
+    report_retry_requested = false,
+    report_retry_requested_at = NULL,
+    report_last_attempt_at = NOW(),
+    report_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked report sent for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark report sent failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// REQUEST REPORT RETRY
+// =============================
+app.MapPost("/jobs/{jobId}/request-report-retry", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    report_retry_requested = true,
+    report_retry_requested_at = NOW(),
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Requested report retry for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request report retry failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK REPORT FAILED
+// =============================
+
+app.MapPost("/jobs/{jobId}/mark-report-failed", async (Guid jobId, ReportFailureRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    report_last_attempt_at = NOW(),
+    report_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("error_message", request.ErrorMessage ?? "Unknown error");
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = $"Marked report failed for job {jobId}",
+            rows_affected = rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark report failed failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // GET LATEST JOBS
 // =============================
 app.MapGet("/jobs/latest", async () =>
@@ -1192,6 +1785,12 @@ SELECT
     invoice_last_attempt_at,
     invoice_last_error,
     paid,
+    marked_as_paid_override,
+    report_available,
+    job_total,
+    amount_paid,
+    amount_outstanding,
+    payment_status,
     calendar_created,
     calendar_created_at,
     calendar_retry_requested,
@@ -1756,6 +2355,11 @@ public class BookingEmailFailureRequest
 {
     public string? ErrorMessage { get; set; }
 }
+
+public record TermsFailureRequest(string ErrorMessage);
+public record InvoiceFailureRequest(string ErrorMessage);
+public record CalendarFailureRequest(string ErrorMessage);
+public record ReportFailureRequest(string ErrorMessage);
 
 public class SendTestEmailRequest
 {
