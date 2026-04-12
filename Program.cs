@@ -280,6 +280,57 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS report_required boolean NOT NULL DEFAULT true;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS building_type text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS stories text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS bedrooms text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS bathrooms text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS monolithic text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS outbuilding text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS occupied text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS attached_flat text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS travel_fee text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_bedrooms text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS meth_samples text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_reinspect text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS council_files text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS foundation_space text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_reinspect_date text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS access_by text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_compliance text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS contact1_salutation text NULL;
 
 ALTER TABLE public.jobs_staging
@@ -1221,6 +1272,23 @@ SELECT
     j.invoice_required,
     j.calendar_required,
     j.report_required,
+    j.building_type,
+    j.stories,
+    j.bedrooms,
+    j.bathrooms,
+    j.monolithic,
+    j.outbuilding,
+    j.occupied,
+    j.attached_flat,
+    j.travel_fee,
+    j.hhs_bedrooms,
+    j.meth_samples,
+    j.hhs_reinspect,
+    j.council_files,
+    j.foundation_space,
+    j.hhs_reinspect_date,
+    j.access_by,
+    j.hhs_compliance,
     j.contact1_salutation,
     j.contact1_first_name,
     j.contact1_last_name,
@@ -1368,6 +1436,28 @@ LIMIT 100;";
                 invoice_required = reader["invoice_required"]?.ToString(),
                 calendar_required = reader["calendar_required"]?.ToString(),
                 report_required = reader["report_required"]?.ToString(),
+                building_type = reader["building_type"]?.ToString(),
+                stories = reader["stories"]?.ToString(),
+                bedrooms = reader["bedrooms"]?.ToString(),
+                bathrooms = reader["bathrooms"]?.ToString(),
+                monolithic = reader["monolithic"]?.ToString(),
+                outbuilding = reader["outbuilding"]?.ToString(),
+                occupied = reader["occupied"]?.ToString(),
+                attached_flat = reader["attached_flat"]?.ToString(),
+                travel_fee = reader["travel_fee"]?.ToString(),
+                hhs_bedrooms = reader["hhs_bedrooms"]?.ToString(),
+                meth_samples = reader["meth_samples"]?.ToString(),
+                hhs_reinspect = reader["hhs_reinspect"]?.ToString(),
+                council_files = reader["council_files"]?.ToString(),
+                foundation_space = reader["foundation_space"]?.ToString(),
+                hhs_reinspect_date = reader["hhs_reinspect_date"]?.ToString(),
+                access_by = reader["access_by"]?.ToString(),
+                hhs_compliance = reader["hhs_compliance"]?.ToString(),
+                outbuilding_scope_label = ToScopeLabel(reader["outbuilding"]?.ToString()),
+                attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
+                council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
+                additional_services_text = BuildAdditionalServicesText(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
+                additional_services_html = BuildAdditionalServicesHtml(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
 
                 contact1_salutation = reader["contact1_salutation"]?.ToString(),
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
@@ -2427,6 +2517,23 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     invoice_required boolean NOT NULL DEFAULT true,
     calendar_required boolean NOT NULL DEFAULT true,
     report_required boolean NOT NULL DEFAULT true,
+    building_type text,
+    stories text,
+    bedrooms text,
+    bathrooms text,
+    monolithic text,
+    outbuilding text,
+    occupied text,
+    attached_flat text,
+    travel_fee text,
+    hhs_bedrooms text,
+    meth_samples text,
+    hhs_reinspect text,
+    council_files text,
+    foundation_space text,
+    hhs_reinspect_date text,
+    access_by text,
+    hhs_compliance text,
     contact1_salutation text,
     contact1_first_name text,
     contact1_last_name text,
@@ -2495,6 +2602,23 @@ INSERT INTO public.jobs_staging
     invoice_required,
     calendar_required,
     report_required,
+    building_type,
+    stories,
+    bedrooms,
+    bathrooms,
+    monolithic,
+    outbuilding,
+    occupied,
+    attached_flat,
+    travel_fee,
+    hhs_bedrooms,
+    meth_samples,
+    hhs_reinspect,
+    council_files,
+    foundation_space,
+    hhs_reinspect_date,
+    access_by,
+    hhs_compliance,
     contact1_salutation,
     contact1_first_name,
     contact1_last_name,
@@ -2540,6 +2664,23 @@ VALUES
     @invoice_required,
     @calendar_required,
     @report_required,
+    @building_type,
+    @stories,
+    @bedrooms,
+    @bathrooms,
+    @monolithic,
+    @outbuilding,
+    @occupied,
+    @attached_flat,
+    @travel_fee,
+    @hhs_bedrooms,
+    @meth_samples,
+    @hhs_reinspect,
+    @council_files,
+    @foundation_space,
+    @hhs_reinspect_date,
+    @access_by,
+    @hhs_compliance,
     @contact1_salutation,
     @contact1_first_name,
     @contact1_last_name,
@@ -2584,6 +2725,23 @@ DO UPDATE SET
     invoice_required             = EXCLUDED.invoice_required,
     calendar_required            = EXCLUDED.calendar_required,
     report_required              = EXCLUDED.report_required,
+    building_type                = EXCLUDED.building_type,
+    stories                      = EXCLUDED.stories,
+    bedrooms                     = EXCLUDED.bedrooms,
+    bathrooms                    = EXCLUDED.bathrooms,
+    monolithic                   = EXCLUDED.monolithic,
+    outbuilding                  = EXCLUDED.outbuilding,
+    occupied                     = EXCLUDED.occupied,
+    attached_flat                = EXCLUDED.attached_flat,
+    travel_fee                   = EXCLUDED.travel_fee,
+    hhs_bedrooms                 = EXCLUDED.hhs_bedrooms,
+    meth_samples                 = EXCLUDED.meth_samples,
+    hhs_reinspect                = EXCLUDED.hhs_reinspect,
+    council_files                = EXCLUDED.council_files,
+    foundation_space             = EXCLUDED.foundation_space,
+    hhs_reinspect_date           = EXCLUDED.hhs_reinspect_date,
+    access_by                    = EXCLUDED.access_by,
+    hhs_compliance               = EXCLUDED.hhs_compliance,
     contact1_salutation          = EXCLUDED.contact1_salutation,
     contact1_first_name          = EXCLUDED.contact1_first_name,
     contact1_last_name           = EXCLUDED.contact1_last_name,
@@ -2635,6 +2793,23 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("invoice_required", payload.Services?.InvoiceRequired ?? true);
             cmd.Parameters.AddWithValue("calendar_required", payload.Services?.CalendarRequired ?? true);
             cmd.Parameters.AddWithValue("report_required", payload.Services?.ReportRequired ?? true);
+            cmd.Parameters.AddWithValue("building_type", payload.JobDetails?.BuildingType ?? "");
+            cmd.Parameters.AddWithValue("stories", payload.JobDetails?.Stories ?? "");
+            cmd.Parameters.AddWithValue("bedrooms", payload.JobDetails?.Bedrooms ?? "");
+            cmd.Parameters.AddWithValue("bathrooms", payload.JobDetails?.Bathrooms ?? "");
+            cmd.Parameters.AddWithValue("monolithic", payload.JobDetails?.Monolithic ?? "");
+            cmd.Parameters.AddWithValue("outbuilding", payload.JobDetails?.Outbuilding ?? "");
+            cmd.Parameters.AddWithValue("occupied", payload.JobDetails?.Occupied ?? "");
+            cmd.Parameters.AddWithValue("attached_flat", payload.JobDetails?.AttachedFlat ?? "");
+            cmd.Parameters.AddWithValue("travel_fee", payload.JobDetails?.TravelFee ?? "");
+            cmd.Parameters.AddWithValue("hhs_bedrooms", payload.JobDetails?.HhsBedrooms ?? "");
+            cmd.Parameters.AddWithValue("meth_samples", payload.JobDetails?.MethSamples ?? "");
+            cmd.Parameters.AddWithValue("hhs_reinspect", payload.JobDetails?.HhsReinspect ?? "");
+            cmd.Parameters.AddWithValue("council_files", payload.JobDetails?.CouncilFiles ?? "");
+            cmd.Parameters.AddWithValue("foundation_space", payload.JobDetails?.FoundationSpace ?? "");
+            cmd.Parameters.AddWithValue("hhs_reinspect_date", payload.JobDetails?.HhsReinspectDate ?? "");
+            cmd.Parameters.AddWithValue("access_by", payload.JobDetails?.AccessBy ?? "");
+            cmd.Parameters.AddWithValue("hhs_compliance", payload.JobDetails?.HhsCompliance ?? "");
             cmd.Parameters.AddWithValue("contact1_salutation", payload.Contact1?.Salutation ?? "");
             cmd.Parameters.AddWithValue("contact1_first_name", payload.Contact1?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact1_last_name", payload.Contact1?.LastName ?? "");
@@ -3145,6 +3320,43 @@ static string InferCanonicalServiceType(string? serviceName)
     return "other";
 }
 
+static string ToScopeLabel(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "Not specified";
+
+    var trimmed = value.Trim();
+    var normalized = trimmed.ToLowerInvariant();
+
+    if (normalized == "yes" || normalized == "true" || normalized == "included" || normalized == "include")
+        return "Included";
+
+    if (normalized == "no" || normalized == "false" || normalized == "excluded" || normalized == "exclude")
+        return "Excluded";
+
+    return trimmed;
+}
+
+static string BuildAdditionalServicesText(string? additional1, string? additional2)
+{
+    var services = new[] { additional1, additional2 }
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Select(value => value!.Trim())
+        .ToList();
+
+    return services.Count == 0 ? "None" : string.Join(Environment.NewLine, services);
+}
+
+static string BuildAdditionalServicesHtml(string? additional1, string? additional2)
+{
+    var services = new[] { additional1, additional2 }
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Select(value => System.Net.WebUtility.HtmlEncode(value!.Trim()))
+        .ToList();
+
+    return services.Count == 0 ? "None" : string.Join("<br>", services);
+}
+
 static async Task EnsureJobPaymentColumnsAsync(NpgsqlConnection conn)
 {
     const string sql = @"
@@ -3195,6 +3407,57 @@ ADD COLUMN IF NOT EXISTS calendar_required boolean NOT NULL DEFAULT true;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS report_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS building_type text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS stories text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS bedrooms text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS bathrooms text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS monolithic text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS outbuilding text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS occupied text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS attached_flat text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS travel_fee text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_bedrooms text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS meth_samples text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_reinspect text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS council_files text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS foundation_space text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_reinspect_date text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS access_by text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS hhs_compliance text NULL;
 ";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
@@ -3281,6 +3544,7 @@ public class JobUploadRequest
     public string TenantId { get; set; } = "";
     public JobSection Job { get; set; } = new JobSection();
     public ServicesSection Services { get; set; } = new ServicesSection();
+    public JobDetailsSection JobDetails { get; set; } = new JobDetailsSection();
     public ContactFlat Contact1 { get; set; } = new ContactFlat();
     public ContactFlat Contact2 { get; set; } = new ContactFlat();
     public MetaSection Meta { get; set; } = new MetaSection();
@@ -3341,6 +3605,28 @@ public class ServicesSection
     public bool? InvoiceRequired { get; set; }
     public bool? CalendarRequired { get; set; }
     public bool? ReportRequired { get; set; }
+}
+
+public class JobDetailsSection
+{
+    public string AgeOfBuilding { get; set; } = "";
+    public string BuildingType { get; set; } = "";
+    public string Stories { get; set; } = "";
+    public string Bedrooms { get; set; } = "";
+    public string Bathrooms { get; set; } = "";
+    public string Monolithic { get; set; } = "";
+    public string Outbuilding { get; set; } = "";
+    public string Occupied { get; set; } = "";
+    public string AttachedFlat { get; set; } = "";
+    public string TravelFee { get; set; } = "";
+    public string HhsBedrooms { get; set; } = "";
+    public string MethSamples { get; set; } = "";
+    public string HhsReinspect { get; set; } = "";
+    public string CouncilFiles { get; set; } = "";
+    public string FoundationSpace { get; set; } = "";
+    public string HhsReinspectDate { get; set; } = "";
+    public string AccessBy { get; set; } = "";
+    public string HhsCompliance { get; set; } = "";
 }
 
 public class ContactFlat
