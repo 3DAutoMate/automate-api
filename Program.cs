@@ -128,6 +128,9 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS inspector_name text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS age_of_building text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS job_date timestamptz NULL;
 
 ALTER TABLE public.jobs_staging
@@ -807,6 +810,7 @@ SELECT
     j.source_system,
     j.job_name,
     j.site_address,
+    j.age_of_building,
     j.job_date,
     j.inspection_duration_minutes,
     j.source_updated_at,
@@ -939,6 +943,7 @@ LIMIT 100;";
                 source_system = reader["source_system"]?.ToString(),
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
+                age_of_building = reader["age_of_building"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
                 inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
                 source_updated_at = reader["source_updated_at"]?.ToString(),
@@ -1762,6 +1767,7 @@ SELECT
     source_system,
     job_name,
     site_address,
+    age_of_building,
     job_date,
     inspection_duration_minutes,
     source_updated_at,
@@ -1845,6 +1851,7 @@ LIMIT 20;";
                 source_system = reader["source_system"]?.ToString(),
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
+                age_of_building = reader["age_of_building"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
                 inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
                 source_updated_at = reader["source_updated_at"]?.ToString(),
@@ -1992,6 +1999,7 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     source_system text,
     job_name text,
     site_address text,
+    age_of_building text,
     job_date timestamptz NULL,
     inspection_duration_minutes integer NULL,
     source_updated_at timestamptz NULL,
@@ -2075,6 +2083,7 @@ INSERT INTO public.jobs_staging
     source_system,
     job_name,
     site_address,
+    age_of_building,
     job_date,
     inspection_duration_minutes,
     source_updated_at,
@@ -2110,6 +2119,7 @@ VALUES
     @source_system,
     @job_name,
     @site_address,
+    @age_of_building,
     @job_date,
     @inspection_duration_minutes,
     @source_updated_at,
@@ -2144,6 +2154,7 @@ DO UPDATE SET
     source_system                = EXCLUDED.source_system,
     job_name                     = EXCLUDED.job_name,
     site_address                 = EXCLUDED.site_address,
+    age_of_building              = EXCLUDED.age_of_building,
     job_date                     = EXCLUDED.job_date,
     inspection_duration_minutes  = EXCLUDED.inspection_duration_minutes,
     source_updated_at            = EXCLUDED.source_updated_at,
@@ -2179,6 +2190,7 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("source_system", payload.SourceSystem ?? "");
             cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
             cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
+            cmd.Parameters.AddWithValue("age_of_building", payload.Job.AgeOfBuilding ?? "");
 
             var jobDate = ParseNullableDateTime(payload.Job.JobDate);
             var sourceUpdatedAt = ParseNullableDateTime(payload.Job.SourceUpdatedAtUtc);
@@ -2366,6 +2378,9 @@ static async Task EnsureJobPaymentColumnsAsync(NpgsqlConnection conn)
 {
     const string sql = @"
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS age_of_building text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS marked_as_paid_override boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.jobs_staging
@@ -2424,6 +2439,7 @@ public class JobSection
     public string InspectorName { get; set; } = "";
     public string JobName { get; set; } = "";
     public string SiteAddress { get; set; } = "";
+    public string AgeOfBuilding { get; set; } = "";
     public string JobDate { get; set; } = "";
     public int InspectionDurationMinutes { get; set; } = 0;
     public string SourceUpdatedAtUtc { get; set; } = "";
