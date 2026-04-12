@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Npgsql;
@@ -39,6 +40,30 @@ else
 {
     connectionString = rawConnectionString;
 }
+
+var V1MappingFields = new List<V1MappingField>
+{
+    new("primary_service", "CustomText1", "Primary Service", true, true, "all_services", ""),
+    new("additional_service_1", "CustomText2", "Additional Service 1", true, true, "all_services", ""),
+    new("additional_service_2", "CustomText3", "Additional Service 2", true, true, "all_services", ""),
+    new("age_of_building", "CustomText4", "Age of Building", true, true, "building_inspection", "Show for all services; affects pricing for building inspection only."),
+    new("building_type", "CustomText5", "Building Type", true, true, "building_inspection", "Affects building inspection only."),
+    new("number_of_stories", "CustomText6", "Number Of Stories", true, true, "building_inspection", "Affects building inspection only."),
+    new("number_of_bedrooms", "CustomText7", "Number Of Bedrooms", true, true, "building_inspection", "Affects building inspection only."),
+    new("number_of_bathrooms", "CustomText8", "Number Of Bathrooms", true, true, "building_inspection", "Affects building inspection only."),
+    new("monolithic_or_plaster_cladding", "CustomText9", "Monolithic or Plaster Cladding?", true, true, "building_inspection", ""),
+    new("inspect_separate_outbuildings", "CustomText10", "Inspect Separate Outbuilding(s)?", true, true, "building_inspection", "Inclusion/exclusion for building inspection."),
+    new("house_occupied", "CustomText11", "House Occupied?", true, true, "building_inspection", ""),
+    new("inspect_attached_flat", "CustomText12", "Inspect Attached Flat?", true, true, "building_inspection", "Inclusion/exclusion for building inspection."),
+    new("travel_fee", "CustomText13", "Travel Fee?", true, true, "all_services", "Can affect all services."),
+    new("healthy_homes_number_of_bedrooms", "CustomText14", "Healthy Homes Number Of Bedrooms", true, true, "healthy_homes", "Healthy Homes Assessment only."),
+    new("meth_testing_number_of_samples", "CustomText15", "Meth Testing Number Of Samples", true, true, "meth_testing", "Meth testing only."),
+    new("healthy_homes_reinspect_failed", "CustomText16", "Reinspect Failed Healthy Homes Assessment", true, true, "healthy_homes", "Healthy Homes Assessment only."),
+    new("review_council_files", "CustomText17", "Review Council Files?", true, true, "building_inspection", "Inclusion/exclusion for building inspection."),
+    new("foundation_space_to_inspect", "CustomText18", "Foundation Space To Inspect?", true, true, "building_inspection", "Affects building inspection only."),
+    new("healthy_homes_reinspection_date", "CustomText19", "Reinspection Date For Healthy Homes", true, true, "healthy_homes", "Healthy Homes Assessment only."),
+    new("property_access_by", "CustomText23", "Property Access By?", false, true, "all_services", "")
+};
 
 var app = builder.Build();
 
@@ -356,6 +381,297 @@ app.MapPost("/integrations/ensure-tables", async () =>
     {
         return Results.Problem(
             title: "Ensure integration tables failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// ENSURE MAPPING TABLES
+// =============================
+app.MapPost("/mappings/ensure-tables", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await EnsureMappingTablesAsync(conn);
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Mapping tables ensured"
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Ensure mapping tables failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// V1 MAPPING TEMPLATE
+// =============================
+app.MapGet("/mappings/v1-template", () => Results.Ok(new
+{
+    success = true,
+    pricing_authority = "THREED tblItem",
+    modifier_pricing = "capture_only",
+    workflow_state_source = "Railway",
+    fields = V1MappingFields
+}));
+
+// =============================
+// CONNECTOR DISCOVERY SYNC
+// =============================
+app.MapPost("/inspectors/{inspectorId}/mappings/discovery", async (Guid inspectorId, MappingDiscoverySyncRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureMappingTablesAsync(conn);
+
+        await using var tx = await conn.BeginTransactionAsync();
+
+        int mappingCount = 0;
+        var mappings = request.FieldMappings.Count > 0
+            ? request.FieldMappings
+            : V1MappingFields.Select(f => new MappingFieldInput
+            {
+                CanonicalFieldName = f.CanonicalFieldName,
+                ThreedColumnName = f.ThreedColumnName,
+                ThreedLabel = f.ThreedLabel,
+                CanAffectPricing = f.CanAffectPricing,
+                V1Enabled = f.V1Enabled,
+                ServiceScope = f.ServiceScope,
+                Notes = f.Notes
+            }).ToList();
+
+        foreach (var mapping in mappings)
+        {
+            await UpsertMappingFieldAsync(conn, tx, inspectorId, mapping, false);
+            mappingCount++;
+        }
+
+        int catalogCount = 0;
+        foreach (var item in request.ServiceCatalogItems)
+        {
+            await UpsertServiceCatalogItemAsync(conn, tx, inspectorId, item);
+            catalogCount++;
+        }
+
+        const string syncSql = @"
+INSERT INTO public.mapping_discovery_syncs
+(
+    inspector_id,
+    connector_version,
+    source_instance,
+    field_mapping_count,
+    service_catalog_count,
+    raw_payload_json,
+    created_at
+)
+VALUES
+(
+    @inspector_id,
+    @connector_version,
+    @source_instance,
+    @field_mapping_count,
+    @service_catalog_count,
+    CAST(@raw_payload_json AS jsonb),
+    NOW()
+);";
+
+        await using (var cmd = new NpgsqlCommand(syncSql, conn, tx))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("connector_version", request.ConnectorVersion ?? "");
+            cmd.Parameters.AddWithValue("source_instance", request.SourceInstance ?? "");
+            cmd.Parameters.AddWithValue("field_mapping_count", mappingCount);
+            cmd.Parameters.AddWithValue("service_catalog_count", catalogCount);
+            cmd.Parameters.AddWithValue("raw_payload_json", JsonSerializer.Serialize(request));
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        await tx.CommitAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Mapping discovery synced",
+            inspector_id = inspectorId,
+            field_mapping_count = mappingCount,
+            service_catalog_count = catalogCount
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mapping discovery sync failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// CONFIRM INSPECTOR MAPPINGS
+// =============================
+app.MapPost("/inspectors/{inspectorId}/mappings/confirm", async (Guid inspectorId, ConfirmMappingsRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureMappingTablesAsync(conn);
+
+        await using var tx = await conn.BeginTransactionAsync();
+
+        int mappingCount = 0;
+        foreach (var mapping in request.FieldMappings)
+        {
+            await UpsertMappingFieldAsync(conn, tx, inspectorId, mapping, true);
+            mappingCount++;
+        }
+
+        await tx.CommitAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Mappings confirmed",
+            inspector_id = inspectorId,
+            confirmed_mapping_count = mappingCount
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Confirm mappings failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// GET INSPECTOR MAPPING PROFILE
+// =============================
+app.MapGet("/inspectors/{inspectorId}/mappings/profile", async (Guid inspectorId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureMappingTablesAsync(conn);
+
+        var mappings = new List<object>();
+        const string mappingSql = @"
+SELECT
+    canonical_field_name,
+    threed_column_name,
+    threed_label,
+    source_table_name,
+    source_list_name,
+    invoice_item_id,
+    invoice_item_name,
+    pricing_affects,
+    v1_enabled,
+    service_scope,
+    notes,
+    is_confirmed,
+    updated_at
+FROM public.inspector_field_mappings
+WHERE inspector_id = @inspector_id
+ORDER BY threed_column_name;";
+
+        await using (var cmd = new NpgsqlCommand(mappingSql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            await using var reader = await cmd.ExecuteReaderAsync();
+
+            while (await reader.ReadAsync())
+            {
+                mappings.Add(new
+                {
+                    canonical_field_name = reader["canonical_field_name"]?.ToString(),
+                    threed_column_name = reader["threed_column_name"]?.ToString(),
+                    threed_label = reader["threed_label"]?.ToString(),
+                    source_table_name = reader["source_table_name"]?.ToString(),
+                    source_list_name = reader["source_list_name"]?.ToString(),
+                    invoice_item_id = reader["invoice_item_id"]?.ToString(),
+                    invoice_item_name = reader["invoice_item_name"]?.ToString(),
+                    pricing_affects = reader["pricing_affects"]?.ToString(),
+                    v1_enabled = reader["v1_enabled"]?.ToString(),
+                    service_scope = reader["service_scope"]?.ToString(),
+                    notes = reader["notes"]?.ToString(),
+                    is_confirmed = reader["is_confirmed"]?.ToString(),
+                    updated_at = reader["updated_at"]?.ToString()
+                });
+            }
+        }
+
+        var serviceCatalog = new List<object>();
+        const string catalogSql = @"
+SELECT
+    catalog_item_key,
+    list_item_id,
+    list_item_name,
+    list_name,
+    invoice_item_id,
+    invoice_item_name,
+    unit_price,
+    is_active,
+    pricing_authority,
+    last_synced_at
+FROM public.inspector_service_catalog
+WHERE inspector_id = @inspector_id
+ORDER BY list_name, list_item_name, invoice_item_name;";
+
+        await using (var cmd = new NpgsqlCommand(catalogSql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            await using var reader = await cmd.ExecuteReaderAsync();
+
+            while (await reader.ReadAsync())
+            {
+                serviceCatalog.Add(new
+                {
+                    catalog_item_key = reader["catalog_item_key"]?.ToString(),
+                    list_item_id = reader["list_item_id"]?.ToString(),
+                    list_item_name = reader["list_item_name"]?.ToString(),
+                    list_name = reader["list_name"]?.ToString(),
+                    invoice_item_id = reader["invoice_item_id"]?.ToString(),
+                    invoice_item_name = reader["invoice_item_name"]?.ToString(),
+                    unit_price = reader["unit_price"]?.ToString(),
+                    is_active = reader["is_active"]?.ToString(),
+                    pricing_authority = reader["pricing_authority"]?.ToString(),
+                    last_synced_at = reader["last_synced_at"]?.ToString()
+                });
+            }
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            inspector_id = inspectorId,
+            pricing_authority = "THREED tblItem",
+            modifier_pricing = "capture_only",
+            mappings,
+            service_catalog = serviceCatalog
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Get mapping profile failed",
             detail: ex.ToString(),
             statusCode: 500
         );
@@ -2191,7 +2507,7 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("source_system", payload.SourceSystem ?? "");
             cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
             cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
-            cmd.Parameters.AddWithValue("age_of_building", payload.Job.AgeOfBuilding ?? "");
+            cmd.Parameters.AddWithValue("age_of_building", payload.Job.GetAgeOfBuilding());
 
             var jobDate = ParseNullableDateTime(payload.Job.JobDate);
             var sourceUpdatedAt = ParseNullableDateTime(payload.Job.SourceUpdatedAtUtc);
@@ -2364,6 +2680,221 @@ CREATE TABLE IF NOT EXISTS public.inspector_integrations
     await cmd.ExecuteNonQueryAsync();
 }
 
+static async Task EnsureMappingTablesAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.inspector_field_mappings
+(
+    inspector_field_mapping_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    inspector_id uuid NOT NULL,
+    canonical_field_name text NOT NULL,
+    threed_column_name text NOT NULL,
+    threed_label text NULL,
+    source_table_name text NULL,
+    source_list_name text NULL,
+    invoice_item_id text NULL,
+    invoice_item_name text NULL,
+    pricing_affects boolean NOT NULL DEFAULT false,
+    v1_enabled boolean NOT NULL DEFAULT true,
+    service_scope text NULL,
+    notes text NULL,
+    is_confirmed boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_inspector_field_mappings_field UNIQUE (inspector_id, canonical_field_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspector_field_mappings_inspector_id
+ON public.inspector_field_mappings(inspector_id);
+
+CREATE TABLE IF NOT EXISTS public.inspector_service_catalog
+(
+    service_catalog_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    inspector_id uuid NOT NULL,
+    catalog_item_key text NOT NULL,
+    list_item_id text NULL,
+    list_item_name text NULL,
+    list_name text NULL,
+    invoice_item_id text NULL,
+    invoice_item_name text NULL,
+    unit_price numeric(10,2) NULL,
+    is_active boolean NOT NULL DEFAULT true,
+    pricing_authority text NOT NULL DEFAULT 'THREED tblItem',
+    raw_payload_json jsonb NULL,
+    last_synced_at timestamptz NOT NULL DEFAULT NOW(),
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_inspector_service_catalog_key UNIQUE (inspector_id, catalog_item_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspector_service_catalog_inspector_id
+ON public.inspector_service_catalog(inspector_id);
+
+CREATE TABLE IF NOT EXISTS public.mapping_discovery_syncs
+(
+    mapping_discovery_sync_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    inspector_id uuid NOT NULL,
+    connector_version text NULL,
+    source_instance text NULL,
+    field_mapping_count integer NOT NULL DEFAULT 0,
+    service_catalog_count integer NOT NULL DEFAULT 0,
+    raw_payload_json jsonb NULL,
+    created_at timestamptz NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mapping_discovery_syncs_inspector_id
+ON public.mapping_discovery_syncs(inspector_id);
+";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task UpsertMappingFieldAsync(
+    NpgsqlConnection conn,
+    NpgsqlTransaction tx,
+    Guid inspectorId,
+    MappingFieldInput mapping,
+    bool isConfirmed)
+{
+    const string sql = @"
+INSERT INTO public.inspector_field_mappings
+(
+    inspector_id,
+    canonical_field_name,
+    threed_column_name,
+    threed_label,
+    source_table_name,
+    source_list_name,
+    invoice_item_id,
+    invoice_item_name,
+    pricing_affects,
+    v1_enabled,
+    service_scope,
+    notes,
+    is_confirmed,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    @canonical_field_name,
+    @threed_column_name,
+    @threed_label,
+    @source_table_name,
+    @source_list_name,
+    @invoice_item_id,
+    @invoice_item_name,
+    @pricing_affects,
+    @v1_enabled,
+    @service_scope,
+    @notes,
+    @is_confirmed,
+    NOW()
+)
+ON CONFLICT (inspector_id, canonical_field_name)
+DO UPDATE SET
+    threed_column_name = EXCLUDED.threed_column_name,
+    threed_label = EXCLUDED.threed_label,
+    source_table_name = EXCLUDED.source_table_name,
+    source_list_name = EXCLUDED.source_list_name,
+    invoice_item_id = EXCLUDED.invoice_item_id,
+    invoice_item_name = EXCLUDED.invoice_item_name,
+    pricing_affects = EXCLUDED.pricing_affects,
+    v1_enabled = EXCLUDED.v1_enabled,
+    service_scope = EXCLUDED.service_scope,
+    notes = EXCLUDED.notes,
+    is_confirmed = public.inspector_field_mappings.is_confirmed OR EXCLUDED.is_confirmed,
+    updated_at = NOW();";
+
+    await using var cmd = new NpgsqlCommand(sql, conn, tx);
+    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    cmd.Parameters.AddWithValue("canonical_field_name", mapping.CanonicalFieldName ?? "");
+    cmd.Parameters.AddWithValue("threed_column_name", mapping.ThreedColumnName ?? "");
+    cmd.Parameters.AddWithValue("threed_label", mapping.ThreedLabel ?? "");
+    cmd.Parameters.AddWithValue("source_table_name", mapping.SourceTableName ?? "dbo.tblListItem");
+    cmd.Parameters.AddWithValue("source_list_name", mapping.SourceListName ?? "");
+    cmd.Parameters.AddWithValue("invoice_item_id", mapping.InvoiceItemId ?? "");
+    cmd.Parameters.AddWithValue("invoice_item_name", mapping.InvoiceItemName ?? "");
+    cmd.Parameters.AddWithValue("pricing_affects", mapping.CanAffectPricing);
+    cmd.Parameters.AddWithValue("v1_enabled", mapping.V1Enabled);
+    cmd.Parameters.AddWithValue("service_scope", mapping.ServiceScope ?? "");
+    cmd.Parameters.AddWithValue("notes", mapping.Notes ?? "");
+    cmd.Parameters.AddWithValue("is_confirmed", isConfirmed);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task UpsertServiceCatalogItemAsync(
+    NpgsqlConnection conn,
+    NpgsqlTransaction tx,
+    Guid inspectorId,
+    ServiceCatalogItemInput item)
+{
+    const string sql = @"
+INSERT INTO public.inspector_service_catalog
+(
+    inspector_id,
+    catalog_item_key,
+    list_item_id,
+    list_item_name,
+    list_name,
+    invoice_item_id,
+    invoice_item_name,
+    unit_price,
+    is_active,
+    pricing_authority,
+    raw_payload_json,
+    last_synced_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    @catalog_item_key,
+    @list_item_id,
+    @list_item_name,
+    @list_name,
+    @invoice_item_id,
+    @invoice_item_name,
+    @unit_price,
+    @is_active,
+    'THREED tblItem',
+    CAST(@raw_payload_json AS jsonb),
+    NOW(),
+    NOW()
+)
+ON CONFLICT (inspector_id, catalog_item_key)
+DO UPDATE SET
+    list_item_id = EXCLUDED.list_item_id,
+    list_item_name = EXCLUDED.list_item_name,
+    list_name = EXCLUDED.list_name,
+    invoice_item_id = EXCLUDED.invoice_item_id,
+    invoice_item_name = EXCLUDED.invoice_item_name,
+    unit_price = EXCLUDED.unit_price,
+    is_active = EXCLUDED.is_active,
+    pricing_authority = EXCLUDED.pricing_authority,
+    raw_payload_json = EXCLUDED.raw_payload_json,
+    last_synced_at = NOW(),
+    updated_at = NOW();";
+
+    var key = !string.IsNullOrWhiteSpace(item.CatalogItemKey)
+        ? item.CatalogItemKey
+        : $"{item.ListName}|{item.ListItemId}|{item.InvoiceItemId}|{item.ListItemName}|{item.InvoiceItemName}";
+
+    await using var cmd = new NpgsqlCommand(sql, conn, tx);
+    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    cmd.Parameters.AddWithValue("catalog_item_key", key);
+    cmd.Parameters.AddWithValue("list_item_id", item.ListItemId ?? "");
+    cmd.Parameters.AddWithValue("list_item_name", item.ListItemName ?? "");
+    cmd.Parameters.AddWithValue("list_name", item.ListName ?? "");
+    cmd.Parameters.AddWithValue("invoice_item_id", item.InvoiceItemId ?? "");
+    cmd.Parameters.AddWithValue("invoice_item_name", item.InvoiceItemName ?? "");
+    cmd.Parameters.AddWithValue("unit_price", item.UnitPrice.HasValue ? item.UnitPrice.Value : (object)DBNull.Value);
+    cmd.Parameters.AddWithValue("is_active", item.IsActive);
+    cmd.Parameters.AddWithValue("raw_payload_json", JsonSerializer.Serialize(item));
+    await cmd.ExecuteNonQueryAsync();
+}
+
 static DateTime? ParseNullableDateTime(string? value)
 {
     if (string.IsNullOrWhiteSpace(value))
@@ -2413,6 +2944,54 @@ public record TermsFailureRequest(string ErrorMessage);
 public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
+public record V1MappingField(
+    string CanonicalFieldName,
+    string ThreedColumnName,
+    string ThreedLabel,
+    bool CanAffectPricing,
+    bool V1Enabled,
+    string ServiceScope,
+    string Notes);
+
+public class MappingDiscoverySyncRequest
+{
+    public string ConnectorVersion { get; set; } = "";
+    public string SourceInstance { get; set; } = "";
+    public List<MappingFieldInput> FieldMappings { get; set; } = new();
+    public List<ServiceCatalogItemInput> ServiceCatalogItems { get; set; } = new();
+}
+
+public class ConfirmMappingsRequest
+{
+    public List<MappingFieldInput> FieldMappings { get; set; } = new();
+}
+
+public class MappingFieldInput
+{
+    public string CanonicalFieldName { get; set; } = "";
+    public string ThreedColumnName { get; set; } = "";
+    public string ThreedLabel { get; set; } = "";
+    public string SourceTableName { get; set; } = "";
+    public string SourceListName { get; set; } = "";
+    public string InvoiceItemId { get; set; } = "";
+    public string InvoiceItemName { get; set; } = "";
+    public bool CanAffectPricing { get; set; } = false;
+    public bool V1Enabled { get; set; } = true;
+    public string ServiceScope { get; set; } = "";
+    public string Notes { get; set; } = "";
+}
+
+public class ServiceCatalogItemInput
+{
+    public string CatalogItemKey { get; set; } = "";
+    public string ListItemId { get; set; } = "";
+    public string ListItemName { get; set; } = "";
+    public string ListName { get; set; } = "";
+    public string InvoiceItemId { get; set; } = "";
+    public string InvoiceItemName { get; set; } = "";
+    public decimal? UnitPrice { get; set; }
+    public bool IsActive { get; set; } = true;
+}
 
 public class SendTestEmailRequest
 {
@@ -2441,6 +3020,8 @@ public class JobSection
     public string JobName { get; set; } = "";
     public string SiteAddress { get; set; } = "";
     public string AgeOfBuilding { get; set; } = "";
+    [JsonPropertyName("age_of_building")]
+    public string AgeOfBuildingSnake { get; set; } = "";
     public string JobDate { get; set; } = "";
     public int InspectionDurationMinutes { get; set; } = 0;
     public string SourceUpdatedAtUtc { get; set; } = "";
@@ -2448,6 +3029,28 @@ public class JobSection
     public string Status { get; set; } = "";
     public string ZapProcessed { get; set; } = "";
     public string ReportSent { get; set; } = "";
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtraFields { get; set; }
+
+    public string GetAgeOfBuilding()
+    {
+        if (!string.IsNullOrWhiteSpace(AgeOfBuilding))
+            return AgeOfBuilding;
+
+        if (!string.IsNullOrWhiteSpace(AgeOfBuildingSnake))
+            return AgeOfBuildingSnake;
+
+        if (ExtraFields == null)
+            return "";
+
+        foreach (var key in new[] { "Age of Building", "age of building", "age-of-building", "building_age", "BuildingAge" })
+        {
+            if (ExtraFields.TryGetValue(key, out var value) && value.ValueKind == JsonValueKind.String)
+                return value.GetString() ?? "";
+        }
+
+        return "";
+    }
 }
 
 public class ServicesSection
