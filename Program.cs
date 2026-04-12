@@ -5,6 +5,7 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
+builder.Configuration.AddEnvironmentVariables();
 
 // Use Railway DATABASE_PUBLIC_URL if available, otherwise use local fallback for testing
 var rawConnectionString = builder.Configuration["DATABASE_PUBLIC_URL"];

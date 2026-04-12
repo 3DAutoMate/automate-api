@@ -19,3 +19,4 @@ Thumbs.db
 
 # Local config (CRITICAL)
 appsettings.Local.json
+appsettings.Development.json
