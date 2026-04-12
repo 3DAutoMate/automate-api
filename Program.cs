@@ -253,6 +253,33 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS additional2 text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS primary_service_key text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS additional1_service_key text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS additional2_service_key text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_template_key text NOT NULL DEFAULT 'general_booking';
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS booking_email_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS invoice_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS calendar_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS contact1_salutation text NULL;
 
 ALTER TABLE public.jobs_staging
@@ -629,6 +656,14 @@ SELECT
     invoice_item_name,
     unit_price,
     is_active,
+    canonical_service_type,
+    booking_template_key,
+    pricing_affects,
+    booking_email_required,
+    terms_required,
+    invoice_required,
+    calendar_required,
+    report_required,
     pricing_authority,
     last_synced_at
 FROM public.inspector_service_catalog
@@ -652,6 +687,14 @@ ORDER BY list_name, list_item_name, invoice_item_name;";
                     invoice_item_name = reader["invoice_item_name"]?.ToString(),
                     unit_price = reader["unit_price"]?.ToString(),
                     is_active = reader["is_active"]?.ToString(),
+                    canonical_service_type = reader["canonical_service_type"]?.ToString(),
+                    booking_template_key = reader["booking_template_key"]?.ToString(),
+                    pricing_affects = reader["pricing_affects"]?.ToString(),
+                    booking_email_required = reader["booking_email_required"]?.ToString(),
+                    terms_required = reader["terms_required"]?.ToString(),
+                    invoice_required = reader["invoice_required"]?.ToString(),
+                    calendar_required = reader["calendar_required"]?.ToString(),
+                    report_required = reader["report_required"]?.ToString(),
                     pricing_authority = reader["pricing_authority"]?.ToString(),
                     last_synced_at = reader["last_synced_at"]?.ToString()
                 });
@@ -1169,6 +1212,15 @@ SELECT
     j.primary_service,
     j.additional1,
     j.additional2,
+    j.primary_service_key,
+    j.additional1_service_key,
+    j.additional2_service_key,
+    j.booking_template_key,
+    j.booking_email_required,
+    j.terms_required,
+    j.invoice_required,
+    j.calendar_required,
+    j.report_required,
     j.contact1_salutation,
     j.contact1_first_name,
     j.contact1_last_name,
@@ -1235,11 +1287,11 @@ LEFT JOIN LATERAL (
 ) s ON TRUE
 WHERE
 (
-    (j.booking_email_sent = false OR j.booking_email_retry_requested = true)
-    OR (j.terms_sent = false OR j.terms_retry_requested = true)
-    OR (j.invoice_sent = false OR j.invoice_retry_requested = true)
-    OR (j.calendar_created = false OR j.calendar_retry_requested = true)
-    OR (j.report_workflow_sent = false OR j.report_retry_requested = true)
+    (j.booking_email_required = true AND (j.booking_email_sent = false OR j.booking_email_retry_requested = true))
+    OR (j.terms_required = true AND (j.terms_sent = false OR j.terms_retry_requested = true))
+    OR (j.invoice_required = true AND (j.invoice_sent = false OR j.invoice_retry_requested = true))
+    OR (j.calendar_required = true AND (j.calendar_created = false OR j.calendar_retry_requested = true))
+    OR (j.report_required = true AND (j.report_workflow_sent = false OR j.report_retry_requested = true))
 )
 ORDER BY j.updated_at ASC
 LIMIT 100;";
@@ -1302,6 +1354,20 @@ LIMIT 100;";
                 primary_service = reader["primary_service"]?.ToString(),
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
+                primary_service_key = reader["primary_service_key"]?.ToString(),
+                additional1_service_key = reader["additional1_service_key"]?.ToString(),
+                additional2_service_key = reader["additional2_service_key"]?.ToString(),
+                additional_service_keys = new[]
+                {
+                    reader["additional1_service_key"]?.ToString(),
+                    reader["additional2_service_key"]?.ToString()
+                }.Where(k => !string.IsNullOrWhiteSpace(k)).ToArray(),
+                booking_template_key = reader["booking_template_key"]?.ToString(),
+                booking_email_required = reader["booking_email_required"]?.ToString(),
+                terms_required = reader["terms_required"]?.ToString(),
+                invoice_required = reader["invoice_required"]?.ToString(),
+                calendar_required = reader["calendar_required"]?.ToString(),
+                report_required = reader["report_required"]?.ToString(),
 
                 contact1_salutation = reader["contact1_salutation"]?.ToString(),
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
@@ -2352,6 +2418,15 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     primary_service text,
     additional1 text,
     additional2 text,
+    primary_service_key text,
+    additional1_service_key text,
+    additional2_service_key text,
+    booking_template_key text NOT NULL DEFAULT 'general_booking',
+    booking_email_required boolean NOT NULL DEFAULT true,
+    terms_required boolean NOT NULL DEFAULT true,
+    invoice_required boolean NOT NULL DEFAULT true,
+    calendar_required boolean NOT NULL DEFAULT true,
+    report_required boolean NOT NULL DEFAULT true,
     contact1_salutation text,
     contact1_first_name text,
     contact1_last_name text,
@@ -2411,6 +2486,15 @@ INSERT INTO public.jobs_staging
     primary_service,
     additional1,
     additional2,
+    primary_service_key,
+    additional1_service_key,
+    additional2_service_key,
+    booking_template_key,
+    booking_email_required,
+    terms_required,
+    invoice_required,
+    calendar_required,
+    report_required,
     contact1_salutation,
     contact1_first_name,
     contact1_last_name,
@@ -2447,6 +2531,15 @@ VALUES
     @primary_service,
     @additional1,
     @additional2,
+    @primary_service_key,
+    @additional1_service_key,
+    @additional2_service_key,
+    @booking_template_key,
+    @booking_email_required,
+    @terms_required,
+    @invoice_required,
+    @calendar_required,
+    @report_required,
     @contact1_salutation,
     @contact1_first_name,
     @contact1_last_name,
@@ -2482,6 +2575,15 @@ DO UPDATE SET
     primary_service              = EXCLUDED.primary_service,
     additional1                  = EXCLUDED.additional1,
     additional2                  = EXCLUDED.additional2,
+    primary_service_key          = EXCLUDED.primary_service_key,
+    additional1_service_key      = EXCLUDED.additional1_service_key,
+    additional2_service_key      = EXCLUDED.additional2_service_key,
+    booking_template_key         = EXCLUDED.booking_template_key,
+    booking_email_required       = EXCLUDED.booking_email_required,
+    terms_required               = EXCLUDED.terms_required,
+    invoice_required             = EXCLUDED.invoice_required,
+    calendar_required            = EXCLUDED.calendar_required,
+    report_required              = EXCLUDED.report_required,
     contact1_salutation          = EXCLUDED.contact1_salutation,
     contact1_first_name          = EXCLUDED.contact1_first_name,
     contact1_last_name           = EXCLUDED.contact1_last_name,
@@ -2524,6 +2626,15 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("primary_service", payload.Services?.Primary ?? "");
             cmd.Parameters.AddWithValue("additional1", payload.Services?.Additional1 ?? "");
             cmd.Parameters.AddWithValue("additional2", payload.Services?.Additional2 ?? "");
+            cmd.Parameters.AddWithValue("primary_service_key", payload.Services?.PrimaryServiceKey ?? InferCanonicalServiceType(payload.Services?.Primary));
+            cmd.Parameters.AddWithValue("additional1_service_key", payload.Services?.Additional1ServiceKey ?? InferCanonicalServiceType(payload.Services?.Additional1));
+            cmd.Parameters.AddWithValue("additional2_service_key", payload.Services?.Additional2ServiceKey ?? InferCanonicalServiceType(payload.Services?.Additional2));
+            cmd.Parameters.AddWithValue("booking_template_key", BuildBookingTemplateKey(payload.Services));
+            cmd.Parameters.AddWithValue("booking_email_required", payload.Services?.BookingEmailRequired ?? true);
+            cmd.Parameters.AddWithValue("terms_required", payload.Services?.TermsRequired ?? true);
+            cmd.Parameters.AddWithValue("invoice_required", payload.Services?.InvoiceRequired ?? true);
+            cmd.Parameters.AddWithValue("calendar_required", payload.Services?.CalendarRequired ?? true);
+            cmd.Parameters.AddWithValue("report_required", payload.Services?.ReportRequired ?? true);
             cmd.Parameters.AddWithValue("contact1_salutation", payload.Contact1?.Salutation ?? "");
             cmd.Parameters.AddWithValue("contact1_first_name", payload.Contact1?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact1_last_name", payload.Contact1?.LastName ?? "");
@@ -2719,6 +2830,14 @@ CREATE TABLE IF NOT EXISTS public.inspector_service_catalog
     invoice_item_name text NULL,
     unit_price numeric(10,2) NULL,
     is_active boolean NOT NULL DEFAULT true,
+    canonical_service_type text NOT NULL DEFAULT 'other',
+    booking_template_key text NOT NULL DEFAULT 'general_booking',
+    pricing_affects boolean NOT NULL DEFAULT true,
+    booking_email_required boolean NOT NULL DEFAULT true,
+    terms_required boolean NOT NULL DEFAULT true,
+    invoice_required boolean NOT NULL DEFAULT true,
+    calendar_required boolean NOT NULL DEFAULT true,
+    report_required boolean NOT NULL DEFAULT true,
     pricing_authority text NOT NULL DEFAULT 'THREED tblItem',
     raw_payload_json jsonb NULL,
     last_synced_at timestamptz NOT NULL DEFAULT NOW(),
@@ -2729,6 +2848,30 @@ CREATE TABLE IF NOT EXISTS public.inspector_service_catalog
 
 CREATE INDEX IF NOT EXISTS idx_inspector_service_catalog_inspector_id
 ON public.inspector_service_catalog(inspector_id);
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS canonical_service_type text NOT NULL DEFAULT 'other';
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS booking_template_key text NOT NULL DEFAULT 'general_booking';
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS pricing_affects boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS booking_email_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS invoice_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS calendar_required boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.inspector_service_catalog
+ADD COLUMN IF NOT EXISTS report_required boolean NOT NULL DEFAULT true;
 
 CREATE TABLE IF NOT EXISTS public.mapping_discovery_syncs
 (
@@ -2842,6 +2985,14 @@ INSERT INTO public.inspector_service_catalog
     invoice_item_name,
     unit_price,
     is_active,
+    canonical_service_type,
+    booking_template_key,
+    pricing_affects,
+    booking_email_required,
+    terms_required,
+    invoice_required,
+    calendar_required,
+    report_required,
     pricing_authority,
     raw_payload_json,
     last_synced_at,
@@ -2858,6 +3009,14 @@ VALUES
     @invoice_item_name,
     @unit_price,
     @is_active,
+    @canonical_service_type,
+    @booking_template_key,
+    @pricing_affects,
+    @booking_email_required,
+    @terms_required,
+    @invoice_required,
+    @calendar_required,
+    @report_required,
     'THREED tblItem',
     CAST(@raw_payload_json AS jsonb),
     NOW(),
@@ -2872,6 +3031,14 @@ DO UPDATE SET
     invoice_item_name = EXCLUDED.invoice_item_name,
     unit_price = EXCLUDED.unit_price,
     is_active = EXCLUDED.is_active,
+    canonical_service_type = EXCLUDED.canonical_service_type,
+    booking_template_key = EXCLUDED.booking_template_key,
+    pricing_affects = EXCLUDED.pricing_affects,
+    booking_email_required = EXCLUDED.booking_email_required,
+    terms_required = EXCLUDED.terms_required,
+    invoice_required = EXCLUDED.invoice_required,
+    calendar_required = EXCLUDED.calendar_required,
+    report_required = EXCLUDED.report_required,
     pricing_authority = EXCLUDED.pricing_authority,
     raw_payload_json = EXCLUDED.raw_payload_json,
     last_synced_at = NOW(),
@@ -2891,6 +3058,14 @@ DO UPDATE SET
     cmd.Parameters.AddWithValue("invoice_item_name", item.InvoiceItemName ?? "");
     cmd.Parameters.AddWithValue("unit_price", item.UnitPrice.HasValue ? item.UnitPrice.Value : (object)DBNull.Value);
     cmd.Parameters.AddWithValue("is_active", item.IsActive);
+    cmd.Parameters.AddWithValue("canonical_service_type", string.IsNullOrWhiteSpace(item.CanonicalServiceType) ? "other" : item.CanonicalServiceType);
+    cmd.Parameters.AddWithValue("booking_template_key", string.IsNullOrWhiteSpace(item.BookingTemplateKey) ? "general_booking" : item.BookingTemplateKey);
+    cmd.Parameters.AddWithValue("pricing_affects", item.PricingAffects);
+    cmd.Parameters.AddWithValue("booking_email_required", item.BookingEmailRequired);
+    cmd.Parameters.AddWithValue("terms_required", item.TermsRequired);
+    cmd.Parameters.AddWithValue("invoice_required", item.InvoiceRequired);
+    cmd.Parameters.AddWithValue("calendar_required", item.CalendarRequired);
+    cmd.Parameters.AddWithValue("report_required", item.ReportRequired);
     cmd.Parameters.AddWithValue("raw_payload_json", JsonSerializer.Serialize(item));
     await cmd.ExecuteNonQueryAsync();
 }
@@ -2904,6 +3079,70 @@ static DateTime? ParseNullableDateTime(string? value)
         return parsed;
 
     return null;
+}
+
+static string BuildBookingTemplateKey(ServicesSection? services)
+{
+    if (services == null)
+        return "general_booking";
+
+    if (!string.IsNullOrWhiteSpace(services.BookingTemplateKey))
+        return services.BookingTemplateKey;
+
+    var keys = new[]
+    {
+        string.IsNullOrWhiteSpace(services.PrimaryServiceKey) ? InferCanonicalServiceType(services.Primary) : services.PrimaryServiceKey,
+        string.IsNullOrWhiteSpace(services.Additional1ServiceKey) ? InferCanonicalServiceType(services.Additional1) : services.Additional1ServiceKey,
+        string.IsNullOrWhiteSpace(services.Additional2ServiceKey) ? InferCanonicalServiceType(services.Additional2) : services.Additional2ServiceKey
+    }
+    .Where(k => !string.IsNullOrWhiteSpace(k) && k != "other")
+    .Distinct()
+    .ToList();
+
+    return keys.Count == 0 ? "general_booking" : string.Join("_", keys);
+}
+
+static string InferCanonicalServiceType(string? serviceName)
+{
+    if (string.IsNullOrWhiteSpace(serviceName))
+        return "";
+
+    var value = serviceName.Trim().ToLowerInvariant();
+
+    if (value.Contains("healthy") || value.Contains("hhs"))
+        return "healthy_homes";
+
+    if (value.Contains("meth"))
+        return "meth_test";
+
+    if (value.Contains("pre-purchase") || value.Contains("pre purchase") || value.Contains("ppi") || value.Contains("building report") || value.Contains("property inspection"))
+        return "pre_purchase";
+
+    if (value.Contains("pre-sale") || value.Contains("pre sale"))
+        return "pre_sale";
+
+    if (value.Contains("reinspect") || value.Contains("re-inspect") || value.Contains("reinspection"))
+        return "reinspection";
+
+    if (value.Contains("travel"))
+        return "travel_fee";
+
+    if (value.Contains("council") || value.Contains("file"))
+        return "council_file_review";
+
+    if (value.Contains("asbestos"))
+        return "asbestos_test";
+
+    if (value.Contains("moisture"))
+        return "moisture_check";
+
+    if (value.Contains("thermal"))
+        return "thermal_imaging";
+
+    if (value.Contains("pool"))
+        return "pool_inspection";
+
+    return "other";
 }
 
 static async Task EnsureJobPaymentColumnsAsync(NpgsqlConnection conn)
@@ -2991,6 +3230,14 @@ public class ServiceCatalogItemInput
     public string InvoiceItemName { get; set; } = "";
     public decimal? UnitPrice { get; set; }
     public bool IsActive { get; set; } = true;
+    public string CanonicalServiceType { get; set; } = "other";
+    public string BookingTemplateKey { get; set; } = "general_booking";
+    public bool PricingAffects { get; set; } = true;
+    public bool BookingEmailRequired { get; set; } = true;
+    public bool TermsRequired { get; set; } = true;
+    public bool InvoiceRequired { get; set; } = true;
+    public bool CalendarRequired { get; set; } = true;
+    public bool ReportRequired { get; set; } = true;
 }
 
 public class SendTestEmailRequest
@@ -3058,6 +3305,15 @@ public class ServicesSection
     public string Primary { get; set; } = "";
     public string Additional1 { get; set; } = "";
     public string Additional2 { get; set; } = "";
+    public string PrimaryServiceKey { get; set; } = "";
+    public string Additional1ServiceKey { get; set; } = "";
+    public string Additional2ServiceKey { get; set; } = "";
+    public string BookingTemplateKey { get; set; } = "";
+    public bool? BookingEmailRequired { get; set; }
+    public bool? TermsRequired { get; set; }
+    public bool? InvoiceRequired { get; set; }
+    public bool? CalendarRequired { get; set; }
+    public bool? ReportRequired { get; set; }
 }
 
 public class ContactFlat
