@@ -796,6 +796,7 @@ app.MapGet("/jobs/pending-workflows", async () =>
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
 
         const string sql = @"
 SELECT
@@ -1576,6 +1577,7 @@ app.MapPost("/jobs/{jobId}/mark-report-available", async (Guid jobId) =>
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
 
         const string sql = @"
 UPDATE public.jobs_staging
@@ -1749,6 +1751,7 @@ app.MapGet("/jobs/latest", async () =>
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
 
         const string sql = @"
 SELECT
@@ -2044,6 +2047,12 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     report_retry_requested_at timestamptz NULL,
     report_last_attempt_at timestamptz NULL,
     report_last_error text NULL,
+    marked_as_paid_override boolean NOT NULL DEFAULT false,
+    report_available boolean NOT NULL DEFAULT false,
+    job_total decimal(10,2) NULL,
+    amount_paid decimal(10,2) NOT NULL DEFAULT 0,
+    amount_outstanding decimal(10,2) NULL,
+    payment_status text NOT NULL DEFAULT 'unpaid',
     workflow_updated_at timestamptz NOT NULL DEFAULT NOW(),
     created_at timestamptz DEFAULT NOW(),
     updated_at timestamptz DEFAULT NOW()
@@ -2053,6 +2062,8 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
         {
             await createCmd.ExecuteNonQueryAsync();
         }
+
+        await EnsureJobPaymentColumnsAsync(conn);
 
         const string upsertSql = @"
 INSERT INTO public.jobs_staging
@@ -2349,6 +2360,32 @@ static DateTime? ParseNullableDateTime(string? value)
         return parsed;
 
     return null;
+}
+
+static async Task EnsureJobPaymentColumnsAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS marked_as_paid_override boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS report_available boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS job_total decimal(10,2) NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS amount_paid decimal(10,2) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS amount_outstanding decimal(10,2) NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS payment_status text NOT NULL DEFAULT 'unpaid';
+";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
 }
 
 public class BookingEmailFailureRequest
