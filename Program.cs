@@ -1522,6 +1522,392 @@ LIMIT 100;";
 });
 
 // =============================
+// GET PENDING WORKFLOW ACTIONS
+// One row per service-level action for new V1 Zaps
+// =============================
+app.MapGet("/workflow-actions/pending", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    a.job_id,
+    a.tenant_id,
+    a.inspector_id,
+    a.action_key,
+    a.action_type,
+    a.service_key,
+    a.service_label,
+    a.service_slot,
+    a.status AS action_status,
+    a.retry_requested AS action_retry_requested,
+    a.sent_at AS action_sent_at,
+    a.last_attempt_at AS action_last_attempt_at,
+    a.last_error AS action_last_error,
+    a.created_at AS action_created_at,
+    a.updated_at AS action_updated_at,
+
+    j.inspector_name,
+    j.source_system,
+    j.job_name,
+    j.site_address,
+    j.age_of_building,
+    j.job_date,
+    j.inspection_duration_minutes,
+    j.source_updated_at,
+    j.date_added,
+    j.status,
+    j.job_total,
+    j.primary_service,
+    j.additional1,
+    j.additional2,
+    j.primary_service_key,
+    j.additional1_service_key,
+    j.additional2_service_key,
+    j.booking_template_key,
+    j.building_type,
+    j.stories,
+    j.bedrooms,
+    j.bathrooms,
+    j.monolithic,
+    j.outbuilding,
+    j.occupied,
+    j.attached_flat,
+    j.travel_fee,
+    j.hhs_bedrooms,
+    j.meth_samples,
+    j.hhs_reinspect,
+    j.council_files,
+    j.foundation_space,
+    j.hhs_reinspect_date,
+    j.access_by,
+    j.hhs_compliance,
+    j.contact1_salutation,
+    j.contact1_first_name,
+    j.contact1_last_name,
+    j.contact1_email,
+    j.contact1_cellular,
+    j.contact2_salutation,
+    j.contact2_first_name,
+    j.contact2_last_name,
+    j.contact2_email,
+    j.contact2_cellular,
+    j.extracted_at_utc,
+    j.connector_version,
+    j.source_instance,
+    j.workflow_updated_at,
+    j.created_at,
+    j.updated_at,
+
+    i.company_name,
+    i.contact_name,
+    i.email_from_name,
+    i.email_from_address,
+    i.phone,
+    i.timezone,
+    i.allow_report_release_before_payment,
+    i.onboarding_status,
+    i.logo_url,
+    i.is_active AS inspector_is_active,
+
+    s.status AS subscription_status,
+    s.plan_name,
+    s.billing_interval,
+    s.trial_ends_at,
+    s.current_period_end,
+
+    CASE
+        WHEN COALESCE(i.is_active, false) = true
+         AND COALESCE(i.onboarding_status, '') IN ('complete', 'in_progress')
+         AND COALESCE(s.status, '') IN ('active', 'trialing')
+        THEN true
+        ELSE false
+    END AS account_can_run_automation
+
+FROM public.job_workflow_actions a
+JOIN public.jobs_staging j
+    ON j.job_id = a.job_id
+LEFT JOIN public.inspectors i
+    ON i.tenant_id::text = j.tenant_id::text
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM public.subscriptions s
+    WHERE s.inspector_id::text = i.inspector_id::text
+    ORDER BY
+        CASE
+            WHEN s.status IN ('active', 'trialing', 'past_due') THEN 0
+            ELSE 1
+        END,
+        s.current_period_end DESC NULLS LAST,
+        s.created_at DESC
+    LIMIT 1
+) s ON TRUE
+WHERE a.action_type = 'booking_email'
+  AND (a.status = 'pending' OR a.retry_requested = true)
+ORDER BY a.updated_at ASC
+LIMIT 100;";
+
+        var rows = new List<object>();
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            rows.Add(new
+            {
+                job_id = reader["job_id"]?.ToString(),
+                tenant_id = reader["tenant_id"]?.ToString(),
+                inspector_id = reader["inspector_id"]?.ToString(),
+                action_key = reader["action_key"]?.ToString(),
+                action_type = reader["action_type"]?.ToString(),
+                service_key = reader["service_key"]?.ToString(),
+                service_label = reader["service_label"]?.ToString(),
+                service_slot = reader["service_slot"]?.ToString(),
+                action_status = reader["action_status"]?.ToString(),
+                action_retry_requested = reader["action_retry_requested"]?.ToString(),
+                action_sent_at = reader["action_sent_at"]?.ToString(),
+                action_last_attempt_at = reader["action_last_attempt_at"]?.ToString(),
+                action_last_error = reader["action_last_error"]?.ToString(),
+
+                inspector_name = reader["inspector_name"]?.ToString(),
+                source_system = reader["source_system"]?.ToString(),
+                job_name = reader["job_name"]?.ToString(),
+                site_address = reader["site_address"]?.ToString(),
+                age_of_building = reader["age_of_building"]?.ToString(),
+                job_date = reader["job_date"]?.ToString(),
+                inspection_duration_minutes = reader["inspection_duration_minutes"]?.ToString(),
+                source_updated_at = reader["source_updated_at"]?.ToString(),
+                date_added = reader["date_added"]?.ToString(),
+                status = reader["status"]?.ToString(),
+                job_total = reader["job_total"]?.ToString(),
+                invoice_total = reader["job_total"]?.ToString(),
+                primary_service = reader["primary_service"]?.ToString(),
+                additional1 = reader["additional1"]?.ToString(),
+                additional2 = reader["additional2"]?.ToString(),
+                primary_service_key = reader["primary_service_key"]?.ToString(),
+                additional1_service_key = reader["additional1_service_key"]?.ToString(),
+                additional2_service_key = reader["additional2_service_key"]?.ToString(),
+                additional_service_keys = new[]
+                {
+                    reader["additional1_service_key"]?.ToString(),
+                    reader["additional2_service_key"]?.ToString()
+                }.Where(k => !string.IsNullOrWhiteSpace(k)).ToArray(),
+                booking_template_key = reader["booking_template_key"]?.ToString(),
+
+                building_type = reader["building_type"]?.ToString(),
+                stories = reader["stories"]?.ToString(),
+                bedrooms = reader["bedrooms"]?.ToString(),
+                bathrooms = reader["bathrooms"]?.ToString(),
+                monolithic = reader["monolithic"]?.ToString(),
+                outbuilding = reader["outbuilding"]?.ToString(),
+                occupied = reader["occupied"]?.ToString(),
+                attached_flat = reader["attached_flat"]?.ToString(),
+                travel_fee = reader["travel_fee"]?.ToString(),
+                hhs_bedrooms = reader["hhs_bedrooms"]?.ToString(),
+                meth_samples = reader["meth_samples"]?.ToString(),
+                hhs_reinspect = reader["hhs_reinspect"]?.ToString(),
+                council_files = reader["council_files"]?.ToString(),
+                foundation_space = reader["foundation_space"]?.ToString(),
+                hhs_reinspect_date = reader["hhs_reinspect_date"]?.ToString(),
+                access_by = reader["access_by"]?.ToString(),
+                hhs_compliance = reader["hhs_compliance"]?.ToString(),
+                outbuilding_scope_label = ToScopeLabel(reader["outbuilding"]?.ToString()),
+                attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
+                council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
+                additional_services_text = BuildAdditionalServicesText(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
+                additional_services_html = BuildAdditionalServicesHtml(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
+
+                contact1_salutation = reader["contact1_salutation"]?.ToString(),
+                contact1_first_name = reader["contact1_first_name"]?.ToString(),
+                contact1_last_name = reader["contact1_last_name"]?.ToString(),
+                contact1_email = reader["contact1_email"]?.ToString(),
+                contact1_cellular = reader["contact1_cellular"]?.ToString(),
+                contact2_salutation = reader["contact2_salutation"]?.ToString(),
+                contact2_first_name = reader["contact2_first_name"]?.ToString(),
+                contact2_last_name = reader["contact2_last_name"]?.ToString(),
+                contact2_email = reader["contact2_email"]?.ToString(),
+                contact2_cellular = reader["contact2_cellular"]?.ToString(),
+
+                extracted_at_utc = reader["extracted_at_utc"]?.ToString(),
+                connector_version = reader["connector_version"]?.ToString(),
+                source_instance = reader["source_instance"]?.ToString(),
+
+                company_name = reader["company_name"]?.ToString(),
+                contact_name = reader["contact_name"]?.ToString(),
+                email_from_name = reader["email_from_name"]?.ToString(),
+                email_from_address = reader["email_from_address"]?.ToString(),
+                phone = reader["phone"]?.ToString(),
+                timezone = reader["timezone"]?.ToString(),
+                allow_report_release_before_payment = reader["allow_report_release_before_payment"]?.ToString(),
+                onboarding_status = reader["onboarding_status"]?.ToString(),
+                logo_url = reader["logo_url"]?.ToString(),
+                inspector_is_active = reader["inspector_is_active"]?.ToString(),
+                subscription_status = reader["subscription_status"]?.ToString(),
+                plan_name = reader["plan_name"]?.ToString(),
+                billing_interval = reader["billing_interval"]?.ToString(),
+                trial_ends_at = reader["trial_ends_at"]?.ToString(),
+                current_period_end = reader["current_period_end"]?.ToString(),
+                account_can_run_automation = reader["account_can_run_automation"]?.ToString()
+            });
+        }
+
+        return Results.Ok(rows);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Pending workflow actions query failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK WORKFLOW ACTION SENT
+// =============================
+app.MapPost("/jobs/{jobId}/workflow-actions/{actionKey}/sent", async (Guid jobId, string actionKey) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'sent',
+    retry_requested = false,
+    sent_at = NOW(),
+    last_attempt_at = NOW(),
+    last_error = NULL,
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_key = @action_key;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("action_key", actionKey);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId,
+            actionKey
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark workflow action sent failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// MARK WORKFLOW ACTION FAILED
+// =============================
+app.MapPost("/jobs/{jobId}/workflow-actions/{actionKey}/failed", async (Guid jobId, string actionKey, WorkflowActionFailureRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'failed',
+    retry_requested = false,
+    last_attempt_at = NOW(),
+    last_error = @error_message,
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_key = @action_key;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("action_key", actionKey);
+        cmd.Parameters.AddWithValue("error_message", request.ErrorMessage ?? "");
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId,
+            actionKey
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Mark workflow action failed failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// REQUEST WORKFLOW ACTION RETRY
+// =============================
+app.MapPost("/jobs/{jobId}/workflow-actions/{actionKey}/retry", async (Guid jobId, string actionKey) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'pending',
+    retry_requested = true,
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_key = @action_key;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("action_key", actionKey);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId,
+            actionKey
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request workflow action retry failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // MARK BOOKING EMAIL SENT
 // =============================
 app.MapPost("/jobs/{jobId}/mark-booking-email-sent", async (Guid jobId) =>
@@ -2465,6 +2851,7 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        await EnsureWorkflowActionsTableAsync(conn);
 
         const string createTableSql = @"
 CREATE TABLE IF NOT EXISTS public.jobs_staging
@@ -2837,6 +3224,8 @@ DO UPDATE SET
             await cmd.ExecuteNonQueryAsync();
         }
 
+        await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
+
         return Results.Ok(new
         {
             success = true,
@@ -2865,6 +3254,218 @@ DO UPDATE SET
 });
 
 app.Run();
+
+static async Task EnsureWorkflowActionsTableAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.job_workflow_actions
+(
+    job_id uuid NOT NULL,
+    tenant_id uuid NULL,
+    inspector_id uuid NOT NULL,
+    action_key text NOT NULL,
+    action_type text NOT NULL,
+    service_key text NULL,
+    service_label text NULL,
+    service_slot text NULL,
+    status text NOT NULL DEFAULT 'pending',
+    retry_requested boolean NOT NULL DEFAULT false,
+    sent_at timestamptz NULL,
+    last_attempt_at timestamptz NULL,
+    last_error text NULL,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (job_id, action_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_workflow_actions_pending
+ON public.job_workflow_actions(status, retry_requested, action_type);
+
+CREATE INDEX IF NOT EXISTS idx_job_workflow_actions_job
+ON public.job_workflow_actions(job_id);";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task RefreshBookingWorkflowActionsAsync(NpgsqlConnection conn, JobUploadRequest payload, Guid jobId, Guid tenantId, Guid inspectorId)
+{
+    var actions = BuildBookingWorkflowActions(payload, jobId, tenantId, inspectorId);
+    var actionKeys = actions.Select(action => action.ActionKey).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+    await using (var deleteCmd = new NpgsqlCommand(@"
+DELETE FROM public.job_workflow_actions
+WHERE job_id = @job_id
+  AND action_type = 'booking_email'
+  AND status <> 'sent'
+  AND NOT (action_key = ANY(@action_keys));", conn))
+    {
+        deleteCmd.Parameters.AddWithValue("job_id", jobId);
+        deleteCmd.Parameters.AddWithValue("action_keys", actionKeys);
+        await deleteCmd.ExecuteNonQueryAsync();
+    }
+
+    foreach (var action in actions)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+INSERT INTO public.job_workflow_actions
+(
+    job_id,
+    tenant_id,
+    inspector_id,
+    action_key,
+    action_type,
+    service_key,
+    service_label,
+    service_slot,
+    status,
+    retry_requested,
+    updated_at
+)
+VALUES
+(
+    @job_id,
+    @tenant_id,
+    @inspector_id,
+    @action_key,
+    @action_type,
+    @service_key,
+    @service_label,
+    @service_slot,
+    'pending',
+    false,
+    NOW()
+)
+ON CONFLICT (job_id, action_key)
+DO UPDATE SET
+    tenant_id = EXCLUDED.tenant_id,
+    inspector_id = EXCLUDED.inspector_id,
+    action_type = EXCLUDED.action_type,
+    service_key = EXCLUDED.service_key,
+    service_label = EXCLUDED.service_label,
+    service_slot = EXCLUDED.service_slot,
+    updated_at = NOW();", conn);
+
+        cmd.Parameters.AddWithValue("job_id", action.JobId);
+        cmd.Parameters.AddWithValue("tenant_id", action.TenantId);
+        cmd.Parameters.AddWithValue("inspector_id", action.InspectorId);
+        cmd.Parameters.AddWithValue("action_key", action.ActionKey);
+        cmd.Parameters.AddWithValue("action_type", action.ActionType);
+        cmd.Parameters.AddWithValue("service_key", action.ServiceKey);
+        cmd.Parameters.AddWithValue("service_label", action.ServiceLabel);
+        cmd.Parameters.AddWithValue("service_slot", action.ServiceSlot);
+
+        await cmd.ExecuteNonQueryAsync();
+    }
+}
+
+static List<WorkflowActionSeed> BuildBookingWorkflowActions(JobUploadRequest payload, Guid jobId, Guid tenantId, Guid inspectorId)
+{
+    var actions = new List<WorkflowActionSeed>();
+
+    AddBookingWorkflowAction(actions, jobId, tenantId, inspectorId, "primary", payload.Services?.Primary, NormalizeServiceKey(payload.Services?.PrimaryServiceKey, payload.Services?.Primary), payload.Services?.BookingEmailRequired ?? true);
+    AddBookingWorkflowAction(actions, jobId, tenantId, inspectorId, "additional1", payload.Services?.Additional1, NormalizeServiceKey(payload.Services?.Additional1ServiceKey, payload.Services?.Additional1), payload.Services?.BookingEmailRequired ?? true);
+    AddBookingWorkflowAction(actions, jobId, tenantId, inspectorId, "additional2", payload.Services?.Additional2, NormalizeServiceKey(payload.Services?.Additional2ServiceKey, payload.Services?.Additional2), payload.Services?.BookingEmailRequired ?? true);
+
+    return actions
+        .GroupBy(action => action.ActionKey, StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.First())
+        .ToList();
+}
+
+static void AddBookingWorkflowAction(List<WorkflowActionSeed> actions, Guid jobId, Guid tenantId, Guid inspectorId, string serviceSlot, string? serviceLabel, string serviceKey, bool bookingEmailRequired)
+{
+    if (!bookingEmailRequired || string.IsNullOrWhiteSpace(serviceLabel))
+        return;
+
+    if (string.IsNullOrWhiteSpace(serviceKey) || IsModifierServiceKey(serviceKey))
+        return;
+
+    var actionKey = BuildBookingActionKey(serviceKey, serviceLabel);
+
+    if (string.IsNullOrWhiteSpace(actionKey))
+        return;
+
+    actions.Add(new WorkflowActionSeed(
+        jobId,
+        tenantId,
+        inspectorId,
+        actionKey,
+        "booking_email",
+        serviceKey,
+        serviceLabel.Trim(),
+        serviceSlot));
+}
+
+static string NormalizeServiceKey(string? serviceKey, string? serviceLabel)
+{
+    var key = string.IsNullOrWhiteSpace(serviceKey) ? InferCanonicalServiceType(serviceLabel) : serviceKey.Trim();
+
+    return key switch
+    {
+        "healthy_homes" => "healthy_homes_assessment",
+        "meth_test" => "meth_field_composite",
+        "custom" => "custom_service",
+        "other" => "other_service",
+        _ => key
+    };
+}
+
+static string BuildBookingActionKey(string serviceKey, string? serviceLabel)
+{
+    if (string.IsNullOrWhiteSpace(serviceKey))
+        return "";
+
+    if (serviceKey == "custom_service" || serviceKey == "other_service")
+        return "booking_custom_" + Slugify(serviceLabel);
+
+    return "booking_" + Slugify(serviceKey);
+}
+
+static string Slugify(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "unknown";
+
+    var sb = new System.Text.StringBuilder();
+    var previousUnderscore = false;
+
+    foreach (var ch in value.Trim().ToLowerInvariant())
+    {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+        {
+            sb.Append(ch);
+            previousUnderscore = false;
+        }
+        else if (!previousUnderscore)
+        {
+            sb.Append('_');
+            previousUnderscore = true;
+        }
+    }
+
+    return sb.ToString().Trim('_');
+}
+
+static bool IsModifierServiceKey(string key)
+{
+    return key == "additional_outbuilding"
+        || key == "attached_flat"
+        || key == "foundation_space"
+        || key == "occupied_house"
+        || key == "property_access"
+        || key == "travel_fee"
+        || key == "age_of_building"
+        || key == "building_type"
+        || key == "number_of_stories"
+        || key == "number_of_bedrooms"
+        || key == "number_of_bathrooms"
+        || key == "monolithic_cladding"
+        || key == "healthy_homes_bedrooms"
+        || key == "meth_sample_count"
+        || key == "custom_modifier"
+        || key == "other_modifier";
+}
 
 static async Task EnsureInspectorsTableAsync(NpgsqlConnection conn)
 {
@@ -3491,10 +4092,20 @@ public class BookingEmailFailureRequest
     public string? ErrorMessage { get; set; }
 }
 
+public record WorkflowActionFailureRequest(string ErrorMessage);
 public record TermsFailureRequest(string ErrorMessage);
 public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
+public record WorkflowActionSeed(
+    Guid JobId,
+    Guid TenantId,
+    Guid InspectorId,
+    string ActionKey,
+    string ActionType,
+    string ServiceKey,
+    string ServiceLabel,
+    string ServiceSlot);
 public record V1MappingField(
     string CanonicalFieldName,
     string ThreedColumnName,
