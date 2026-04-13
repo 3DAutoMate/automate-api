@@ -1522,6 +1522,118 @@ LIMIT 100;";
 });
 
 // =============================
+// GET JOB WORKFLOW STATUS
+// Read-only connector view of Railway-owned state
+// =============================
+app.MapGet("/jobs/workflow-status", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    j.job_id,
+    j.job_name,
+    j.site_address,
+    j.job_date,
+    j.primary_service,
+    j.additional1,
+    j.additional2,
+    j.booking_template_key,
+    j.booking_email_required,
+    j.booking_email_sent,
+    j.booking_email_retry_requested,
+    j.terms_required,
+    j.terms_sent,
+    j.terms_retry_requested,
+    j.invoice_required,
+    j.invoice_sent,
+    j.invoice_retry_requested,
+    j.calendar_required,
+    j.calendar_created,
+    j.calendar_retry_requested,
+    j.report_required,
+    j.report_workflow_sent,
+    j.report_retry_requested,
+    j.paid,
+    j.workflow_updated_at,
+    COALESCE(a.pending_action_count, 0) AS pending_action_count,
+    COALESCE(a.sent_action_count, 0) AS sent_action_count,
+    COALESCE(a.failed_action_count, 0) AS failed_action_count,
+    COALESCE(a.pending_action_keys, '') AS pending_action_keys
+FROM public.jobs_staging j
+LEFT JOIN (
+    SELECT
+        job_id,
+        COUNT(*) FILTER (WHERE status = 'pending' OR retry_requested = true) AS pending_action_count,
+        COUNT(*) FILTER (WHERE status = 'sent') AS sent_action_count,
+        COUNT(*) FILTER (WHERE status = 'failed') AS failed_action_count,
+        string_agg(action_key, ', ' ORDER BY action_key) FILTER (WHERE status = 'pending' OR retry_requested = true) AS pending_action_keys
+    FROM public.job_workflow_actions
+    GROUP BY job_id
+) a
+    ON a.job_id = j.job_id
+ORDER BY COALESCE(j.workflow_updated_at, j.updated_at, j.created_at) DESC
+LIMIT 100;";
+
+        var rows = new List<object>();
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            rows.Add(new
+            {
+                job_id = reader["job_id"]?.ToString(),
+                job_name = reader["job_name"]?.ToString(),
+                site_address = reader["site_address"]?.ToString(),
+                job_date = reader["job_date"]?.ToString(),
+                primary_service = reader["primary_service"]?.ToString(),
+                additional1 = reader["additional1"]?.ToString(),
+                additional2 = reader["additional2"]?.ToString(),
+                booking_template_key = reader["booking_template_key"]?.ToString(),
+                booking_email_required = reader["booking_email_required"]?.ToString(),
+                booking_email_sent = reader["booking_email_sent"]?.ToString(),
+                booking_email_retry_requested = reader["booking_email_retry_requested"]?.ToString(),
+                terms_required = reader["terms_required"]?.ToString(),
+                terms_sent = reader["terms_sent"]?.ToString(),
+                terms_retry_requested = reader["terms_retry_requested"]?.ToString(),
+                invoice_required = reader["invoice_required"]?.ToString(),
+                invoice_sent = reader["invoice_sent"]?.ToString(),
+                invoice_retry_requested = reader["invoice_retry_requested"]?.ToString(),
+                calendar_required = reader["calendar_required"]?.ToString(),
+                calendar_created = reader["calendar_created"]?.ToString(),
+                calendar_retry_requested = reader["calendar_retry_requested"]?.ToString(),
+                report_required = reader["report_required"]?.ToString(),
+                report_workflow_sent = reader["report_workflow_sent"]?.ToString(),
+                report_retry_requested = reader["report_retry_requested"]?.ToString(),
+                paid = reader["paid"]?.ToString(),
+                workflow_updated_at = reader["workflow_updated_at"]?.ToString(),
+                pending_action_count = reader["pending_action_count"]?.ToString(),
+                sent_action_count = reader["sent_action_count"]?.ToString(),
+                failed_action_count = reader["failed_action_count"]?.ToString(),
+                pending_action_keys = reader["pending_action_keys"]?.ToString()
+            });
+        }
+
+        return Results.Ok(rows);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Workflow status query failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // GET PENDING WORKFLOW ACTIONS
 // One row per service-level action for new V1 Zaps
 // =============================
@@ -3957,6 +4069,9 @@ static string InferCanonicalServiceType(string? serviceName)
 
     if (value.Contains("meth"))
         return "meth_test";
+
+    if (value.Contains("weathertight") || value.Contains("weather tight") || value.Contains("weather-tight"))
+        return "weathertightness";
 
     if (value.Contains("pre-purchase") || value.Contains("pre purchase") || value.Contains("ppi") || value.Contains("building report") || value.Contains("property inspection"))
         return "pre_purchase";
