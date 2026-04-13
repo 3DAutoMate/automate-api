@@ -1464,6 +1464,18 @@ LIMIT 100;";
                 attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
                 council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
                 weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
+                outbuilding_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include any separate garages or outbuildings?",
+                    reader["outbuilding"]?.ToString()),
+                attached_flat_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include any self-contained flats?",
+                    reader["attached_flat"]?.ToString()),
+                council_file_review_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include review of the Council Property File?",
+                    reader["council_files"]?.ToString()),
+                weathertightness_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include a non-invasive weathertightness assessment suitable for lender review?",
+                    reader["weathertightness"]?.ToString()),
                 additional_services_text = BuildAdditionalServicesText(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
                 additional_services_html = BuildAdditionalServicesHtml(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
 
@@ -1859,6 +1871,18 @@ LIMIT 100;";
                 attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
                 council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
                 weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
+                outbuilding_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include any separate garages or outbuildings?",
+                    reader["outbuilding"]?.ToString()),
+                attached_flat_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include any self-contained flats?",
+                    reader["attached_flat"]?.ToString()),
+                council_file_review_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include review of the Council Property File?",
+                    reader["council_files"]?.ToString()),
+                weathertightness_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include a non-invasive weathertightness assessment suitable for lender review?",
+                    reader["weathertightness"]?.ToString()),
                 additional_services_text = BuildAdditionalServicesText(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
                 additional_services_html = BuildAdditionalServicesHtml(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
 
@@ -2854,6 +2878,9 @@ SELECT
     primary_service,
     additional1,
     additional2,
+    outbuilding,
+    attached_flat,
+    council_files,
     weathertightness,
     contact1_salutation,
     contact1_first_name,
@@ -2941,8 +2968,26 @@ LIMIT 20;";
                 primary_service = reader["primary_service"]?.ToString(),
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
+                outbuilding = reader["outbuilding"]?.ToString(),
+                attached_flat = reader["attached_flat"]?.ToString(),
+                council_files = reader["council_files"]?.ToString(),
                 weathertightness = reader["weathertightness"]?.ToString(),
+                outbuilding_scope_label = ToScopeLabel(reader["outbuilding"]?.ToString()),
+                attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
+                council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
                 weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
+                outbuilding_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include any separate garages or outbuildings?",
+                    reader["outbuilding"]?.ToString()),
+                attached_flat_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include any self-contained flats?",
+                    reader["attached_flat"]?.ToString()),
+                council_file_review_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include review of the Council Property File?",
+                    reader["council_files"]?.ToString()),
+                weathertightness_scope_html = BuildScopeHtml(
+                    "Does the scope of this inspection include a non-invasive weathertightness assessment suitable for lender review?",
+                    reader["weathertightness"]?.ToString()),
 
                 contact1_salutation = reader["contact1_salutation"]?.ToString(),
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
@@ -4144,14 +4189,31 @@ static string ToScopeLabel(string? value)
     if (string.IsNullOrWhiteSpace(value))
         return "Not specified";
 
+    return NormalizeScopeValue(value);
+}
+
+static string BuildScopeHtml(string question, string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "";
+
+    var label = NormalizeScopeValue(value);
+    return "<br>" +
+        System.Net.WebUtility.HtmlEncode(question) +
+        " - " +
+        System.Net.WebUtility.HtmlEncode(label);
+}
+
+static string NormalizeScopeValue(string value)
+{
     var trimmed = value.Trim();
     var normalized = trimmed.ToLowerInvariant();
 
     if (normalized == "yes" || normalized == "true" || normalized == "included" || normalized == "include")
-        return "Included";
+        return "Yes";
 
     if (normalized == "no" || normalized == "false" || normalized == "excluded" || normalized == "exclude")
-        return "Excluded";
+        return "No";
 
     return trimmed;
 }
