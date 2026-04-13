@@ -1908,6 +1908,51 @@ WHERE job_id = @job_id
 });
 
 // =============================
+// REQUEST ALL WORKFLOW ACTIONS RETRY
+// Testing/admin helper for connector Reset Workflow
+// =============================
+app.MapPost("/jobs/{jobId}/workflow-actions/retry-all", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'pending',
+    retry_requested = true,
+    sent_at = NULL,
+    last_attempt_at = NULL,
+    last_error = NULL,
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+
+        int rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            updated = rows,
+            jobId
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Request all workflow action retries failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // MARK BOOKING EMAIL SENT
 // =============================
 app.MapPost("/jobs/{jobId}/mark-booking-email-sent", async (Guid jobId) =>
