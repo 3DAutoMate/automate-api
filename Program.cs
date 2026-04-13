@@ -322,6 +322,9 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS foundation_space text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS weathertightness text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS hhs_reinspect_date text NULL;
 
 ALTER TABLE public.jobs_staging
@@ -1286,6 +1289,7 @@ SELECT
     j.hhs_reinspect,
     j.council_files,
     j.foundation_space,
+    j.weathertightness,
     j.hhs_reinspect_date,
     j.access_by,
     j.hhs_compliance,
@@ -1452,12 +1456,14 @@ LIMIT 100;";
                 hhs_reinspect = reader["hhs_reinspect"]?.ToString(),
                 council_files = reader["council_files"]?.ToString(),
                 foundation_space = reader["foundation_space"]?.ToString(),
+                weathertightness = reader["weathertightness"]?.ToString(),
                 hhs_reinspect_date = reader["hhs_reinspect_date"]?.ToString(),
                 access_by = reader["access_by"]?.ToString(),
                 hhs_compliance = reader["hhs_compliance"]?.ToString(),
                 outbuilding_scope_label = ToScopeLabel(reader["outbuilding"]?.ToString()),
                 attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
                 council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
+                weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
                 additional_services_text = BuildAdditionalServicesText(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
                 additional_services_html = BuildAdditionalServicesHtml(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
 
@@ -1540,6 +1546,8 @@ SELECT
     j.job_name,
     j.site_address,
     j.job_date,
+    j.inspector_name,
+    j.job_total,
     j.primary_service,
     j.additional1,
     j.additional2,
@@ -1560,6 +1568,10 @@ SELECT
     j.report_workflow_sent,
     j.report_retry_requested,
     j.paid,
+    j.contact1_first_name,
+    j.contact1_last_name,
+    j.contact1_email,
+    j.weathertightness,
     j.workflow_updated_at,
     COALESCE(a.pending_action_count, 0) AS pending_action_count,
     COALESCE(a.sent_action_count, 0) AS sent_action_count,
@@ -1593,6 +1605,9 @@ LIMIT 100;";
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
+                inspector_name = reader["inspector_name"]?.ToString(),
+                job_total = reader["job_total"]?.ToString(),
+                invoice_total = reader["job_total"]?.ToString(),
                 primary_service = reader["primary_service"]?.ToString(),
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
@@ -1613,6 +1628,11 @@ LIMIT 100;";
                 report_workflow_sent = reader["report_workflow_sent"]?.ToString(),
                 report_retry_requested = reader["report_retry_requested"]?.ToString(),
                 paid = reader["paid"]?.ToString(),
+                contact1_first_name = reader["contact1_first_name"]?.ToString(),
+                contact1_last_name = reader["contact1_last_name"]?.ToString(),
+                contact1_email = reader["contact1_email"]?.ToString(),
+                weathertightness = reader["weathertightness"]?.ToString(),
+                weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
                 workflow_updated_at = reader["workflow_updated_at"]?.ToString(),
                 pending_action_count = reader["pending_action_count"]?.ToString(),
                 sent_action_count = reader["sent_action_count"]?.ToString(),
@@ -1696,6 +1716,7 @@ SELECT
     j.hhs_reinspect,
     j.council_files,
     j.foundation_space,
+    j.weathertightness,
     j.hhs_reinspect_date,
     j.access_by,
     j.hhs_compliance,
@@ -1826,12 +1847,14 @@ LIMIT 100;";
                 hhs_reinspect = reader["hhs_reinspect"]?.ToString(),
                 council_files = reader["council_files"]?.ToString(),
                 foundation_space = reader["foundation_space"]?.ToString(),
+                weathertightness = reader["weathertightness"]?.ToString(),
                 hhs_reinspect_date = reader["hhs_reinspect_date"]?.ToString(),
                 access_by = reader["access_by"]?.ToString(),
                 hhs_compliance = reader["hhs_compliance"]?.ToString(),
                 outbuilding_scope_label = ToScopeLabel(reader["outbuilding"]?.ToString()),
                 attached_flat_scope_label = ToScopeLabel(reader["attached_flat"]?.ToString()),
                 council_file_review_scope_label = ToScopeLabel(reader["council_files"]?.ToString()),
+                weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
                 additional_services_text = BuildAdditionalServicesText(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
                 additional_services_html = BuildAdditionalServicesHtml(reader["additional1"]?.ToString(), reader["additional2"]?.ToString()),
 
@@ -2827,6 +2850,7 @@ SELECT
     primary_service,
     additional1,
     additional2,
+    weathertightness,
     contact1_salutation,
     contact1_first_name,
     contact1_last_name,
@@ -2913,6 +2937,8 @@ LIMIT 20;";
                 primary_service = reader["primary_service"]?.ToString(),
                 additional1 = reader["additional1"]?.ToString(),
                 additional2 = reader["additional2"]?.ToString(),
+                weathertightness = reader["weathertightness"]?.ToString(),
+                weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
 
                 contact1_salutation = reader["contact1_salutation"]?.ToString(),
                 contact1_first_name = reader["contact1_first_name"]?.ToString(),
@@ -3079,6 +3105,7 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     hhs_reinspect text,
     council_files text,
     foundation_space text,
+    weathertightness text,
     hhs_reinspect_date text,
     access_by text,
     hhs_compliance text,
@@ -3165,6 +3192,7 @@ INSERT INTO public.jobs_staging
     hhs_reinspect,
     council_files,
     foundation_space,
+    weathertightness,
     hhs_reinspect_date,
     access_by,
     hhs_compliance,
@@ -3228,6 +3256,7 @@ VALUES
     @hhs_reinspect,
     @council_files,
     @foundation_space,
+    @weathertightness,
     @hhs_reinspect_date,
     @access_by,
     @hhs_compliance,
@@ -3290,6 +3319,7 @@ DO UPDATE SET
     hhs_reinspect                = EXCLUDED.hhs_reinspect,
     council_files                = EXCLUDED.council_files,
     foundation_space             = EXCLUDED.foundation_space,
+    weathertightness             = EXCLUDED.weathertightness,
     hhs_reinspect_date           = EXCLUDED.hhs_reinspect_date,
     access_by                    = EXCLUDED.access_by,
     hhs_compliance               = EXCLUDED.hhs_compliance,
@@ -3360,6 +3390,7 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("hhs_reinspect", payload.JobDetails?.HhsReinspect ?? "");
             cmd.Parameters.AddWithValue("council_files", payload.JobDetails?.CouncilFiles ?? "");
             cmd.Parameters.AddWithValue("foundation_space", payload.JobDetails?.FoundationSpace ?? "");
+            cmd.Parameters.AddWithValue("weathertightness", payload.JobDetails?.Weathertightness ?? "");
             cmd.Parameters.AddWithValue("hhs_reinspect_date", payload.JobDetails?.HhsReinspectDate ?? "");
             cmd.Parameters.AddWithValue("access_by", payload.JobDetails?.AccessBy ?? "");
             cmd.Parameters.AddWithValue("hhs_compliance", payload.JobDetails?.HhsCompliance ?? "");
@@ -3609,6 +3640,7 @@ static bool IsModifierServiceKey(string key)
     return key == "additional_outbuilding"
         || key == "attached_flat"
         || key == "foundation_space"
+        || key == "weathertightness"
         || key == "occupied_house"
         || key == "property_access"
         || key == "travel_fee"
@@ -4050,7 +4082,7 @@ static string BuildBookingTemplateKey(ServicesSection? services)
         string.IsNullOrWhiteSpace(services.Additional1ServiceKey) ? InferCanonicalServiceType(services.Additional1) : services.Additional1ServiceKey,
         string.IsNullOrWhiteSpace(services.Additional2ServiceKey) ? InferCanonicalServiceType(services.Additional2) : services.Additional2ServiceKey
     }
-    .Where(k => !string.IsNullOrWhiteSpace(k) && k != "other")
+    .Where(k => !string.IsNullOrWhiteSpace(k) && k != "other" && !IsModifierServiceKey(k))
     .Distinct()
     .ToList();
 
@@ -4232,6 +4264,9 @@ ADD COLUMN IF NOT EXISTS council_files text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS foundation_space text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS weathertightness text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS hhs_reinspect_date text NULL;
@@ -4418,6 +4453,7 @@ public class JobDetailsSection
     public string HhsReinspect { get; set; } = "";
     public string CouncilFiles { get; set; } = "";
     public string FoundationSpace { get; set; } = "";
+    public string Weathertightness { get; set; } = "";
     public string HhsReinspectDate { get; set; } = "";
     public string AccessBy { get; set; } = "";
     public string HhsCompliance { get; set; } = "";
