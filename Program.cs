@@ -1546,6 +1546,8 @@ SELECT
     j.job_name,
     j.site_address,
     j.job_date,
+    j.date_added,
+    j.status,
     j.inspector_name,
     j.job_total,
     j.primary_service,
@@ -1589,8 +1591,8 @@ LEFT JOIN (
     GROUP BY job_id
 ) a
     ON a.job_id = j.job_id
-ORDER BY COALESCE(j.workflow_updated_at, j.updated_at, j.created_at) DESC
-LIMIT 100;";
+ORDER BY j.job_date DESC NULLS LAST, COALESCE(j.workflow_updated_at, j.updated_at, j.created_at) DESC
+LIMIT 500;";
 
         var rows = new List<object>();
 
@@ -1605,6 +1607,8 @@ LIMIT 100;";
                 job_name = reader["job_name"]?.ToString(),
                 site_address = reader["site_address"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
+                date_added = reader["date_added"]?.ToString(),
+                status = reader["status"]?.ToString(),
                 inspector_name = reader["inspector_name"]?.ToString(),
                 job_total = reader["job_total"]?.ToString(),
                 invoice_total = reader["job_total"]?.ToString(),
