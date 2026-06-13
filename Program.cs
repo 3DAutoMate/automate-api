@@ -8,6 +8,16 @@ using Npgsql;
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 builder.Configuration.AddEnvironmentVariables();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("LocalTemplateMaker", policy =>
+    {
+        policy
+            .WithOrigins("http://127.0.0.1:5000", "http://localhost:5000")
+            .AllowAnyHeader()
+            .AllowAnyMethod();
+    });
+});
 
 // Use Railway DATABASE_PUBLIC_URL if available, otherwise use local fallback for testing
 var rawConnectionString = builder.Configuration["DATABASE_PUBLIC_URL"];
@@ -67,6 +77,7 @@ var V1MappingFields = new List<V1MappingField>
 };
 
 var app = builder.Build();
+app.UseCors("LocalTemplateMaker");
 
 // =============================
 // ROOT
