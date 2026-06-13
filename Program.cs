@@ -4397,7 +4397,11 @@ static string RenderTestEmailBody(
     string? phone,
     string? logoUrl)
 {
-    var company = string.IsNullOrWhiteSpace(companyName) ? "3D AutoMate" : companyName.Trim();
+    const string fallbackCompanyName = "Pro-Spect Building Reports Ltd";
+    const string fallbackLogoUrl = "https://pro-spect.co.nz/wp-content/uploads/2023/11/Pro-Spect-report-transparent.png";
+
+    var company = string.IsNullOrWhiteSpace(companyName) ? fallbackCompanyName : companyName.Trim();
+    var logo = string.IsNullOrWhiteSpace(logoUrl) ? fallbackLogoUrl : logoUrl.Trim();
     var inspector = !string.IsNullOrWhiteSpace(emailFromName)
         ? emailFromName.Trim()
         : !string.IsNullOrWhiteSpace(contactName)
@@ -4406,8 +4410,8 @@ static string RenderTestEmailBody(
 
     var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
-        ["LOGO_URL"] = SafeHtml(logoUrl),
-        ["COMPANY_LOGO_URL"] = SafeHtml(logoUrl),
+        ["LOGO_URL"] = SafeHtml(logo),
+        ["COMPANY_LOGO_URL"] = SafeHtml(logo),
         ["COMPANY_NAME"] = SafeHtml(company),
         ["INSPECTOR_NAME"] = SafeHtml(inspector),
         ["INSPECTOR_FIRST_NAME"] = SafeHtml(FirstWord(inspector)),
