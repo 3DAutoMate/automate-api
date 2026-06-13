@@ -1012,14 +1012,22 @@ app.MapPost("/integrations/microsoft/send-test-email", async (SendTestEmailReque
 
         const string sql = @"
 SELECT
-    access_token_encrypted,
-    refresh_token_encrypted,
-    expires_at,
-    external_account_email,
-    status
-FROM public.inspector_integrations
-WHERE inspector_id = @inspector_id
-  AND provider = 'microsoft'
+    ii.access_token_encrypted,
+    ii.refresh_token_encrypted,
+    ii.expires_at,
+    ii.external_account_email,
+    ii.status,
+    i.company_name,
+    i.contact_name,
+    i.email_from_name,
+    i.email_from_address,
+    i.phone,
+    i.logo_url
+FROM public.inspector_integrations ii
+LEFT JOIN public.inspectors i
+    ON i.inspector_id = ii.inspector_id
+WHERE ii.inspector_id = @inspector_id
+  AND ii.provider = 'microsoft'
 LIMIT 1;";
 
         string? accessToken = null;
@@ -1027,6 +1035,12 @@ LIMIT 1;";
         DateTime? expiresAt = null;
         string? externalAccountEmail = null;
         string? status = null;
+        string? companyName = null;
+        string? contactName = null;
+        string? emailFromName = null;
+        string? emailFromAddress = null;
+        string? phone = null;
+        string? logoUrl = null;
 
         await using (var cmd = new NpgsqlCommand(sql, conn))
         {
@@ -1039,6 +1053,12 @@ LIMIT 1;";
                 refreshToken = reader["refresh_token_encrypted"]?.ToString();
                 externalAccountEmail = reader["external_account_email"]?.ToString();
                 status = reader["status"]?.ToString();
+                companyName = reader["company_name"]?.ToString();
+                contactName = reader["contact_name"]?.ToString();
+                emailFromName = reader["email_from_name"]?.ToString();
+                emailFromAddress = reader["email_from_address"]?.ToString();
+                phone = reader["phone"]?.ToString();
+                logoUrl = reader["logo_url"]?.ToString();
 
                 if (reader["expires_at"] != DBNull.Value)
                 {
@@ -1154,7 +1174,14 @@ WHERE inspector_id = @inspector_id
                     contentType = "HTML",
                     content = string.IsNullOrWhiteSpace(request.Body)
                         ? "This is a test email from 3D AutoMate."
-                        : CleanEditorHtml(request.Body)
+                        : RenderTestEmailBody(
+                            request.Body,
+                            companyName,
+                            contactName,
+                            emailFromName,
+                            emailFromAddress,
+                            phone,
+                            logoUrl)
                 },
                 toRecipients = new[]
                 {
@@ -4359,6 +4386,57 @@ static string CleanEditorHtml(string? html)
         "\\scontenteditable=(\"true\"|'true'|true)",
         "",
         RegexOptions.IgnoreCase);
+}
+
+static string RenderTestEmailBody(
+    string htmlBody,
+    string? companyName,
+    string? contactName,
+    string? emailFromName,
+    string? emailFromAddress,
+    string? phone,
+    string? logoUrl)
+{
+    var company = string.IsNullOrWhiteSpace(companyName) ? "3D AutoMate" : companyName.Trim();
+    var inspector = !string.IsNullOrWhiteSpace(emailFromName)
+        ? emailFromName.Trim()
+        : !string.IsNullOrWhiteSpace(contactName)
+            ? contactName.Trim()
+            : "Inspector";
+
+    var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["LOGO_URL"] = SafeHtml(logoUrl),
+        ["COMPANY_LOGO_URL"] = SafeHtml(logoUrl),
+        ["COMPANY_NAME"] = SafeHtml(company),
+        ["INSPECTOR_NAME"] = SafeHtml(inspector),
+        ["INSPECTOR_FIRST_NAME"] = SafeHtml(FirstWord(inspector)),
+        ["INSPECTOR_PHONE"] = SafeHtml(phone),
+        ["INSPECTOR_EMAIL"] = SafeHtml(emailFromAddress)
+    };
+
+    return CleanEditorHtml(Regex.Replace(
+        htmlBody ?? "",
+        "\\{\\{\\s*([A-Z0-9_]+)\\s*\\}\\}",
+        match =>
+        {
+            var key = match.Groups[1].Value;
+            return fields.TryGetValue(key, out var replacement) ? replacement : match.Value;
+        },
+        RegexOptions.IgnoreCase));
+}
+
+static string SafeHtml(string? value)
+{
+    return System.Net.WebUtility.HtmlEncode(value ?? "");
+}
+
+static string FirstWord(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "";
+
+    return value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
 }
 
 public class BookingEmailFailureRequest
