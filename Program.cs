@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Npgsql;
@@ -1150,10 +1151,10 @@ WHERE inspector_id = @inspector_id
                     : request.Subject,
                 body = new
                 {
-                    contentType = "Text",
+                    contentType = "HTML",
                     content = string.IsNullOrWhiteSpace(request.Body)
                         ? "This is a test email from 3D AutoMate."
-                        : request.Body
+                        : CleanEditorHtml(request.Body)
                 },
                 toRecipients = new[]
                 {
@@ -4346,6 +4347,18 @@ ADD COLUMN IF NOT EXISTS hhs_compliance text NULL;
 
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
+}
+
+static string CleanEditorHtml(string? html)
+{
+    if (string.IsNullOrWhiteSpace(html))
+        return "";
+
+    return Regex.Replace(
+        html,
+        "\\scontenteditable=(\"true\"|'true'|true)",
+        "",
+        RegexOptions.IgnoreCase);
 }
 
 public class BookingEmailFailureRequest
