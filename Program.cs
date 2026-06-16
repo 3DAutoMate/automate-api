@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Npgsql;
@@ -1235,6 +1236,365 @@ WHERE inspector_id = @inspector_id
     {
         return Results.Problem(
             title: "Send test email failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// XERO CONNECT URL
+// =============================
+app.MapGet("/integrations/xero/connect-url", (string inspectorId) =>
+{
+    var clientId = builder.Configuration["XERO_CLIENT_ID"];
+    var redirectUri = builder.Configuration["XERO_REDIRECT_URI"];
+
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(redirectUri))
+    {
+        return Results.Problem(
+            title: "Xero config missing",
+            detail: "XERO_CLIENT_ID and/or XERO_REDIRECT_URI are missing from Railway variables.",
+            statusCode: 500
+        );
+    }
+
+    if (!Guid.TryParse(inspectorId.Trim(), out _))
+    {
+        return Results.BadRequest(new
+        {
+            success = false,
+            message = "Invalid inspectorId"
+        });
+    }
+
+    var scopes = "offline_access accounting.transactions accounting.contacts accounting.settings.read";
+
+    var url =
+        "https://login.xero.com/identity/connect/authorize" +
+        $"?response_type=code" +
+        $"&client_id={Uri.EscapeDataString(clientId)}" +
+        $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+        $"&scope={Uri.EscapeDataString(scopes)}" +
+        $"&state={Uri.EscapeDataString(inspectorId.Trim())}";
+
+    return Results.Ok(new
+    {
+        success = true,
+        inspectorId = inspectorId.Trim(),
+        url
+    });
+});
+
+// =============================
+// XERO CALLBACK
+// =============================
+app.MapGet("/api/integrations/xero/callback", async (HttpContext context) =>
+{
+    try
+    {
+        var code = context.Request.Query["code"].ToString();
+        var state = context.Request.Query["state"].ToString();
+        var error = context.Request.Query["error"].ToString();
+
+        if (!string.IsNullOrWhiteSpace(error))
+            return Results.BadRequest("Xero authorization failed: " + WebUtility.HtmlEncode(error));
+
+        if (string.IsNullOrWhiteSpace(code))
+            return Results.BadRequest("Missing code");
+
+        if (!Guid.TryParse(state, out Guid inspectorId))
+            return Results.BadRequest("Invalid inspector ID in state");
+
+        var clientId = builder.Configuration["XERO_CLIENT_ID"];
+        var clientSecret = builder.Configuration["XERO_CLIENT_SECRET"];
+        var redirectUri = builder.Configuration["XERO_REDIRECT_URI"];
+
+        if (string.IsNullOrWhiteSpace(clientId) ||
+            string.IsNullOrWhiteSpace(clientSecret) ||
+            string.IsNullOrWhiteSpace(redirectUri))
+        {
+            return Results.Problem(
+                title: "Xero config missing",
+                detail: "XERO_CLIENT_ID, XERO_CLIENT_SECRET and/or XERO_REDIRECT_URI are missing from Railway variables.",
+                statusCode: 500
+            );
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "Basic",
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(clientId + ":" + clientSecret)));
+
+        var tokenResponse = await httpClient.PostAsync(
+            "https://identity.xero.com/connect/token",
+            new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["grant_type"] = "authorization_code",
+                ["code"] = code,
+                ["redirect_uri"] = redirectUri
+            }));
+
+        var tokenJson = await tokenResponse.Content.ReadAsStringAsync();
+
+        if (!tokenResponse.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Xero token exchange failed",
+                detail: tokenJson,
+                statusCode: 500
+            );
+        }
+
+        var tokenDoc = JsonDocument.Parse(tokenJson).RootElement;
+        var accessToken = tokenDoc.GetProperty("access_token").GetString() ?? "";
+        var refreshToken = tokenDoc.TryGetProperty("refresh_token", out var refreshTokenProp)
+            ? refreshTokenProp.GetString() ?? ""
+            : "";
+        var expiresIn = tokenDoc.TryGetProperty("expires_in", out var expiresInProp)
+            ? expiresInProp.GetInt32()
+            : 1800;
+        var expiresAt = DateTime.UtcNow.AddSeconds(expiresIn);
+
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        var connectionsResponse = await httpClient.GetAsync("https://api.xero.com/connections");
+        var connectionsJson = await connectionsResponse.Content.ReadAsStringAsync();
+
+        if (!connectionsResponse.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Xero connections lookup failed",
+                detail: connectionsJson,
+                statusCode: 500
+            );
+        }
+
+        var connections = JsonDocument.Parse(connectionsJson).RootElement;
+        if (connections.ValueKind != JsonValueKind.Array || connections.GetArrayLength() == 0)
+        {
+            return Results.Problem(
+                title: "No Xero tenants found",
+                detail: "Xero connected, but no organisation/tenant was returned for this account.",
+                statusCode: 500
+            );
+        }
+
+        var firstTenant = connections[0];
+        string tenantId = firstTenant.TryGetProperty("tenantId", out var tenantIdProp)
+            ? tenantIdProp.GetString() ?? ""
+            : "";
+        string tenantName = firstTenant.TryGetProperty("tenantName", out var tenantNameProp)
+            ? tenantNameProp.GetString() ?? ""
+            : "";
+        int tenantCount = connections.GetArrayLength();
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string upsertSql = @"
+INSERT INTO public.inspector_integrations
+(
+    inspector_id,
+    provider,
+    status,
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    external_tenant_id,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    'xero',
+    'connected',
+    @access_token,
+    @refresh_token,
+    @expires_at,
+    @tenant_name,
+    @tenant_id,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (inspector_id, provider)
+DO UPDATE SET
+    status = 'connected',
+    access_token_encrypted = EXCLUDED.access_token_encrypted,
+    refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
+    expires_at = EXCLUDED.expires_at,
+    external_account_email = EXCLUDED.external_account_email,
+    external_tenant_id = EXCLUDED.external_tenant_id,
+    updated_at = NOW();";
+
+        await using (var cmd = new NpgsqlCommand(upsertSql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("access_token", accessToken);
+            cmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("expires_at", expiresAt);
+            cmd.Parameters.AddWithValue("tenant_name", (object?)tenantName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("tenant_id", (object?)tenantId ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var multipleNote = tenantCount > 1
+            ? $"<p>Multiple Xero organisations were returned. 3D AutoMate selected the first one for this first pass: <strong>{WebUtility.HtmlEncode(tenantName)}</strong>.</p>"
+            : "";
+
+        return Results.Content(
+            "<html><body style=\"font-family:Segoe UI,Arial,sans-serif;padding:32px;\">" +
+            "<h2>Xero connected successfully</h2>" +
+            $"<p>Connected organisation: <strong>{WebUtility.HtmlEncode(tenantName)}</strong></p>" +
+            multipleNote +
+            "<p>You can close this window and return to 3D AutoMate.</p>" +
+            "</body></html>",
+            "text/html");
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Xero callback failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// XERO STATUS
+// =============================
+app.MapGet("/integrations/xero/status", async (string inspectorId) =>
+{
+    try
+    {
+        if (!Guid.TryParse(inspectorId.Trim(), out Guid parsedInspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid inspectorId"
+            });
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    status,
+    external_account_email,
+    external_tenant_id,
+    expires_at,
+    updated_at
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = 'xero'
+LIMIT 1;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", parsedInspectorId);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                connected = false,
+                status = "Disconnected",
+                tenantName = "",
+                tenantId = "",
+                lastSync = "",
+                expiresAt = ""
+            });
+        }
+
+        string status = reader["status"]?.ToString() ?? "disconnected";
+
+        return Results.Ok(new
+        {
+            success = true,
+            connected = string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase),
+            status,
+            tenantName = reader["external_account_email"]?.ToString() ?? "",
+            tenantId = reader["external_tenant_id"]?.ToString() ?? "",
+            lastSync = reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O"),
+            expiresAt = reader["expires_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["expires_at"]).ToString("O")
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Xero status failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// XERO TEST CONNECTION
+// =============================
+app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionRequest request) =>
+{
+    try
+    {
+        if (!Guid.TryParse(request.InspectorId, out Guid inspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid InspectorId"
+            });
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        var account = await GetXeroAccountAsync(conn, inspectorId, builder.Configuration);
+        if (!account.Success)
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = account.ErrorMessage
+            });
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+        httpClient.DefaultRequestHeaders.Add("xero-tenant-id", account.TenantId);
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        var response = await httpClient.GetAsync("https://api.xero.com/api.xro/2.0/Organisation");
+        var responseText = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Xero organisation lookup failed",
+                detail: responseText,
+                statusCode: 500
+            );
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Xero connection verified.",
+            tenantId = account.TenantId,
+            tenantName = account.TenantName
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Xero test connection failed",
             detail: ex.ToString(),
             statusCode: 500
         );
@@ -3853,6 +4213,117 @@ CREATE TABLE IF NOT EXISTS public.inspector_integrations
     await cmd.ExecuteNonQueryAsync();
 }
 
+static async Task<XeroAccountResult> GetXeroAccountAsync(
+    NpgsqlConnection conn,
+    Guid inspectorId,
+    IConfiguration configuration)
+{
+    const string sql = @"
+SELECT
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    external_tenant_id,
+    status
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = 'xero'
+LIMIT 1;";
+
+    string? accessToken = null;
+    string? refreshToken = null;
+    DateTime? expiresAt = null;
+    string? tenantName = null;
+    string? tenantId = null;
+    string? status = null;
+
+    await using (var cmd = new NpgsqlCommand(sql, conn))
+    {
+        cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            accessToken = reader["access_token_encrypted"]?.ToString();
+            refreshToken = reader["refresh_token_encrypted"]?.ToString();
+            tenantName = reader["external_account_email"]?.ToString();
+            tenantId = reader["external_tenant_id"]?.ToString();
+            status = reader["status"]?.ToString();
+
+            if (reader["expires_at"] != DBNull.Value)
+                expiresAt = Convert.ToDateTime(reader["expires_at"]);
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(accessToken) ||
+        string.IsNullOrWhiteSpace(tenantId) ||
+        !string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase))
+    {
+        return XeroAccountResult.Failure("Xero is not connected for this inspector.");
+    }
+
+    if (expiresAt.HasValue && expiresAt.Value > DateTime.UtcNow.AddMinutes(5))
+        return XeroAccountResult.Ok(accessToken, refreshToken, tenantId, tenantName);
+
+    var clientId = configuration["XERO_CLIENT_ID"];
+    var clientSecret = configuration["XERO_CLIENT_SECRET"];
+
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+        return XeroAccountResult.Failure("XERO_CLIENT_ID and/or XERO_CLIENT_SECRET are missing.");
+
+    if (string.IsNullOrWhiteSpace(refreshToken))
+        return XeroAccountResult.Failure("Access token expired and no refresh token is stored.");
+
+    using var refreshClient = new HttpClient();
+    refreshClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+        "Basic",
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(clientId + ":" + clientSecret)));
+
+    var refreshResponse = await refreshClient.PostAsync(
+        "https://identity.xero.com/connect/token",
+        new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "refresh_token",
+            ["refresh_token"] = refreshToken
+        }));
+
+    var refreshJson = await refreshResponse.Content.ReadAsStringAsync();
+
+    if (!refreshResponse.IsSuccessStatusCode)
+        return XeroAccountResult.Failure($"Xero token refresh failed: {refreshJson}");
+
+    var refreshDoc = JsonDocument.Parse(refreshJson).RootElement;
+    accessToken = refreshDoc.GetProperty("access_token").GetString() ?? accessToken;
+    refreshToken = refreshDoc.TryGetProperty("refresh_token", out var refreshedTokenProp)
+        ? refreshedTokenProp.GetString() ?? refreshToken
+        : refreshToken;
+
+    var refreshedExpiresIn = refreshDoc.TryGetProperty("expires_in", out var refreshedExpiresInProp)
+        ? refreshedExpiresInProp.GetInt32()
+        : 1800;
+    expiresAt = DateTime.UtcNow.AddSeconds(refreshedExpiresIn);
+
+    const string updateSql = @"
+UPDATE public.inspector_integrations
+SET
+    access_token_encrypted = @access_token,
+    refresh_token_encrypted = @refresh_token,
+    expires_at = @expires_at,
+    updated_at = NOW()
+WHERE inspector_id = @inspector_id
+  AND provider = 'xero';";
+
+    await using var updateCmd = new NpgsqlCommand(updateSql, conn);
+    updateCmd.Parameters.AddWithValue("access_token", accessToken);
+    updateCmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+    updateCmd.Parameters.AddWithValue("expires_at", expiresAt.Value);
+    updateCmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    await updateCmd.ExecuteNonQueryAsync();
+
+    return XeroAccountResult.Ok(accessToken, refreshToken, tenantId, tenantName);
+}
+
 static async Task EnsureMappingTablesAsync(NpgsqlConnection conn)
 {
     const string sql = @"
@@ -4536,6 +5007,30 @@ public class SendTestEmailRequest
     public string ToEmail { get; set; } = "";
     public string Subject { get; set; } = "";
     public string Body { get; set; } = "";
+}
+
+public class XeroTestConnectionRequest
+{
+    public string InspectorId { get; set; } = "";
+}
+
+public record XeroAccountResult(
+    bool Success,
+    string? AccessToken,
+    string? RefreshToken,
+    string? TenantId,
+    string? TenantName,
+    string? ErrorMessage)
+{
+    public static XeroAccountResult Ok(string accessToken, string? refreshToken, string? tenantId, string? tenantName)
+    {
+        return new XeroAccountResult(true, accessToken, refreshToken, tenantId, tenantName, null);
+    }
+
+    public static XeroAccountResult Failure(string errorMessage)
+    {
+        return new XeroAccountResult(false, null, null, null, null, errorMessage);
+    }
 }
 
 public class JobUploadRequest
