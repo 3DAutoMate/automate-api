@@ -1549,6 +1549,282 @@ LIMIT 1;";
 });
 
 // =============================
+// GOOGLE CONNECT URL
+// =============================
+app.MapGet("/integrations/google/connect-url", (string inspectorId) =>
+{
+    var clientId = builder.Configuration["GOOGLE_CLIENT_ID"];
+    var redirectUri = builder.Configuration["GOOGLE_REDIRECT_URI"];
+
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(redirectUri))
+    {
+        return Results.Problem(
+            title: "Google config missing",
+            detail: "GOOGLE_CLIENT_ID and/or GOOGLE_REDIRECT_URI are missing from Railway variables.",
+            statusCode: 500
+        );
+    }
+
+    if (!Guid.TryParse(inspectorId.Trim(), out _))
+    {
+        return Results.BadRequest(new
+        {
+            success = false,
+            message = "Invalid inspectorId"
+        });
+    }
+
+    var scopes = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email";
+
+    var url =
+        "https://accounts.google.com/o/oauth2/v2/auth" +
+        $"?client_id={Uri.EscapeDataString(clientId)}" +
+        $"&response_type=code" +
+        $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+        $"&scope={Uri.EscapeDataString(scopes)}" +
+        $"&access_type=offline" +
+        $"&prompt=consent" +
+        $"&state={Uri.EscapeDataString(inspectorId.Trim())}";
+
+    return Results.Ok(new
+    {
+        success = true,
+        inspectorId = inspectorId.Trim(),
+        url
+    });
+});
+
+// =============================
+// GOOGLE CALLBACK
+// =============================
+app.MapGet("/api/integrations/google/callback", async (HttpContext context) =>
+{
+    try
+    {
+        var code = context.Request.Query["code"].ToString();
+        var state = context.Request.Query["state"].ToString();
+        var error = context.Request.Query["error"].ToString();
+
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Google authorization failed.",
+                error,
+                state
+            });
+        }
+
+        if (string.IsNullOrWhiteSpace(code))
+            return Results.BadRequest("Missing code");
+
+        if (!Guid.TryParse(state, out Guid inspectorId))
+            return Results.BadRequest("Invalid inspector ID in state");
+
+        var clientId = builder.Configuration["GOOGLE_CLIENT_ID"];
+        var clientSecret = builder.Configuration["GOOGLE_CLIENT_SECRET"];
+        var redirectUri = builder.Configuration["GOOGLE_REDIRECT_URI"];
+
+        if (string.IsNullOrWhiteSpace(clientId) ||
+            string.IsNullOrWhiteSpace(clientSecret) ||
+            string.IsNullOrWhiteSpace(redirectUri))
+        {
+            return Results.Problem(
+                title: "Google config missing",
+                detail: "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and/or GOOGLE_REDIRECT_URI are missing from Railway variables.",
+                statusCode: 500
+            );
+        }
+
+        using var httpClient = new HttpClient();
+        var tokenResponse = await httpClient.PostAsync(
+            "https://oauth2.googleapis.com/token",
+            new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["client_id"] = clientId,
+                ["client_secret"] = clientSecret,
+                ["code"] = code,
+                ["redirect_uri"] = redirectUri,
+                ["grant_type"] = "authorization_code"
+            }));
+
+        var tokenJson = await tokenResponse.Content.ReadAsStringAsync();
+
+        if (!tokenResponse.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Google token exchange failed",
+                detail: tokenJson,
+                statusCode: 500
+            );
+        }
+
+        var tokenDoc = JsonDocument.Parse(tokenJson).RootElement;
+        var accessToken = tokenDoc.GetProperty("access_token").GetString() ?? "";
+        var refreshToken = tokenDoc.TryGetProperty("refresh_token", out var refreshTokenProp)
+            ? refreshTokenProp.GetString() ?? ""
+            : "";
+        var expiresIn = tokenDoc.TryGetProperty("expires_in", out var expiresInProp)
+            ? expiresInProp.GetInt32()
+            : 3600;
+        var expiresAt = DateTime.UtcNow.AddSeconds(expiresIn);
+
+        string? accountEmail = null;
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        var userInfoResponse = await httpClient.GetAsync("https://www.googleapis.com/oauth2/v2/userinfo");
+        if (userInfoResponse.IsSuccessStatusCode)
+        {
+            var userInfoJson = await userInfoResponse.Content.ReadAsStringAsync();
+            var userInfo = JsonDocument.Parse(userInfoJson).RootElement;
+            accountEmail = userInfo.TryGetProperty("email", out var emailProp)
+                ? emailProp.GetString()
+                : null;
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string upsertSql = @"
+INSERT INTO public.inspector_integrations
+(
+    inspector_id,
+    provider,
+    status,
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    external_tenant_id,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    'google',
+    'connected',
+    @access_token,
+    @refresh_token,
+    @expires_at,
+    @external_account_email,
+    'primary',
+    NOW(),
+    NOW()
+)
+ON CONFLICT (inspector_id, provider)
+DO UPDATE SET
+    status = 'connected',
+    access_token_encrypted = EXCLUDED.access_token_encrypted,
+    refresh_token_encrypted = COALESCE(NULLIF(EXCLUDED.refresh_token_encrypted, ''), inspector_integrations.refresh_token_encrypted),
+    expires_at = EXCLUDED.expires_at,
+    external_account_email = EXCLUDED.external_account_email,
+    external_tenant_id = EXCLUDED.external_tenant_id,
+    updated_at = NOW();";
+
+        await using (var cmd = new NpgsqlCommand(upsertSql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+            cmd.Parameters.AddWithValue("access_token", accessToken);
+            cmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("expires_at", expiresAt);
+            cmd.Parameters.AddWithValue("external_account_email", (object?)accountEmail ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        return Results.Content(
+            "<html><body style=\"font-family:Segoe UI,Arial,sans-serif;padding:32px;\">" +
+            "<h2>Google Calendar connected successfully</h2>" +
+            $"<p>Connected account: <strong>{WebUtility.HtmlEncode(accountEmail ?? "Google Calendar")}</strong></p>" +
+            "<p>You can close this window and return to 3D AutoMate.</p>" +
+            "</body></html>",
+            "text/html");
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Google callback failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// GOOGLE STATUS
+// =============================
+app.MapGet("/integrations/google/status", async (string inspectorId) =>
+{
+    try
+    {
+        if (!Guid.TryParse(inspectorId.Trim(), out Guid parsedInspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid inspectorId"
+            });
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    status,
+    external_account_email,
+    external_tenant_id,
+    expires_at,
+    updated_at
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = 'google'
+LIMIT 1;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", parsedInspectorId);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                connected = false,
+                status = "Disconnected",
+                accountEmail = "",
+                calendarId = "primary",
+                lastSync = "",
+                expiresAt = ""
+            });
+        }
+
+        string status = reader["status"]?.ToString() ?? "disconnected";
+
+        return Results.Ok(new
+        {
+            success = true,
+            connected = string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase),
+            status,
+            accountEmail = reader["external_account_email"]?.ToString() ?? "",
+            calendarId = string.IsNullOrWhiteSpace(reader["external_tenant_id"]?.ToString()) ? "primary" : reader["external_tenant_id"]?.ToString(),
+            lastSync = reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O"),
+            expiresAt = reader["expires_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["expires_at"]).ToString("O")
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Google status failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // XERO TEST CONNECTION
 // =============================
 app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionRequest request) =>
@@ -1841,6 +2117,94 @@ app.MapPost("/integrations/xero/jobs/{jobId}/create-draft-invoice", async (Guid 
 
         return Results.Problem(
             title: "Create Xero draft invoice failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+// =============================
+// SCHEDULE JOB
+// =============================
+app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
+{
+    var results = new List<ScheduleActionResult>();
+
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureJobInvoiceLinesTableAsync(conn);
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        var job = await LoadScheduleJobAsync(conn, jobId);
+        if (job == null)
+        {
+            return Results.NotFound(new
+            {
+                success = false,
+                message = "Job was not found in Railway. Sync the selected job first.",
+                jobId
+            });
+        }
+
+        if (job.BookingEmailRequired)
+        {
+            var bookingResult = await SendScheduleBookingEmailsAsync(conn, job, builder.Configuration);
+            results.Add(bookingResult);
+        }
+        else
+        {
+            results.Add(ScheduleActionResult.Skip("booking-email", "Booking email is not required for this job."));
+        }
+
+        if (job.InvoiceRequired)
+        {
+            var invoiceResult = await CreateXeroDraftInvoiceForJobAsync(conn, jobId, builder.Configuration);
+            results.Add(invoiceResult);
+        }
+        else
+        {
+            results.Add(ScheduleActionResult.Skip("invoice", "Invoice is not required for this job."));
+        }
+
+        if (job.TermsRequired)
+        {
+            await MarkTermsFailedAsync(conn, jobId, "SignNow integration is not configured yet. Booking can continue, but agreement sending still needs the SignNow connector.");
+            results.Add(ScheduleActionResult.Failed("terms", "SignNow integration is not configured yet."));
+        }
+        else
+        {
+            results.Add(ScheduleActionResult.Skip("terms", "Terms are not required for this job."));
+        }
+
+        if (job.CalendarRequired)
+        {
+            var calendarResult = await CreateGoogleCalendarEventForJobAsync(conn, job, builder.Configuration);
+            results.Add(calendarResult);
+        }
+        else
+        {
+            results.Add(ScheduleActionResult.Skip("calendar", "Calendar event is not required for this job."));
+        }
+
+        var failed = results.Where(result => !result.Success && !result.Skipped).ToArray();
+
+        return Results.Ok(new
+        {
+            success = failed.Length == 0,
+            message = failed.Length == 0
+                ? "Schedule Job completed."
+                : "Schedule Job completed with setup or action errors.",
+            jobId,
+            actions = results
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Schedule Job failed",
             detail: ex.ToString(),
             statusCode: 500);
     }
@@ -4776,6 +5140,725 @@ WHERE job_id = @job_id;";
     await cmd.ExecuteNonQueryAsync();
 }
 
+static async Task<ScheduleJobInput?> LoadScheduleJobAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string sql = @"
+SELECT
+    j.job_id,
+    j.tenant_id,
+    j.inspector_id,
+    j.inspector_name,
+    j.job_name,
+    j.site_address,
+    j.job_date,
+    j.inspection_duration_minutes,
+    j.primary_service,
+    j.additional1,
+    j.additional2,
+    j.primary_service_key,
+    j.additional1_service_key,
+    j.additional2_service_key,
+    j.booking_email_required,
+    j.booking_email_sent,
+    j.terms_required,
+    j.invoice_required,
+    j.calendar_required,
+    j.calendar_created,
+    j.contact1_first_name,
+    j.contact1_last_name,
+    j.contact1_email,
+    j.contact2_first_name,
+    j.contact2_last_name,
+    j.contact2_email,
+    COALESCE(i.timezone, 'Pacific/Auckland') AS timezone,
+    i.company_name,
+    i.email_from_name,
+    i.email_from_address,
+    i.phone
+FROM public.jobs_staging j
+LEFT JOIN public.inspectors i
+    ON i.inspector_id = j.inspector_id
+WHERE j.job_id = @job_id
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+        return null;
+
+    return new ScheduleJobInput(
+        (Guid)reader["job_id"],
+        reader["tenant_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["tenant_id"],
+        (Guid)reader["inspector_id"],
+        reader["inspector_name"]?.ToString() ?? "",
+        reader["job_name"]?.ToString() ?? "",
+        reader["site_address"]?.ToString() ?? "",
+        reader["job_date"] == DBNull.Value ? null : Convert.ToDateTime(reader["job_date"]),
+        reader["inspection_duration_minutes"] == DBNull.Value ? 60 : Convert.ToInt32(reader["inspection_duration_minutes"]),
+        reader["primary_service"]?.ToString() ?? "",
+        reader["additional1"]?.ToString() ?? "",
+        reader["additional2"]?.ToString() ?? "",
+        reader["primary_service_key"]?.ToString() ?? "",
+        reader["additional1_service_key"]?.ToString() ?? "",
+        reader["additional2_service_key"]?.ToString() ?? "",
+        reader["booking_email_required"] != DBNull.Value && Convert.ToBoolean(reader["booking_email_required"]),
+        reader["booking_email_sent"] != DBNull.Value && Convert.ToBoolean(reader["booking_email_sent"]),
+        reader["terms_required"] != DBNull.Value && Convert.ToBoolean(reader["terms_required"]),
+        reader["invoice_required"] != DBNull.Value && Convert.ToBoolean(reader["invoice_required"]),
+        reader["calendar_required"] != DBNull.Value && Convert.ToBoolean(reader["calendar_required"]),
+        reader["calendar_created"] != DBNull.Value && Convert.ToBoolean(reader["calendar_created"]),
+        BuildPersonName(reader["contact1_first_name"]?.ToString(), reader["contact1_last_name"]?.ToString()),
+        reader["contact1_email"]?.ToString() ?? "",
+        BuildPersonName(reader["contact2_first_name"]?.ToString(), reader["contact2_last_name"]?.ToString()),
+        reader["contact2_email"]?.ToString() ?? "",
+        reader["timezone"]?.ToString() ?? "Pacific/Auckland",
+        reader["company_name"]?.ToString() ?? "",
+        reader["email_from_name"]?.ToString() ?? "",
+        reader["email_from_address"]?.ToString() ?? "",
+        reader["phone"]?.ToString() ?? "");
+}
+
+static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
+    NpgsqlConnection conn,
+    ScheduleJobInput job,
+    IConfiguration configuration)
+{
+    if (job.BookingEmailSent)
+        return ScheduleActionResult.Skip("booking-email", "Booking email was already marked sent.");
+
+    if (string.IsNullOrWhiteSpace(job.ClientEmail))
+    {
+        await MarkBookingEmailFailedAsync(conn, job.JobId, "Client email is missing.");
+        return ScheduleActionResult.Failed("booking-email", "Client email is missing.");
+    }
+
+    var services = GetSchedulableServices(job).ToArray();
+    if (services.Length == 0)
+        return ScheduleActionResult.Skip("booking-email", "No schedulable services were found.");
+
+    var account = await GetMicrosoftMailAccountAsync(conn, job.InspectorId, configuration);
+    if (!account.Success)
+    {
+        await MarkBookingEmailFailedAsync(conn, job.JobId, account.ErrorMessage ?? "Microsoft email is not connected.");
+        return ScheduleActionResult.Failed("booking-email", account.ErrorMessage ?? "Microsoft email is not connected.");
+    }
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+
+    var sent = new List<string>();
+    foreach (var service in services)
+    {
+        var subject = $"Booking confirmation - {service.Label}";
+        var body = BuildScheduleBookingEmailHtml(job, service);
+        var response = await SendMicrosoftMailAsync(httpClient, job.ClientEmail, subject, body);
+        if (!response.Success)
+        {
+            await MarkBookingEmailFailedAsync(conn, job.JobId, response.Message);
+            return ScheduleActionResult.Failed("booking-email", response.Message, new { sent });
+        }
+
+        await MarkWorkflowActionSentAsync(conn, job.JobId, BuildBookingActionKey(service.ServiceKey, service.Label));
+        sent.Add(service.Label);
+    }
+
+    await MarkBookingEmailSentAsync(conn, job.JobId);
+    return ScheduleActionResult.Ok("booking-email", $"Sent {sent.Count} booking email(s).", new { sent });
+}
+
+static IEnumerable<ScheduleServiceInput> GetSchedulableServices(ScheduleJobInput job)
+{
+    foreach (var service in new[]
+    {
+        new ScheduleServiceInput(job.PrimaryService, NormalizeServiceKey(job.PrimaryServiceKey, job.PrimaryService), "primary"),
+        new ScheduleServiceInput(job.Additional1, NormalizeServiceKey(job.Additional1ServiceKey, job.Additional1), "additional1"),
+        new ScheduleServiceInput(job.Additional2, NormalizeServiceKey(job.Additional2ServiceKey, job.Additional2), "additional2")
+    })
+    {
+        if (string.IsNullOrWhiteSpace(service.Label))
+            continue;
+
+        if (string.IsNullOrWhiteSpace(service.ServiceKey) || IsModifierServiceKey(service.ServiceKey))
+            continue;
+
+        yield return service;
+    }
+}
+
+static string BuildScheduleBookingEmailHtml(ScheduleJobInput job, ScheduleServiceInput service)
+{
+    var company = string.IsNullOrWhiteSpace(job.CompanyName) ? "3D AutoMate" : job.CompanyName.Trim();
+    var inspector = !string.IsNullOrWhiteSpace(job.EmailFromName) ? job.EmailFromName.Trim() : job.InspectorName;
+    var start = job.JobDate.HasValue ? job.JobDate.Value.ToLocalTime().ToString("f") : "To be confirmed";
+
+    return
+        "<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937;\">" +
+        $"<p>Hi {WebUtility.HtmlEncode(FirstWord(job.ClientName))},</p>" +
+        $"<p>Your <strong>{WebUtility.HtmlEncode(service.Label)}</strong> booking has been scheduled.</p>" +
+        "<table style=\"border-collapse:collapse;margin:16px 0;\">" +
+        $"<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Address</td><td>{WebUtility.HtmlEncode(job.SiteAddress)}</td></tr>" +
+        $"<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Date/time</td><td>{WebUtility.HtmlEncode(start)}</td></tr>" +
+        $"<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Inspector</td><td>{WebUtility.HtmlEncode(inspector)}</td></tr>" +
+        "</table>" +
+        "<p>Terms and any agreement documents will follow where required.</p>" +
+        $"<p>Regards,<br>{WebUtility.HtmlEncode(company)}</p>" +
+        "</div>";
+}
+
+static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
+    NpgsqlConnection conn,
+    Guid jobId,
+    IConfiguration configuration)
+{
+    var job = await LoadXeroInvoiceJobAsync(conn, jobId);
+    if (job == null)
+        return ScheduleActionResult.Failed("invoice", "Job was not found in Railway. Sync the selected job first.");
+
+    if (!string.IsNullOrWhiteSpace(job.XeroInvoiceId))
+    {
+        await MarkInvoiceSentAsync(conn, jobId);
+        return ScheduleActionResult.Skip("invoice", "Xero draft invoice already exists.", new
+        {
+            invoiceId = job.XeroInvoiceId,
+            invoiceNumber = job.XeroInvoiceNumber,
+            invoiceStatus = job.XeroInvoiceStatus
+        });
+    }
+
+    var account = await GetXeroAccountAsync(conn, job.InspectorId, configuration);
+    if (!account.Success)
+    {
+        await StoreXeroJobErrorAsync(conn, jobId, account.ErrorMessage ?? "Xero is not connected.");
+        return ScheduleActionResult.Failed("invoice", account.ErrorMessage ?? "Xero is not connected.");
+    }
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+    httpClient.DefaultRequestHeaders.Add("xero-tenant-id", account.TenantId);
+    httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+    var contactId = job.XeroContactId;
+    if (string.IsNullOrWhiteSpace(contactId))
+        contactId = await FindXeroContactIdByEmailAsync(httpClient, job.ContactEmail);
+
+    if (string.IsNullOrWhiteSpace(contactId))
+        contactId = await CreateXeroContactAsync(httpClient, job.ContactName, job.ContactEmail, job.ContactPhone);
+
+    if (string.IsNullOrWhiteSpace(contactId))
+        return ScheduleActionResult.Failed("invoice", "Xero did not return a contact ID.");
+
+    var invoiceLines = await LoadXeroInvoiceLinesAsync(conn, jobId);
+    if (invoiceLines.Count == 0)
+    {
+        invoiceLines.Add(new XeroInvoiceLineInput(
+            BuildFallbackInvoiceDescription(job.PrimaryService, job.SiteAddress),
+            1m,
+            job.JobTotal ?? 0m,
+            1));
+    }
+
+    if (invoiceLines.All(line => line.UnitAmount == 0m))
+    {
+        var message = "No invoice amount was found. Check the THREED invoice total/lines and sync the job again.";
+        await StoreXeroJobErrorAsync(conn, jobId, message);
+        return ScheduleActionResult.Failed("invoice", message);
+    }
+
+    var invoicePayload = new
+    {
+        Invoices = new[]
+        {
+            new
+            {
+                Type = "ACCREC",
+                Contact = new { ContactID = contactId },
+                DateString = DateTime.UtcNow.ToString("yyyy-MM-dd"),
+                DueDateString = (job.JobDate ?? DateTime.UtcNow).ToString("yyyy-MM-dd"),
+                Reference = string.IsNullOrWhiteSpace(job.SiteAddress) ? job.JobName : job.SiteAddress,
+                Status = "DRAFT",
+                SentToContact = false,
+                LineItems = invoiceLines.Select(line => new
+                {
+                    Description = line.Description,
+                    Quantity = line.Quantity <= 0m ? 1m : line.Quantity,
+                    UnitAmount = line.UnitAmount
+                }).ToArray()
+            }
+        }
+    };
+
+    var invoiceResponse = await httpClient.PostAsJsonAsync(
+        "https://api.xero.com/api.xro/2.0/Invoices",
+        invoicePayload);
+    var invoiceJson = await invoiceResponse.Content.ReadAsStringAsync();
+
+    if (!invoiceResponse.IsSuccessStatusCode)
+    {
+        await StoreXeroJobErrorAsync(conn, jobId, invoiceJson);
+        return ScheduleActionResult.Failed("invoice", "Xero draft invoice creation failed: " + invoiceJson);
+    }
+
+    var invoiceDoc = JsonDocument.Parse(invoiceJson).RootElement;
+    var invoice = invoiceDoc.TryGetProperty("Invoices", out var invoicesProp) &&
+                  invoicesProp.ValueKind == JsonValueKind.Array &&
+                  invoicesProp.GetArrayLength() > 0
+        ? invoicesProp[0]
+        : invoiceDoc;
+
+    var invoiceId = GetJsonString(invoice, "InvoiceID");
+    var invoiceNumber = GetJsonString(invoice, "InvoiceNumber");
+    var invoiceStatus = GetJsonString(invoice, "Status");
+
+    await StoreXeroInvoiceResultAsync(conn, jobId, contactId, invoiceId, invoiceNumber, invoiceStatus);
+    await MarkInvoiceSentAsync(conn, jobId);
+
+    return ScheduleActionResult.Ok("invoice", "Xero draft invoice created.", new
+    {
+        invoiceId,
+        invoiceNumber,
+        invoiceStatus,
+        sentToContact = false
+    });
+}
+
+static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
+    NpgsqlConnection conn,
+    ScheduleJobInput job,
+    IConfiguration configuration)
+{
+    if (job.CalendarCreated)
+        return ScheduleActionResult.Skip("calendar", "Calendar event was already marked created.");
+
+    if (!job.JobDate.HasValue)
+    {
+        await MarkCalendarFailedAsync(conn, job.JobId, "Inspection date/time is missing.");
+        return ScheduleActionResult.Failed("calendar", "Inspection date/time is missing.");
+    }
+
+    var account = await GetGoogleCalendarAccountAsync(conn, job.InspectorId, configuration);
+    if (!account.Success)
+    {
+        await MarkCalendarFailedAsync(conn, job.JobId, account.ErrorMessage ?? "Google Calendar is not connected.");
+        return ScheduleActionResult.Failed("calendar", account.ErrorMessage ?? "Google Calendar is not connected.");
+    }
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+
+    var calendarId = string.IsNullOrWhiteSpace(account.CalendarId) ? "primary" : account.CalendarId;
+    var privateProperty = Uri.EscapeDataString("automateJobId=" + job.JobId);
+    var lookupUrl =
+        $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events" +
+        $"?privateExtendedProperty={privateProperty}&singleEvents=true&maxResults=1";
+    var lookupResponse = await httpClient.GetAsync(lookupUrl);
+    var lookupJson = await lookupResponse.Content.ReadAsStringAsync();
+    if (lookupResponse.IsSuccessStatusCode)
+    {
+        var lookupDoc = JsonDocument.Parse(lookupJson).RootElement;
+        if (lookupDoc.TryGetProperty("items", out var items) &&
+            items.ValueKind == JsonValueKind.Array &&
+            items.GetArrayLength() > 0)
+        {
+            await MarkCalendarCreatedAsync(conn, job.JobId);
+            return ScheduleActionResult.Skip("calendar", "Google Calendar event already exists.", new
+            {
+                eventId = GetJsonString(items[0], "id"),
+                htmlLink = GetJsonString(items[0], "htmlLink")
+            });
+        }
+    }
+
+    var start = job.JobDate.Value;
+    var duration = job.InspectionDurationMinutes <= 0 ? 60 : job.InspectionDurationMinutes;
+    var end = start.AddMinutes(duration);
+    var summary = string.IsNullOrWhiteSpace(job.PrimaryService)
+        ? "Inspection"
+        : job.PrimaryService.Trim();
+    if (!string.IsNullOrWhiteSpace(job.SiteAddress))
+        summary += " - " + job.SiteAddress.Trim();
+
+    var eventPayload = new
+    {
+        summary,
+        location = job.SiteAddress,
+        description =
+            "Created by 3D AutoMate." +
+            (string.IsNullOrWhiteSpace(job.ClientName) ? "" : "\nClient: " + job.ClientName) +
+            (string.IsNullOrWhiteSpace(job.ClientEmail) ? "" : "\nClient email: " + job.ClientEmail),
+        start = new
+        {
+            dateTime = start.ToUniversalTime().ToString("O"),
+            timeZone = string.IsNullOrWhiteSpace(job.Timezone) ? "Pacific/Auckland" : job.Timezone
+        },
+        end = new
+        {
+            dateTime = end.ToUniversalTime().ToString("O"),
+            timeZone = string.IsNullOrWhiteSpace(job.Timezone) ? "Pacific/Auckland" : job.Timezone
+        },
+        extendedProperties = new
+        {
+            @private = new Dictionary<string, string>
+            {
+                ["automateJobId"] = job.JobId.ToString()
+            }
+        }
+    };
+
+    var createResponse = await httpClient.PostAsJsonAsync(
+        $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events",
+        eventPayload);
+    var createJson = await createResponse.Content.ReadAsStringAsync();
+
+    if (!createResponse.IsSuccessStatusCode)
+    {
+        await MarkCalendarFailedAsync(conn, job.JobId, createJson);
+        return ScheduleActionResult.Failed("calendar", "Google Calendar event creation failed: " + createJson);
+    }
+
+    var created = JsonDocument.Parse(createJson).RootElement;
+    await MarkCalendarCreatedAsync(conn, job.JobId);
+    return ScheduleActionResult.Ok("calendar", "Google Calendar event created.", new
+    {
+        eventId = GetJsonString(created, "id"),
+        htmlLink = GetJsonString(created, "htmlLink")
+    });
+}
+
+static async Task<IntegrationAccountResult> GetMicrosoftMailAccountAsync(
+    NpgsqlConnection conn,
+    Guid inspectorId,
+    IConfiguration configuration)
+{
+    return await GetOAuthAccountAsync(
+        conn,
+        inspectorId,
+        "microsoft",
+        configuration["MS_CLIENT_ID"],
+        configuration["MS_CLIENT_SECRET"],
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        new Dictionary<string, string>
+        {
+            ["scope"] = "offline_access Mail.Send User.Read"
+        },
+        null);
+}
+
+static async Task<IntegrationAccountResult> GetGoogleCalendarAccountAsync(
+    NpgsqlConnection conn,
+    Guid inspectorId,
+    IConfiguration configuration)
+{
+    return await GetOAuthAccountAsync(
+        conn,
+        inspectorId,
+        "google",
+        configuration["GOOGLE_CLIENT_ID"],
+        configuration["GOOGLE_CLIENT_SECRET"],
+        "https://oauth2.googleapis.com/token",
+        null,
+        "primary");
+}
+
+static async Task<IntegrationAccountResult> GetOAuthAccountAsync(
+    NpgsqlConnection conn,
+    Guid inspectorId,
+    string provider,
+    string? clientId,
+    string? clientSecret,
+    string tokenUrl,
+    Dictionary<string, string>? extraRefreshFields,
+    string? defaultTenantId)
+{
+    const string sql = @"
+SELECT
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    external_tenant_id,
+    status
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = @provider
+LIMIT 1;";
+
+    string? accessToken = null;
+    string? refreshToken = null;
+    DateTime? expiresAt = null;
+    string? accountName = null;
+    string? tenantId = null;
+    string? status = null;
+
+    await using (var cmd = new NpgsqlCommand(sql, conn))
+    {
+        cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+        cmd.Parameters.AddWithValue("provider", provider);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            accessToken = reader["access_token_encrypted"]?.ToString();
+            refreshToken = reader["refresh_token_encrypted"]?.ToString();
+            accountName = reader["external_account_email"]?.ToString();
+            tenantId = reader["external_tenant_id"]?.ToString();
+            status = reader["status"]?.ToString();
+            if (reader["expires_at"] != DBNull.Value)
+                expiresAt = Convert.ToDateTime(reader["expires_at"]);
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(accessToken) ||
+        !string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase))
+    {
+        return IntegrationAccountResult.Failure($"{ToTitle(provider)} is not connected for this inspector.");
+    }
+
+    if (expiresAt.HasValue && expiresAt.Value > DateTime.UtcNow.AddMinutes(5))
+        return IntegrationAccountResult.Ok(accessToken, refreshToken, tenantId ?? defaultTenantId, accountName);
+
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+        return IntegrationAccountResult.Failure($"{provider.ToUpperInvariant()} client ID and/or secret are missing.");
+
+    if (string.IsNullOrWhiteSpace(refreshToken))
+        return IntegrationAccountResult.Failure($"{ToTitle(provider)} access token expired and no refresh token is stored.");
+
+    using var refreshClient = new HttpClient();
+    var refreshFields = new Dictionary<string, string>
+    {
+        ["client_id"] = clientId,
+        ["client_secret"] = clientSecret,
+        ["refresh_token"] = refreshToken,
+        ["grant_type"] = "refresh_token"
+    };
+
+    if (extraRefreshFields != null)
+    {
+        foreach (var field in extraRefreshFields)
+            refreshFields[field.Key] = field.Value;
+    }
+
+    var refreshResponse = await refreshClient.PostAsync(tokenUrl, new FormUrlEncodedContent(refreshFields));
+    var refreshJson = await refreshResponse.Content.ReadAsStringAsync();
+
+    if (!refreshResponse.IsSuccessStatusCode)
+        return IntegrationAccountResult.Failure($"{ToTitle(provider)} token refresh failed: {refreshJson}");
+
+    var refreshDoc = JsonDocument.Parse(refreshJson).RootElement;
+    accessToken = refreshDoc.GetProperty("access_token").GetString() ?? accessToken;
+    refreshToken = refreshDoc.TryGetProperty("refresh_token", out var refreshedTokenProp)
+        ? refreshedTokenProp.GetString() ?? refreshToken
+        : refreshToken;
+
+    var refreshedExpiresIn = refreshDoc.TryGetProperty("expires_in", out var refreshedExpiresInProp)
+        ? refreshedExpiresInProp.GetInt32()
+        : 3600;
+    expiresAt = DateTime.UtcNow.AddSeconds(refreshedExpiresIn);
+
+    const string updateSql = @"
+UPDATE public.inspector_integrations
+SET
+    access_token_encrypted = @access_token,
+    refresh_token_encrypted = @refresh_token,
+    expires_at = @expires_at,
+    updated_at = NOW()
+WHERE inspector_id = @inspector_id
+  AND provider = @provider;";
+
+    await using var updateCmd = new NpgsqlCommand(updateSql, conn);
+    updateCmd.Parameters.AddWithValue("access_token", accessToken);
+    updateCmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+    updateCmd.Parameters.AddWithValue("expires_at", expiresAt.Value);
+    updateCmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    updateCmd.Parameters.AddWithValue("provider", provider);
+    await updateCmd.ExecuteNonQueryAsync();
+
+    return IntegrationAccountResult.Ok(accessToken, refreshToken, tenantId ?? defaultTenantId, accountName);
+}
+
+static async Task<ScheduleActionResult> SendMicrosoftMailAsync(
+    HttpClient httpClient,
+    string toEmail,
+    string subject,
+    string htmlBody)
+{
+    var emailBody = new
+    {
+        message = new
+        {
+            subject,
+            body = new
+            {
+                contentType = "HTML",
+                content = htmlBody
+            },
+            toRecipients = new[]
+            {
+                new
+                {
+                    emailAddress = new
+                    {
+                        address = toEmail
+                    }
+                }
+            }
+        }
+    };
+
+    var response = await httpClient.PostAsJsonAsync(
+        "https://graph.microsoft.com/v1.0/me/sendMail",
+        emailBody);
+    var responseText = await response.Content.ReadAsStringAsync();
+
+    return response.IsSuccessStatusCode
+        ? ScheduleActionResult.Ok("booking-email", "Email sent.")
+        : ScheduleActionResult.Failed("booking-email", "Microsoft send mail failed: " + responseText);
+}
+
+static async Task MarkBookingEmailSentAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    booking_email_sent = true,
+    booking_email_sent_at = NOW(),
+    booking_email_retry_requested = false,
+    booking_email_retry_requested_at = NULL,
+    booking_email_last_attempt_at = NOW(),
+    booking_email_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkBookingEmailFailedAsync(NpgsqlConnection conn, Guid jobId, string error)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    booking_email_last_attempt_at = NOW(),
+    booking_email_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("error_message", error);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkTermsFailedAsync(NpgsqlConnection conn, Guid jobId, string error)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    terms_last_attempt_at = NOW(),
+    terms_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("error_message", error);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkInvoiceSentAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    invoice_sent = true,
+    invoice_sent_at = NOW(),
+    invoice_retry_requested = false,
+    invoice_retry_requested_at = NULL,
+    invoice_last_attempt_at = NOW(),
+    invoice_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkCalendarCreatedAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    calendar_created = true,
+    calendar_created_at = NOW(),
+    calendar_retry_requested = false,
+    calendar_retry_requested_at = NULL,
+    calendar_last_attempt_at = NOW(),
+    calendar_last_error = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkCalendarFailedAsync(NpgsqlConnection conn, Guid jobId, string error)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    calendar_last_attempt_at = NOW(),
+    calendar_last_error = @error_message,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("error_message", error);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkWorkflowActionSentAsync(NpgsqlConnection conn, Guid jobId, string actionKey)
+{
+    if (string.IsNullOrWhiteSpace(actionKey))
+        return;
+
+    const string sql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'sent',
+    retry_requested = false,
+    retry_requested_at = NULL,
+    sent_at = NOW(),
+    last_attempt_at = NOW(),
+    last_error = NULL,
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_key = @action_key;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("action_key", actionKey);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static string ToTitle(string value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "";
+
+    return char.ToUpperInvariant(value[0]) + value.Substring(1);
+}
+
 static string GetJsonString(JsonElement element, string propertyName)
 {
     return element.TryGetProperty(propertyName, out var value) && value.ValueKind != JsonValueKind.Null
@@ -6574,6 +7657,86 @@ public record XeroInvoiceLineInput(
     decimal Quantity,
     decimal UnitAmount,
     int LineIndex);
+
+public record ScheduleActionResult(
+    string Action,
+    bool Success,
+    bool Skipped,
+    string Message,
+    object? Details = null)
+{
+    public static ScheduleActionResult Ok(string action, string message, object? details = null)
+    {
+        return new ScheduleActionResult(action, true, false, message, details);
+    }
+
+    public static ScheduleActionResult Skip(string action, string message, object? details = null)
+    {
+        return new ScheduleActionResult(action, true, true, message, details);
+    }
+
+    public static ScheduleActionResult Failed(string action, string message, object? details = null)
+    {
+        return new ScheduleActionResult(action, false, false, message, details);
+    }
+}
+
+public record IntegrationAccountResult(
+    bool Success,
+    string? AccessToken,
+    string? RefreshToken,
+    string? TenantId,
+    string? AccountName,
+    string? ErrorMessage)
+{
+    public string? CalendarId => TenantId;
+
+    public static IntegrationAccountResult Ok(string accessToken, string? refreshToken, string? tenantId, string? accountName)
+    {
+        return new IntegrationAccountResult(true, accessToken, refreshToken, tenantId, accountName, null);
+    }
+
+    public static IntegrationAccountResult Failure(string errorMessage)
+    {
+        return new IntegrationAccountResult(false, null, null, null, null, errorMessage);
+    }
+}
+
+public record ScheduleServiceInput(
+    string Label,
+    string ServiceKey,
+    string Slot);
+
+public record ScheduleJobInput(
+    Guid JobId,
+    Guid TenantId,
+    Guid InspectorId,
+    string InspectorName,
+    string JobName,
+    string SiteAddress,
+    DateTime? JobDate,
+    int InspectionDurationMinutes,
+    string PrimaryService,
+    string Additional1,
+    string Additional2,
+    string PrimaryServiceKey,
+    string Additional1ServiceKey,
+    string Additional2ServiceKey,
+    bool BookingEmailRequired,
+    bool BookingEmailSent,
+    bool TermsRequired,
+    bool InvoiceRequired,
+    bool CalendarRequired,
+    bool CalendarCreated,
+    string ClientName,
+    string ClientEmail,
+    string AgentName,
+    string AgentEmail,
+    string Timezone,
+    string CompanyName,
+    string EmailFromName,
+    string EmailFromAddress,
+    string Phone);
 
 public class JobUploadRequest
 {
