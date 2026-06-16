@@ -1644,6 +1644,29 @@ app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionReque
 });
 
 // =============================
+// =============================
+// EMAIL TEMPLATE PLACEHOLDERS
+// =============================
+app.MapGet("/email-templates/placeholders", () => Results.Ok(new
+{
+    success = true,
+    placeholders = GetEmailTemplatePlaceholders(),
+    categories = GetEmailTemplatePlaceholderCategories()
+}));
+
+// =============================
+// EMAIL TEMPLATE SERVICE TYPES
+// =============================
+app.MapGet("/email-templates/service-types", () => Results.Ok(new
+{
+    success = true,
+    serviceTypes = GetEmailTemplateServiceTypes()
+}));
+
+// =============================
+// EMAIL TEMPLATE MAKER UI
+// =============================
+app.MapGet("/email-template-maker", () => Results.Content(GetEmailTemplateMakerHtml(), "text/html"));
 // XERO CREATE DRAFT INVOICE
 // =============================
 app.MapPost("/integrations/xero/jobs/{jobId}/create-draft-invoice", async (Guid jobId) =>
@@ -5054,6 +5077,954 @@ DO UPDATE SET
     await cmd.ExecuteNonQueryAsync();
 }
 
+static string NormalizeServiceTypeKey(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "general_booking";
+
+    var normalized = value.Trim().ToLowerInvariant().Replace(" ", "_").Replace("-", "_");
+
+    return normalized switch
+    {
+        "pre_purchase" => "building_inspection",
+        "pre_sale" => "building_inspection",
+        "additional_outbuilding" => "garage_outbuilding",
+        "council_file_review" => "property_file_review",
+        _ => normalized
+    };
+}
+
+static string BuildAddOnPlaceholderKey(string serviceTypeKey)
+{
+    return "HAS_" + NormalizeServiceTypeKey(serviceTypeKey).ToUpperInvariant();
+}
+
+static object BuildAddOnPlaceholder(EmailTemplateServiceType serviceType)
+{
+    var key = BuildAddOnPlaceholderKey(serviceType.Key);
+    return new { key, token = "{{" + key + "}}", label = "Has " + serviceType.Label };
+}
+
+static object[] GetEmailTemplatePlaceholders()
+{
+    var basePlaceholders = new object[]
+    {
+        new { key = "SERVICES", token = "{{SERVICES}}", label = "Services" },
+        new { key = "PRIMARY_SERVICE", token = "{{PRIMARY_SERVICE}}", label = "Primary Service" },
+        new { key = "ADDITIONAL_SERVICES", token = "{{ADDITIONAL_SERVICES}}", label = "Additional Services" },
+        new { key = "PRIMARY_SERVICE_KEY", token = "{{PRIMARY_SERVICE_KEY}}", label = "Primary Service Key" },
+        new { key = "ADDITIONAL1_SERVICE_KEY", token = "{{ADDITIONAL1_SERVICE_KEY}}", label = "Additional 1 Service Key" },
+        new { key = "ADDITIONAL2_SERVICE_KEY", token = "{{ADDITIONAL2_SERVICE_KEY}}", label = "Additional 2 Service Key" },
+        new { key = "CANONICAL_SERVICES", token = "{{CANONICAL_SERVICES}}", label = "Canonical Services" },
+        new { key = "ADD_ON_SERVICE_KEYS", token = "{{ADD_ON_SERVICE_KEYS}}", label = "Add On Service Keys" },
+        new { key = "BOOKING_TEMPLATE_KEY", token = "{{BOOKING_TEMPLATE_KEY}}", label = "Booking Template Key" },
+        new { key = "BOOKING_EMAIL_REQUIRED", token = "{{BOOKING_EMAIL_REQUIRED}}", label = "Booking Email Required" },
+        new { key = "TERMS_REQUIRED", token = "{{TERMS_REQUIRED}}", label = "Terms Required" },
+        new { key = "INVOICE_REQUIRED", token = "{{INVOICE_REQUIRED}}", label = "Invoice Required" },
+        new { key = "CALENDAR_REQUIRED", token = "{{CALENDAR_REQUIRED}}", label = "Calendar Required" },
+        new { key = "REPORT_REQUIRED", token = "{{REPORT_REQUIRED}}", label = "Report Required" },
+        new { key = "PROPERTY_ADDRESS", token = "{{PROPERTY_ADDRESS}}", label = "Property Address" },
+        new { key = "ADDRESS", token = "{{ADDRESS}}", label = "Address" },
+        new { key = "PROPERTY_COUNTY", token = "{{PROPERTY_COUNTY}}", label = "Property County" },
+        new { key = "STREET_ADDRESS", token = "{{STREET_ADDRESS}}", label = "Street Address" },
+        new { key = "INSPECTION_DATE", token = "{{INSPECTION_DATE}}", label = "Inspection Date" },
+        new { key = "INSPECTION_TIME", token = "{{INSPECTION_TIME}}", label = "Inspection Time" },
+        new { key = "INSPECTION_END_TIME", token = "{{INSPECTION_END_TIME}}", label = "Inspection End Time" },
+        new { key = "CLIENT_NAME", token = "{{CLIENT_NAME}}", label = "Client Name" },
+        new { key = "CLIENT_FIRST_NAME", token = "{{CLIENT_FIRST_NAME}}", label = "Client First Name" },
+        new { key = "CLIENT_ADDRESS", token = "{{CLIENT_ADDRESS}}", label = "Client Address" },
+        new { key = "CLIENT_EMAIL", token = "{{CLIENT_EMAIL}}", label = "Client Email" },
+        new { key = "CLIENT_PHONE", token = "{{CLIENT_PHONE}}", label = "Client Phone" },
+        new { key = "AGENT_NAME", token = "{{AGENT_NAME}}", label = "Agent Name" },
+        new { key = "AGENT_FIRST_NAME", token = "{{AGENT_FIRST_NAME}}", label = "Agent First Name" },
+        new { key = "AGENT_FULL_ADDRESS", token = "{{AGENT_FULL_ADDRESS}}", label = "Agent Full Address" },
+        new { key = "AGENT_ADDRESS", token = "{{AGENT_ADDRESS}}", label = "Agent Address" },
+        new { key = "AGENT_CITY", token = "{{AGENT_CITY}}", label = "Agent City" },
+        new { key = "AGENT_STATE", token = "{{AGENT_STATE}}", label = "Agent State" },
+        new { key = "AGENT_ZIP", token = "{{AGENT_ZIP}}", label = "Agent Zip" },
+        new { key = "LISTING_AGENT_NAME", token = "{{LISTING_AGENT_NAME}}", label = "Listing Agent Name" },
+        new { key = "LISTING_AGENT_FIRST_NAME", token = "{{LISTING_AGENT_FIRST_NAME}}", label = "Listing Agent First Name" },
+        new { key = "LISTING_AGENT_FULL_ADDRESS", token = "{{LISTING_AGENT_FULL_ADDRESS}}", label = "Listing Agent Full Address" },
+        new { key = "LISTING_AGENT_ADDRESS", token = "{{LISTING_AGENT_ADDRESS}}", label = "Listing Agent Address" },
+        new { key = "LISTING_AGENT_CITY", token = "{{LISTING_AGENT_CITY}}", label = "Listing Agent City" },
+        new { key = "LISTING_AGENT_STATE", token = "{{LISTING_AGENT_STATE}}", label = "Listing Agent State" },
+        new { key = "LISTING_AGENT_ZIP", token = "{{LISTING_AGENT_ZIP}}", label = "Listing Agent Zip" },
+        new { key = "INSPECTOR_NAME", token = "{{INSPECTOR_NAME}}", label = "Inspector Name" },
+        new { key = "INSPECTOR_FIRST_NAME", token = "{{INSPECTOR_FIRST_NAME}}", label = "Inspector First Name" },
+        new { key = "INSPECTOR_PHONE", token = "{{INSPECTOR_PHONE}}", label = "Inspector Phone" },
+        new { key = "INSPECTOR_EMAIL", token = "{{INSPECTOR_EMAIL}}", label = "Inspector Email" },
+        new { key = "INSPECTORS_NAMES", token = "{{INSPECTORS_NAMES}}", label = "Inspectors Names" },
+        new { key = "COMPANY_NAME", token = "{{COMPANY_NAME}}", label = "Company Name" },
+        new { key = "LOGO_URL", token = "{{LOGO_URL}}", label = "Logo URL" },
+        new { key = "COMPANY_LOGO_URL", token = "{{COMPANY_LOGO_URL}}", label = "Company Logo URL" },
+        new { key = "JOB_NAME", token = "{{JOB_NAME}}", label = "Job Name" },
+        new { key = "INSPECTION_LINK", token = "{{INSPECTION_LINK}}", label = "Inspection Link" },
+        new { key = "REPORT_LINK", token = "{{REPORT_LINK}}", label = "Report Link" },
+        new { key = "INVOICE_LINK", token = "{{INVOICE_LINK}}", label = "Invoice Link" }
+    };
+
+    return basePlaceholders
+        .Take(8)
+        .Concat(GetEmailTemplateAddOnServiceTypes().Select(BuildAddOnPlaceholder))
+        .Concat(basePlaceholders.Skip(8))
+        .ToArray();
+}
+
+static object[] GetEmailTemplatePlaceholderCategories()
+{
+    return new object[]
+    {
+        new
+        {
+            category = "Job Details",
+            placeholders = new object[]
+            {
+                new { key = "JOB_NAME", token = "{{JOB_NAME}}", label = "Job Name" },
+                new { key = "PROPERTY_ADDRESS", token = "{{PROPERTY_ADDRESS}}", label = "Property Address" },
+                new { key = "ADDRESS", token = "{{ADDRESS}}", label = "Address" },
+                new { key = "INSPECTION_DATE", token = "{{INSPECTION_DATE}}", label = "Inspection Date" },
+                new { key = "INSPECTION_TIME", token = "{{INSPECTION_TIME}}", label = "Inspection Time" },
+                new { key = "INSPECTION_END_TIME", token = "{{INSPECTION_END_TIME}}", label = "Inspection End Time" }
+            }
+        },
+        new
+        {
+            category = "Service Items",
+            placeholders = new object[]
+            {
+                new { key = "SERVICES", token = "{{SERVICES}}", label = "Services" },
+                new { key = "PRIMARY_SERVICE", token = "{{PRIMARY_SERVICE}}", label = "Primary Service" },
+                new { key = "ADDITIONAL_SERVICES", token = "{{ADDITIONAL_SERVICES}}", label = "Additional Services" },
+                new { key = "PRIMARY_SERVICE_KEY", token = "{{PRIMARY_SERVICE_KEY}}", label = "Primary Service Key" },
+                new { key = "ADDITIONAL1_SERVICE_KEY", token = "{{ADDITIONAL1_SERVICE_KEY}}", label = "Additional 1 Service Key" },
+                new { key = "ADDITIONAL2_SERVICE_KEY", token = "{{ADDITIONAL2_SERVICE_KEY}}", label = "Additional 2 Service Key" },
+                new { key = "CANONICAL_SERVICES", token = "{{CANONICAL_SERVICES}}", label = "Canonical Services" },
+                new { key = "ADD_ON_SERVICE_KEYS", token = "{{ADD_ON_SERVICE_KEYS}}", label = "Add On Service Keys" },
+                new { key = "BOOKING_TEMPLATE_KEY", token = "{{BOOKING_TEMPLATE_KEY}}", label = "Booking Template Key" }
+            }
+            .Take(8)
+            .Concat(GetEmailTemplateAddOnServiceTypes().Select(BuildAddOnPlaceholder))
+            .Concat(new object[]
+            {
+                new { key = "BOOKING_TEMPLATE_KEY", token = "{{BOOKING_TEMPLATE_KEY}}", label = "Booking Template Key" }
+            })
+            .ToArray()
+        },
+        new
+        {
+            category = "Client Details",
+            placeholders = new object[]
+            {
+                new { key = "CLIENT_NAME", token = "{{CLIENT_NAME}}", label = "Client Name" },
+                new { key = "CLIENT_FIRST_NAME", token = "{{CLIENT_FIRST_NAME}}", label = "Client First Name" },
+                new { key = "CLIENT_EMAIL", token = "{{CLIENT_EMAIL}}", label = "Client Email" },
+                new { key = "CLIENT_PHONE", token = "{{CLIENT_PHONE}}", label = "Client Phone" }
+            }
+        },
+        new
+        {
+            category = "Agent Details",
+            placeholders = new object[]
+            {
+                new { key = "AGENT_NAME", token = "{{AGENT_NAME}}", label = "Agent Name" },
+                new { key = "AGENT_FIRST_NAME", token = "{{AGENT_FIRST_NAME}}", label = "Agent First Name" }
+            }
+        },
+        new
+        {
+            category = "Inspector Details",
+            placeholders = new object[]
+            {
+                new { key = "INSPECTOR_NAME", token = "{{INSPECTOR_NAME}}", label = "Inspector Name" },
+                new { key = "INSPECTOR_FIRST_NAME", token = "{{INSPECTOR_FIRST_NAME}}", label = "Inspector First Name" },
+                new { key = "INSPECTOR_PHONE", token = "{{INSPECTOR_PHONE}}", label = "Inspector Phone" },
+                new { key = "INSPECTOR_EMAIL", token = "{{INSPECTOR_EMAIL}}", label = "Inspector Email" },
+                new { key = "COMPANY_NAME", token = "{{COMPANY_NAME}}", label = "Company Name" },
+                new { key = "LOGO_URL", token = "{{LOGO_URL}}", label = "Logo URL" },
+                new { key = "COMPANY_LOGO_URL", token = "{{COMPANY_LOGO_URL}}", label = "Company Logo URL" }
+            }
+        },
+        new
+        {
+            category = "Links",
+            placeholders = new object[]
+            {
+                new { key = "INSPECTION_LINK", token = "{{INSPECTION_LINK}}", label = "Inspection Link" },
+                new { key = "REPORT_LINK", token = "{{REPORT_LINK}}", label = "Report Link" },
+                new { key = "INVOICE_LINK", token = "{{INVOICE_LINK}}", label = "Invoice Link" }
+            }
+        }
+    };
+}
+
+static object[] GetEmailTemplateServiceTypes()
+{
+    return GetEmailTemplateServiceTypeRecords()
+        .Select(type => new { key = type.Key, label = type.Label, group = type.Group })
+        .ToArray();
+}
+
+static EmailTemplateServiceType[] GetEmailTemplateAddOnServiceTypes()
+{
+    return GetEmailTemplateServiceTypeRecords()
+        .Where(type => string.Equals(type.Group, "Add-on service", StringComparison.OrdinalIgnoreCase))
+        .ToArray();
+}
+
+static EmailTemplateServiceType[] GetEmailTemplateServiceTypeRecords()
+{
+    return new[]
+    {
+        new EmailTemplateServiceType("general_booking", "General booking", "Primary service"),
+        new EmailTemplateServiceType("building_inspection", "Building inspection", "Primary service"),
+        new EmailTemplateServiceType("building_investigation", "Building investigation", "Primary service"),
+        new EmailTemplateServiceType("healthy_homes_assessment", "Healthy Homes assessment", "Primary service"),
+        new EmailTemplateServiceType("meth_field_composite", "Meth field composite", "Primary service"),
+        new EmailTemplateServiceType("meth_lab_composite", "Meth lab composite", "Primary service"),
+        new EmailTemplateServiceType("building_inspection_weathertightness", "Building inspection + weathertightness", "Building inspection combinations"),
+        new EmailTemplateServiceType("building_inspection_garage_outbuilding", "Building inspection + garage/outbuilding", "Building inspection combinations"),
+        new EmailTemplateServiceType("building_inspection_attached_flat", "Building inspection + attached flat", "Building inspection combinations"),
+        new EmailTemplateServiceType("building_inspection_property_file_review", "Building inspection + property file review", "Building inspection combinations"),
+        new EmailTemplateServiceType("building_inspection_weathertightness_garage_outbuilding", "Building inspection + weathertightness + garage/outbuilding", "Building inspection combinations"),
+        new EmailTemplateServiceType("building_inspection_weathertightness_attached_flat", "Building inspection + weathertightness + attached flat", "Building inspection combinations"),
+        new EmailTemplateServiceType("building_inspection_weathertightness_property_file_review", "Building inspection + weathertightness + property file review", "Building inspection combinations"),
+        new EmailTemplateServiceType("weathertightness", "Weathertightness", "Add-on service"),
+        new EmailTemplateServiceType("garage_outbuilding", "Garage/outbuilding", "Add-on service"),
+        new EmailTemplateServiceType("attached_flat", "Attached flat", "Add-on service"),
+        new EmailTemplateServiceType("property_file_review", "Property file review", "Add-on service"),
+        new EmailTemplateServiceType("reinspection", "Reinspection", "Additional service / modifier"),
+        new EmailTemplateServiceType("asbestos_test", "Asbestos test", "Additional service / modifier"),
+        new EmailTemplateServiceType("moisture_check", "Moisture check", "Additional service / modifier"),
+        new EmailTemplateServiceType("thermal_imaging", "Thermal imaging", "Additional service / modifier"),
+        new EmailTemplateServiceType("pool_inspection", "Pool inspection", "Additional service / modifier"),
+        new EmailTemplateServiceType("custom_service", "Custom service", "Additional service / modifier"),
+        new EmailTemplateServiceType("other_service", "Other service", "Additional service / modifier")
+    };
+}
+
+static string GetEmailTemplateMakerHtml()
+{
+    return """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoMate Email Templates</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1d252c;
+      --muted: #64717d;
+      --line: #d8dee4;
+      --panel: #f6f7f8;
+      --accent: #c9662a;
+      --accent-dark: #a84f1c;
+      --ok: #1f7a4d;
+      --bad: #a4362d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Segoe UI, Arial, sans-serif;
+      color: var(--ink);
+      background: #fff;
+    }
+    header {
+      padding: 16px 20px 10px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 650;
+    }
+    .status {
+      min-height: 22px;
+      font-size: 13px;
+      color: var(--muted);
+      text-align: right;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 20px;
+      padding: 18px 20px 28px;
+    }
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 9px 10px;
+      font: inherit;
+      color: var(--ink);
+      background: #fff;
+    }
+    #htmlBody { display: none; }
+    .editor-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 4px 4px 0 0;
+      background: var(--panel);
+    }
+    .editor-tools button {
+      min-height: 30px;
+      padding: 4px 9px;
+      font-weight: 650;
+    }
+    .editor-frame {
+      width: 100%;
+      height: 560px;
+      border: 1px solid var(--line);
+      border-radius: 0 0 4px 4px;
+      background: #fff;
+    }
+    .subject-row {
+      display: grid;
+      grid-template-columns: 1fr 170px;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 9px 13px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      min-height: 38px;
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 650;
+    }
+    button.primary:hover { background: var(--accent-dark); }
+    button:disabled {
+      opacity: .48;
+      cursor: not-allowed;
+    }
+    aside {
+      border-left: 1px solid var(--line);
+      padding-left: 20px;
+    }
+    aside h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .placeholder-list {
+      display: grid;
+      gap: 7px;
+      max-height: calc(100vh - 148px);
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .placeholder-list button {
+      width: 100%;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 650;
+      padding: 7px 9px;
+      min-height: 30px;
+    }
+    .preview-wrap {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      min-height: 260px;
+    }
+    .preview-head {
+      padding: 9px 10px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .preview-wrap iframe {
+      width: 100%;
+      height: 260px;
+      border: 0;
+      background: #fff;
+    }
+    .send-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 12px;
+      align-items: end;
+      margin-top: 14px;
+    }
+    .good { color: var(--ok); }
+    .bad { color: var(--bad); }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      aside { border-left: 0; padding-left: 0; }
+      .field-grid { grid-template-columns: 1fr 1fr; }
+      .subject-row, .send-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AutoMate Email Templates</h1>
+    <div id="status" class="status">Ready</div>
+  </header>
+
+  <main>
+    <section>
+      <div class="field-grid">
+        <div>
+          <label for="emailTypeName">Email Type</label>
+          <input id="emailTypeName" value="Booking email" disabled>
+        </div>
+        <div>
+          <label for="serviceType">Service Type</label>
+          <select id="serviceType"></select>
+        </div>
+        <div>
+          <label for="templateName">Template Name</label>
+          <input id="templateName" value="Booking email">
+        </div>
+        <div>
+          <label for="active">Status</label>
+          <select id="active">
+            <option value="true">Active</option>
+            <option value="false">Inactive</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="subject-row">
+        <div>
+          <label for="subject">Subject</label>
+          <input id="subject" class="insert-target" value="Please Complete Your Inspection Booking">
+        </div>
+        <div>
+          <label for="signedInInspector">Inspector</label>
+          <input id="signedInInspector" value="Auto-filled from selected job" disabled>
+        </div>
+      </div>
+
+      <input id="inspectorId" type="hidden">
+
+      <label for="editor">Email Body</label>
+      <div class="editor-tools">
+        <button type="button" data-command="bold">B</button>
+        <button type="button" data-command="italic"><em>I</em></button>
+        <button type="button" data-command="underline"><u>U</u></button>
+        <button type="button" data-command="insertUnorderedList">List</button>
+        <button type="button" data-command="justifyLeft">Left</button>
+        <button type="button" data-command="justifyCenter">Center</button>
+        <button type="button" data-command="createLink">Link</button>
+        <button type="button" data-command="removeFormat">Clear</button>
+      </div>
+      <iframe id="editor" class="editor-frame" title="Email body editor"></iframe>
+      <textarea id="htmlBody"><!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Booking Confirmation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; background-color: #f5f5f5; margin: 0; padding: 0; }
+  .container { max-width: 900px; margin: 20px auto; padding: 5%; background-color: #ffffff; border: 1px solid #5c9ccf; border-radius: 4px; }
+  .header img { max-width: 50%; height: auto; display: block; margin: 0 auto 18px; }
+  h1 { text-align: center; font-weight: bold; margin: 10px 0 20px; }
+  p { line-height: 1.5; margin: 10px 0; }
+  ul { margin: 10px 0 10px 20px; padding-left: 20px; }
+  li { line-height: 1.5; margin: 10px 0; }
+  .footer { margin-top: 20px; font-size: 12px; color: #555555; line-height: 1.4; }
+  @media only screen and (max-width: 600px) {
+    .container { width: 90%; padding: 15px; }
+    .header img { max-width: 80%; }
+  }
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <img src="{{LOGO_URL}}" alt="{{COMPANY_NAME}}" style="width:50%; height:auto; display:block; margin:0 auto 18px;">
+    </div>
+
+    <h1>Letter of Engagement</h1>
+
+    <p>Hi {{CLIENT_FIRST_NAME}},</p>
+
+    <p>Thank you for choosing {{COMPANY_NAME}} to carry out your property inspection at {{ADDRESS}}.</p>
+
+    <p>As part of our compliance with New Zealand Property Inspection Standard NZS 4306:2005, we must supply you with a letter of engagement containing the following information:</p>
+
+    <ul>
+      <li><strong>Inspector:</strong> Your scheduled Inspector is {{INSPECTOR_NAME}}. Please note this may be subject to change at the discretion of {{COMPANY_NAME}}.</li>
+      <li><strong>Date &amp; Time:</strong> The inspection has been scheduled for {{INSPECTION_TIME}} on {{INSPECTION_DATE}}.</li>
+      <li><strong>Scope:</strong> The scope of the report is limited to the inspection services listed for this booking and any agreed inclusions or exclusions.</li>
+      <li><strong>Services:</strong><br>{{SERVICES}}</li>
+      <li><strong>Additional Services / Add-ons:</strong><br>{{ADDITIONAL_SERVICES}}</li>
+      <li><strong>Terms:</strong> The relevant terms and conditions have been sent with this booking email and must be accepted where required to confirm your booking.</li>
+    </ul>
+
+    <p>{{INSPECTION_LINK}}</p>
+
+    <p>We look forward to providing this service for you.</p>
+
+    <p>Best Regards,<br>{{COMPANY_NAME}}</p>
+
+    <div class="footer">
+      <p>IMPORTANT: The contents of this email and any attachments are confidential. They are intended for the named recipient(s) only. If you have received this email by mistake, please notify the sender immediately and do not disclose the contents to anyone or make copies thereof.</p>
+      <p>Warning: Although taking reasonable precautions to ensure no viruses or malicious software are present in this email, the sender cannot accept responsibility for any loss or damage arising from the use of this email or attachments.</p>
+    </div>
+  </div>
+</body>
+</html></textarea>
+
+      <div class="toolbar">
+        <button id="loadBtn">Load Saved</button>
+        <button id="saveBtn" class="primary">Save Template</button>
+        <button id="previewBtn">Preview With Job</button>
+        <button id="jobInspectorBtn">Use Job Inspector</button>
+      </div>
+
+      <div class="send-grid">
+        <div>
+          <label for="jobId">Preview / Send Job ID</label>
+          <input id="jobId" autocomplete="off">
+        </div>
+        <div>
+          <label for="toEmail">Send To Override</label>
+          <input id="toEmail" autocomplete="off" placeholder="Optional">
+        </div>
+        <button id="sendTestBtn">Send Test Email</button>
+        <button id="sendBtn" class="primary">Send</button>
+      </div>
+
+      <div class="preview-wrap">
+        <div id="previewSubject" class="preview-head">Preview subject will appear here</div>
+        <iframe id="preview"></iframe>
+      </div>
+    </section>
+
+    <aside>
+      <h2>Insert Placeholders</h2>
+      <div id="placeholders" class="placeholder-list"></div>
+    </aside>
+  </main>
+
+  <script>
+    const state = { lastTarget: null, placeholders: [], editorReady: false };
+    const DEFAULT_TEST_INSPECTOR_ID = "dea3f71c-b8ca-4cbb-bbe3-3de48d380ec5";
+    const $ = id => document.getElementById(id);
+
+    function setStatus(message, kind) {
+      const el = $("status");
+      el.textContent = message;
+      el.className = "status " + (kind || "");
+    }
+
+    function updateJobActionState() {
+      const hasJob = $("jobId").value.trim() !== "";
+      $("previewBtn").disabled = !hasJob;
+      $("sendBtn").disabled = !hasJob;
+      $("jobInspectorBtn").disabled = !hasJob;
+    }
+
+    function getInspectorIdForTest() {
+      const fromHidden = $("inspectorId").value.trim();
+      if (fromHidden) return fromHidden;
+      const fromUrl = new URLSearchParams(window.location.search).get("inspectorId");
+      if (fromUrl) return fromUrl.trim();
+      return DEFAULT_TEST_INSPECTOR_ID;
+    }
+
+    function friendlyError(message) {
+      const text = message || "";
+      if (text.includes("28P01") || text.toLowerCase().includes("password authentication failed")) {
+        return "Local database connection needs refreshing before job preview/save can run.";
+      }
+      if (text.toLowerCase().includes("failed to fetch")) {
+        return "API is unavailable. Check that AutoMate API is running.";
+      }
+      return text.split("\n")[0].split("\r")[0] || "Something went wrong.";
+    }
+
+    function templateUrl() {
+      const inspectorId = $("inspectorId").value.trim();
+      const type = "booking-email";
+      const serviceTypeKey = $("serviceType").value || "general_booking";
+      if (!inspectorId) throw new Error("Inspector ID is required.");
+      return `/inspectors/${encodeURIComponent(inspectorId)}/email-templates/${encodeURIComponent(type)}?serviceTypeKey=${encodeURIComponent(serviceTypeKey)}`;
+    }
+
+    function bodyPayload() {
+      return {
+        emailType: "transactional",
+        serviceTypeKey: $("serviceType").value || "general_booking",
+        name: $("templateName").value.trim(),
+        subject: $("subject").value,
+        htmlBody: getEditorHtml(),
+        isActive: $("active").value === "true"
+      };
+    }
+
+    function editorDocument() {
+      return $("editor").contentDocument || $("editor").contentWindow.document;
+    }
+
+    function setEditorHtml(html) {
+      const value = html || $("htmlBody").value || "";
+      $("htmlBody").value = value;
+      state.editorReady = false;
+      $("editor").srcdoc = value;
+    }
+
+    function prepareEditor() {
+      const doc = editorDocument();
+      if (!doc || !doc.body) return;
+      doc.designMode = "on";
+      doc.body.contentEditable = "true";
+      doc.body.addEventListener("focus", () => state.lastTarget = $("editor"));
+      doc.body.addEventListener("click", () => state.lastTarget = $("editor"));
+      doc.body.addEventListener("keyup", () => state.lastTarget = $("editor"));
+      state.editorReady = true;
+    }
+
+    function getEditorHtml() {
+      try {
+        const doc = editorDocument();
+        if (doc && doc.documentElement) {
+          const html = "<!DOCTYPE html>\n" + doc.documentElement.outerHTML;
+          $("htmlBody").value = html;
+          return html;
+        }
+      } catch {}
+      return $("htmlBody").value;
+    }
+
+    function renderDraftForTest(value) {
+      const sampleFields = {
+        CLIENT_FIRST_NAME: "Test Client",
+        CLIENT_NAME: "Test Client",
+        ADDRESS: "123 Test Street, Papamoa",
+        PROPERTY_ADDRESS: "123 Test Street, Papamoa",
+        INSPECTION_TIME: "10:00 AM",
+        INSPECTION_DATE: "14 Jun 2026",
+        INSPECTION_END_TIME: "11:30 AM",
+        SERVICES: "Building inspection",
+        PRIMARY_SERVICE: "Building inspection",
+        ADDITIONAL_SERVICES: "Weathertightness Report",
+        INSPECTION_LINK: "",
+        REPORT_LINK: "",
+        INVOICE_LINK: "",
+        TERMS_REQUIRED: "Yes",
+        BOOKING_TEMPLATE_KEY: "building_inspection"
+      };
+
+      return (value || "").replace(/\{\{\s*([A-Z0-9_]+)\s*\}\}/gi, (match, key) => {
+        const upper = key.toUpperCase();
+        return Object.prototype.hasOwnProperty.call(sampleFields, upper) ? sampleFields[upper] : match;
+      });
+    }
+
+    function runEditorCommand(command) {
+      const doc = editorDocument();
+      if (!doc) return;
+      let value = null;
+      if (command === "createLink") {
+        value = window.prompt("Link URL");
+        if (!value) return;
+      }
+      doc.execCommand(command, false, value);
+      $("editor").contentWindow.focus();
+      getEditorHtml();
+    }
+
+    function labelFromKey(value) {
+      return (value || "")
+        .split("_")
+        .filter(Boolean)
+        .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+    }
+
+    function ensureServiceTypeOption(value) {
+      if (!value) return;
+      const select = $("serviceType");
+      if ([...select.options].some(option => option.value === value)) return;
+
+      let group = [...select.children].find(child => child.tagName === "OPTGROUP" && child.label === "Job-specific templates");
+      if (!group) {
+        group = document.createElement("optgroup");
+        group.label = "Job-specific templates";
+        select.appendChild(group);
+      }
+
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = labelFromKey(value);
+      group.appendChild(option);
+    }
+
+    async function api(url, options) {
+      const response = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+        ...options
+      });
+      const text = await response.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (!response.ok) {
+        const detail = data && (data.detail || data.message || data.title) ? (data.detail || data.message || data.title) : text;
+        throw new Error(detail || `Request failed: ${response.status}`);
+      }
+      return data;
+    }
+
+    function insertToken(token) {
+      if (state.lastTarget === $("subject")) {
+        const target = $("subject");
+        const start = target.selectionStart ?? target.value.length;
+        const end = target.selectionEnd ?? target.value.length;
+        target.value = target.value.slice(0, start) + token + target.value.slice(end);
+        target.focus();
+        target.selectionStart = target.selectionEnd = start + token.length;
+        return;
+      }
+
+      const doc = editorDocument();
+      if (doc && state.editorReady) {
+        $("editor").contentWindow.focus();
+        doc.execCommand("insertText", false, token);
+        getEditorHtml();
+        return;
+      }
+
+      const target = $("htmlBody");
+      const start = target.selectionStart ?? target.value.length;
+      const end = target.selectionEnd ?? target.value.length;
+      target.value = target.value.slice(0, start) + token + target.value.slice(end);
+      setEditorHtml(target.value);
+    }
+
+    async function loadPlaceholders() {
+      const data = await api("/email-templates/placeholders");
+      state.placeholders = data.placeholders || [];
+      $("placeholders").innerHTML = "";
+      for (const group of data.categories || []) {
+        const heading = document.createElement("h2");
+        heading.textContent = group.category;
+        $("placeholders").appendChild(heading);
+
+        for (const placeholder of group.placeholders || []) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = "+ " + placeholder.label.toUpperCase();
+          btn.title = placeholder.token;
+          btn.addEventListener("click", () => insertToken(placeholder.token));
+          $("placeholders").appendChild(btn);
+        }
+      }
+    }
+
+    async function loadServiceTypes() {
+      const data = await api("/email-templates/service-types");
+      $("serviceType").innerHTML = "";
+      let currentGroup = "";
+      let groupElement = null;
+
+      for (const item of data.serviceTypes || []) {
+        if (item.group !== currentGroup) {
+          currentGroup = item.group;
+          groupElement = document.createElement("optgroup");
+          groupElement.label = currentGroup;
+          $("serviceType").appendChild(groupElement);
+        }
+
+        const option = document.createElement("option");
+        option.value = item.key;
+        option.textContent = item.label;
+        groupElement.appendChild(option);
+      }
+    }
+
+    async function loadTemplate() {
+      await resolveInspectorFromJob(false);
+      setStatus("Loading...");
+      const data = await api(templateUrl());
+      const t = data.template;
+      const serviceTypeKey = t.serviceTypeKey || t.service_type_key;
+      if (serviceTypeKey) {
+        ensureServiceTypeOption(serviceTypeKey);
+        $("serviceType").value = serviceTypeKey;
+      }
+      $("templateName").value = t.name || "";
+      $("subject").value = t.subject || "";
+      setEditorHtml(t.htmlBody || t.html_body || "");
+      $("active").value = String(t.isActive ?? t.is_active ?? true);
+      setStatus("Template loaded.", "good");
+    }
+
+    async function saveTemplate() {
+      await resolveInspectorFromJob(false);
+      setStatus("Saving...");
+      const data = await api(templateUrl(), {
+        method: "PUT",
+        body: JSON.stringify(bodyPayload())
+      });
+      setStatus("Template saved.", data.success ? "good" : "");
+    }
+
+    async function previewTemplate() {
+      const jobId = $("jobId").value.trim();
+      if (!jobId) throw new Error("No test job is loaded yet. Refresh the local database connection or paste a Job ID.");
+      await resolveInspectorFromJob(false);
+      setStatus("Rendering preview...");
+      const data = await api(`/jobs/${encodeURIComponent(jobId)}/email-templates/booking-email/preview`, {
+        method: "POST",
+        body: JSON.stringify({
+          emailType: "transactional",
+          serviceTypeKey: $("serviceType").value || null,
+          subject: $("subject").value,
+          htmlBody: getEditorHtml()
+        })
+      });
+      $("previewSubject").textContent = data.subject || "";
+      $("preview").srcdoc = data.htmlBody || "";
+      setStatus("Preview rendered.", "good");
+    }
+
+    async function sendTemplate() {
+      const jobId = $("jobId").value.trim();
+      if (!jobId) throw new Error("No test job is loaded yet. Refresh the local database connection or paste a Job ID.");
+      await resolveInspectorFromJob(false);
+      setStatus("Sending...");
+      const data = await api(`/jobs/${encodeURIComponent(jobId)}/email-templates/booking-email/send`, {
+        method: "POST",
+        body: JSON.stringify({
+          toEmail: $("toEmail").value.trim() || null,
+          serviceTypeKey: $("serviceType").value || null,
+          markWorkflowComplete: true
+        })
+      });
+      setStatus(data.message || "Sent.", "good");
+    }
+
+    async function sendTestEmail() {
+      const toEmail = $("toEmail").value.trim();
+      if (!toEmail) throw new Error("Enter your email address in Send To Override first.");
+
+      setStatus("Sending test email...");
+      const isLocal = location.hostname === "127.0.0.1" || location.hostname === "localhost";
+      const sendUrl = isLocal
+        ? "https://automate-api-production.up.railway.app/integrations/microsoft/send-test-email"
+        : "/integrations/microsoft/send-test-email";
+      const data = await api(sendUrl, {
+        method: "POST",
+        body: JSON.stringify({
+          inspectorId: getInspectorIdForTest(),
+          toEmail,
+          subject: "[TEST] " + ($("subject").value || "Booking email"),
+          body: renderDraftForTest(getEditorHtml())
+        })
+      });
+      setStatus(data.message || "Test email sent.", data.success ? "good" : "");
+    }
+
+    async function resolveInspectorFromJob(showSuccess) {
+      const jobId = $("jobId").value.trim();
+      if (!jobId) {
+        if (!$("inspectorId").value.trim()) throw new Error("Inspector ID or Job ID is required.");
+        return null;
+      }
+
+      const data = await api(`/jobs/${encodeURIComponent(jobId)}/email-template-context`);
+      if (data.inspectorId) $("inspectorId").value = data.inspectorId;
+      $("signedInInspector").value = data.inspectorName || data.inspectorId || "Selected job inspector";
+      if (data.clientEmail && !$("toEmail").value.trim()) $("toEmail").value = data.clientEmail;
+      if (data.fields && data.fields.BOOKING_TEMPLATE_KEY && data.fields.BOOKING_TEMPLATE_KEY !== "" && $("serviceType").value === "general_booking") {
+        ensureServiceTypeOption(data.fields.BOOKING_TEMPLATE_KEY);
+        $("serviceType").value = data.fields.BOOKING_TEMPLATE_KEY;
+      }
+      if (showSuccess) setStatus(`Using inspector ${data.inspectorName || data.inspectorId}`, "good");
+      return data;
+    }
+
+    async function loadTopJobForTesting() {
+      try {
+        const jobs = await api("/jobs/latest");
+        const first = Array.isArray(jobs) ? jobs[0] : null;
+        const jobId = first && (first.job_id || first.jobId || first.JobId);
+        if (!jobId) return;
+        $("jobId").value = jobId;
+        updateJobActionState();
+        await resolveInspectorFromJob(false);
+        setStatus("Loaded top job for testing.", "good");
+      } catch (err) {
+        setStatus("Test email mode ready. Job preview needs a working database connection.", "");
+        updateJobActionState();
+      }
+    }
+
+    for (const el of document.querySelectorAll(".insert-target")) {
+      el.addEventListener("focus", () => state.lastTarget = el);
+      el.addEventListener("click", () => state.lastTarget = el);
+      el.addEventListener("keyup", () => state.lastTarget = el);
+    }
+
+    $("editor").addEventListener("load", prepareEditor);
+    setEditorHtml($("htmlBody").value);
+    $("jobId").addEventListener("input", updateJobActionState);
+    updateJobActionState();
+
+    for (const btn of document.querySelectorAll(".editor-tools button")) {
+      btn.addEventListener("click", () => runEditorCommand(btn.dataset.command));
+    }
+
+    $("loadBtn").addEventListener("click", () => loadTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("saveBtn").addEventListener("click", () => saveTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("previewBtn").addEventListener("click", () => previewTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("sendTestBtn").addEventListener("click", () => sendTestEmail().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("sendBtn").addEventListener("click", () => sendTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("jobInspectorBtn").addEventListener("click", () => resolveInspectorFromJob(true).catch(err => setStatus(friendlyError(err.message), "bad")));
+
+    Promise.all([loadServiceTypes(), loadPlaceholders()])
+      .then(() => loadTopJobForTesting())
+      .catch(err => setStatus(friendlyError(err.message), "bad"));
+  </script>
+</body>
+</html>
+""";
+}
+
 static DateTime? ParseNullableDateTime(string? value)
 {
     if (string.IsNullOrWhiteSpace(value))
@@ -5556,6 +6527,8 @@ public class SendTestEmailRequest
     public string Body { get; set; } = "";
 }
 
+public record EmailTemplateServiceType(string Key, string Label, string Group);
+
 public class XeroTestConnectionRequest
 {
     public string InspectorId { get; set; } = "";
@@ -5720,3 +6693,4 @@ public class MetaSection
     public string ConnectorVersion { get; set; } = "";
     public string SourceInstance { get; set; } = "";
 }
+
