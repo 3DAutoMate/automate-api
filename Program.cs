@@ -3135,6 +3135,7 @@ app.MapPost("/jobs/{jobId}/hard-reset", async (Guid jobId) =>
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
+        await EnsureWorkflowActionsTableForHardResetAsync(conn);
 
         await using var tx = await conn.BeginTransactionAsync();
 
@@ -3227,10 +3228,15 @@ SET
 WHERE job_id = @job_id;";
 
         int actionRows;
-        await using (var resetActionsCmd = new NpgsqlCommand(resetActionsSql, conn, tx))
+        try
         {
+            await using var resetActionsCmd = new NpgsqlCommand(resetActionsSql, conn, tx);
             resetActionsCmd.Parameters.AddWithValue("job_id", jobId);
             actionRows = await resetActionsCmd.ExecuteNonQueryAsync();
+        }
+        catch (PostgresException pgEx) when (pgEx.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            actionRows = 0;
         }
 
         await tx.CommitAsync();
@@ -4653,6 +4659,41 @@ CREATE TABLE IF NOT EXISTS public.job_workflow_actions
     created_at timestamptz NOT NULL DEFAULT NOW(),
     updated_at timestamptz NOT NULL DEFAULT NOW(),
     PRIMARY KEY (job_id, action_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_workflow_actions_pending
+ON public.job_workflow_actions(status, retry_requested, action_type);
+
+CREATE INDEX IF NOT EXISTS idx_job_workflow_actions_job
+ON public.job_workflow_actions(job_id);";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task EnsureWorkflowActionsTableForHardResetAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.job_workflow_actions
+(
+    job_workflow_action_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    inspector_id uuid NOT NULL,
+    action_key text NOT NULL,
+    action_type text NOT NULL,
+    service_key text NOT NULL,
+    service_label text NOT NULL,
+    service_slot text NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    retry_requested boolean NOT NULL DEFAULT false,
+    retry_requested_at timestamptz NULL,
+    sent_at timestamptz NULL,
+    last_attempt_at timestamptz NULL,
+    last_error text NULL,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_job_workflow_actions_job_action UNIQUE (job_id, action_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_job_workflow_actions_pending
