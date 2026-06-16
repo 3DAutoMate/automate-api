@@ -1268,7 +1268,7 @@ app.MapGet("/integrations/xero/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "offline_access accounting.settings.read";
+    var scopes = "offline_access accounting.settings.read accounting.contacts accounting.invoices";
 
     var url =
         "https://login.xero.com/identity/connect/authorize" +
@@ -1640,6 +1640,173 @@ app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionReque
             detail: ex.ToString(),
             statusCode: 500
         );
+    }
+});
+
+// =============================
+// XERO CREATE DRAFT INVOICE
+// =============================
+app.MapPost("/integrations/xero/jobs/{jobId}/create-draft-invoice", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureJobInvoiceLinesTableAsync(conn);
+
+        var job = await LoadXeroInvoiceJobAsync(conn, jobId);
+        if (job == null)
+        {
+            return Results.NotFound(new
+            {
+                success = false,
+                message = "Job was not found in Railway. Sync the selected job first."
+            });
+        }
+
+        if (!string.IsNullOrWhiteSpace(job.XeroInvoiceId))
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                message = "Xero draft invoice already exists for this job.",
+                invoiceId = job.XeroInvoiceId,
+                invoiceNumber = job.XeroInvoiceNumber,
+                invoiceStatus = job.XeroInvoiceStatus,
+                contactId = job.XeroContactId,
+                duplicatePrevented = true
+            });
+        }
+
+        var account = await GetXeroAccountAsync(conn, job.InspectorId, builder.Configuration);
+        if (!account.Success)
+        {
+            await StoreXeroJobErrorAsync(conn, jobId, account.ErrorMessage ?? "Xero is not connected.");
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = account.ErrorMessage
+            });
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+        httpClient.DefaultRequestHeaders.Add("xero-tenant-id", account.TenantId);
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        var contactId = job.XeroContactId;
+        if (string.IsNullOrWhiteSpace(contactId))
+        {
+            contactId = await FindXeroContactIdByEmailAsync(httpClient, job.ContactEmail);
+        }
+
+        if (string.IsNullOrWhiteSpace(contactId))
+        {
+            contactId = await CreateXeroContactAsync(httpClient, job.ContactName, job.ContactEmail, job.ContactPhone);
+        }
+
+        if (string.IsNullOrWhiteSpace(contactId))
+            throw new InvalidOperationException("Xero did not return a contact ID.");
+
+        var invoiceLines = await LoadXeroInvoiceLinesAsync(conn, jobId);
+        if (invoiceLines.Count == 0)
+        {
+            invoiceLines.Add(new XeroInvoiceLineInput(
+                BuildFallbackInvoiceDescription(job.PrimaryService, job.SiteAddress),
+                1m,
+                job.JobTotal ?? 0m,
+                1));
+        }
+
+        if (invoiceLines.All(line => line.UnitAmount == 0m))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "No invoice amount was found. Check the THREED invoice total/lines and sync the job again."
+            });
+        }
+
+        var invoicePayload = new
+        {
+            Invoices = new[]
+            {
+                new
+                {
+                    Type = "ACCREC",
+                    Contact = new { ContactID = contactId },
+                    DateString = DateTime.UtcNow.ToString("yyyy-MM-dd"),
+                    DueDateString = (job.JobDate ?? DateTime.UtcNow).ToString("yyyy-MM-dd"),
+                    Reference = string.IsNullOrWhiteSpace(job.SiteAddress) ? job.JobName : job.SiteAddress,
+                    Status = "DRAFT",
+                    SentToContact = false,
+                    LineItems = invoiceLines.Select(line => new
+                    {
+                        Description = line.Description,
+                        Quantity = line.Quantity <= 0m ? 1m : line.Quantity,
+                        UnitAmount = line.UnitAmount
+                    }).ToArray()
+                }
+            }
+        };
+
+        var invoiceResponse = await httpClient.PostAsJsonAsync(
+            "https://api.xero.com/api.xro/2.0/Invoices",
+            invoicePayload);
+        var invoiceJson = await invoiceResponse.Content.ReadAsStringAsync();
+
+        if (!invoiceResponse.IsSuccessStatusCode)
+        {
+            await StoreXeroJobErrorAsync(conn, jobId, invoiceJson);
+            return Results.Problem(
+                title: "Xero draft invoice creation failed",
+                detail: invoiceJson,
+                statusCode: 500);
+        }
+
+        var invoiceDoc = JsonDocument.Parse(invoiceJson).RootElement;
+        var invoice = invoiceDoc.TryGetProperty("Invoices", out var invoicesProp) &&
+                      invoicesProp.ValueKind == JsonValueKind.Array &&
+                      invoicesProp.GetArrayLength() > 0
+            ? invoicesProp[0]
+            : invoiceDoc;
+
+        var invoiceId = GetJsonString(invoice, "InvoiceID");
+        var invoiceNumber = GetJsonString(invoice, "InvoiceNumber");
+        var invoiceStatus = GetJsonString(invoice, "Status");
+
+        await StoreXeroInvoiceResultAsync(conn, jobId, contactId, invoiceId, invoiceNumber, invoiceStatus);
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Xero draft invoice created.",
+            contactId,
+            invoiceId,
+            invoiceNumber,
+            invoiceStatus,
+            sentToContact = false
+        });
+    }
+    catch (Exception ex)
+    {
+        try
+        {
+            await using var errConn = new NpgsqlConnection(connectionString);
+            await errConn.OpenAsync();
+            await EnsureJobPaymentColumnsAsync(errConn);
+            await StoreXeroJobErrorAsync(errConn, jobId, ex.Message);
+        }
+        catch
+        {
+        }
+
+        return Results.Problem(
+            title: "Create Xero draft invoice failed",
+            detail: ex.ToString(),
+            statusCode: 500);
     }
 });
 
@@ -3903,6 +4070,7 @@ DO UPDATE SET
         }
 
         await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
+        await RefreshJobInvoiceLinesAsync(conn, payload, jobId);
 
         return Results.Ok(new
         {
@@ -4364,6 +4532,226 @@ WHERE inspector_id = @inspector_id
     await updateCmd.ExecuteNonQueryAsync();
 
     return XeroAccountResult.Ok(accessToken, refreshToken, tenantId, tenantName);
+}
+
+static async Task<XeroInvoiceJobInput?> LoadXeroInvoiceJobAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string sql = @"
+SELECT
+    job_id,
+    inspector_id,
+    job_name,
+    site_address,
+    job_date,
+    job_total,
+    primary_service,
+    contact1_first_name,
+    contact1_last_name,
+    contact1_email,
+    contact1_cellular,
+    xero_contact_id,
+    xero_invoice_id,
+    xero_invoice_number,
+    xero_invoice_status
+FROM public.jobs_staging
+WHERE job_id = @job_id
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+        return null;
+
+    var contactName = BuildPersonName(
+        reader["contact1_first_name"]?.ToString(),
+        reader["contact1_last_name"]?.ToString());
+    var contactEmail = reader["contact1_email"]?.ToString() ?? "";
+    if (string.IsNullOrWhiteSpace(contactName))
+        contactName = string.IsNullOrWhiteSpace(contactEmail) ? "3D AutoMate Client" : contactEmail;
+
+    return new XeroInvoiceJobInput(
+        jobId,
+        (Guid)reader["inspector_id"],
+        reader["job_name"]?.ToString() ?? "",
+        reader["site_address"]?.ToString() ?? "",
+        reader["job_date"] == DBNull.Value ? null : Convert.ToDateTime(reader["job_date"]),
+        reader["job_total"] == DBNull.Value ? null : Convert.ToDecimal(reader["job_total"]),
+        reader["primary_service"]?.ToString() ?? "",
+        contactName,
+        contactEmail,
+        reader["contact1_cellular"]?.ToString() ?? "",
+        reader["xero_contact_id"]?.ToString() ?? "",
+        reader["xero_invoice_id"]?.ToString() ?? "",
+        reader["xero_invoice_number"]?.ToString() ?? "",
+        reader["xero_invoice_status"]?.ToString() ?? "");
+}
+
+static async Task<List<XeroInvoiceLineInput>> LoadXeroInvoiceLinesAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string sql = @"
+SELECT
+    line_index,
+    description,
+    quantity,
+    unit_price
+FROM public.job_invoice_lines
+WHERE job_id = @job_id
+ORDER BY line_index;";
+
+    var lines = new List<XeroInvoiceLineInput>();
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        var description = reader["description"]?.ToString() ?? "";
+        if (string.IsNullOrWhiteSpace(description))
+            description = "Inspection service";
+
+        lines.Add(new XeroInvoiceLineInput(
+            description,
+            reader["quantity"] == DBNull.Value ? 1m : Convert.ToDecimal(reader["quantity"]),
+            reader["unit_price"] == DBNull.Value ? 0m : Convert.ToDecimal(reader["unit_price"]),
+            reader["line_index"] == DBNull.Value ? 0 : Convert.ToInt32(reader["line_index"])));
+    }
+
+    return lines;
+}
+
+static async Task<string> FindXeroContactIdByEmailAsync(HttpClient httpClient, string email)
+{
+    if (string.IsNullOrWhiteSpace(email))
+        return "";
+
+    var where = Uri.EscapeDataString($"EmailAddress==\"{email.Trim()}\"");
+    var response = await httpClient.GetAsync($"https://api.xero.com/api.xro/2.0/Contacts?where={where}");
+    var body = await response.Content.ReadAsStringAsync();
+
+    if (!response.IsSuccessStatusCode)
+        return "";
+
+    var doc = JsonDocument.Parse(body).RootElement;
+    if (!doc.TryGetProperty("Contacts", out var contacts) ||
+        contacts.ValueKind != JsonValueKind.Array ||
+        contacts.GetArrayLength() == 0)
+    {
+        return "";
+    }
+
+    return GetJsonString(contacts[0], "ContactID");
+}
+
+static async Task<string> CreateXeroContactAsync(HttpClient httpClient, string name, string email, string phone)
+{
+    if (string.IsNullOrWhiteSpace(name) && string.IsNullOrWhiteSpace(email))
+        throw new InvalidOperationException("Client contact name or email is required before creating a Xero contact.");
+
+    var contact = new Dictionary<string, object?>
+    {
+        ["Name"] = string.IsNullOrWhiteSpace(name) ? email.Trim() : name.Trim()
+    };
+
+    if (!string.IsNullOrWhiteSpace(email))
+        contact["EmailAddress"] = email.Trim();
+
+    if (!string.IsNullOrWhiteSpace(phone))
+    {
+        contact["Phones"] = new[]
+        {
+            new
+            {
+                PhoneType = "MOBILE",
+                PhoneNumber = phone.Trim()
+            }
+        };
+    }
+
+    var response = await httpClient.PostAsJsonAsync(
+        "https://api.xero.com/api.xro/2.0/Contacts",
+        new { Contacts = new[] { contact } });
+    var body = await response.Content.ReadAsStringAsync();
+
+    if (!response.IsSuccessStatusCode)
+        throw new InvalidOperationException("Xero contact creation failed: " + body);
+
+    var doc = JsonDocument.Parse(body).RootElement;
+    if (!doc.TryGetProperty("Contacts", out var contacts) ||
+        contacts.ValueKind != JsonValueKind.Array ||
+        contacts.GetArrayLength() == 0)
+    {
+        return "";
+    }
+
+    return GetJsonString(contacts[0], "ContactID");
+}
+
+static async Task StoreXeroInvoiceResultAsync(
+    NpgsqlConnection conn,
+    Guid jobId,
+    string contactId,
+    string invoiceId,
+    string invoiceNumber,
+    string invoiceStatus)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    xero_contact_id = @xero_contact_id,
+    xero_invoice_id = @xero_invoice_id,
+    xero_invoice_number = @xero_invoice_number,
+    xero_invoice_status = @xero_invoice_status,
+    xero_invoice_created_at = NOW(),
+    xero_last_error = NULL,
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("xero_contact_id", contactId);
+    cmd.Parameters.AddWithValue("xero_invoice_id", invoiceId);
+    cmd.Parameters.AddWithValue("xero_invoice_number", invoiceNumber);
+    cmd.Parameters.AddWithValue("xero_invoice_status", invoiceStatus);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task StoreXeroJobErrorAsync(NpgsqlConnection conn, Guid jobId, string error)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    xero_last_error = @xero_last_error,
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("xero_last_error", string.IsNullOrWhiteSpace(error) ? "Unknown Xero error" : error);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static string GetJsonString(JsonElement element, string propertyName)
+{
+    return element.TryGetProperty(propertyName, out var value) && value.ValueKind != JsonValueKind.Null
+        ? value.ToString()
+        : "";
+}
+
+static string BuildPersonName(string? firstName, string? lastName)
+{
+    return string.Join(" ", new[] { firstName, lastName }
+        .Where(part => !string.IsNullOrWhiteSpace(part))
+        .Select(part => part!.Trim()));
+}
+
+static string BuildFallbackInvoiceDescription(string? primaryService, string? siteAddress)
+{
+    var service = string.IsNullOrWhiteSpace(primaryService) ? "Inspection service" : primaryService.Trim();
+    return string.IsNullOrWhiteSpace(siteAddress)
+        ? service
+        : service + " - " + siteAddress.Trim();
 }
 
 static async Task EnsureMappingTablesAsync(NpgsqlConnection conn)
@@ -4894,10 +5282,106 @@ ADD COLUMN IF NOT EXISTS access_by text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS hhs_compliance text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS xero_contact_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS xero_invoice_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS xero_invoice_number text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS xero_invoice_status text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS xero_invoice_created_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS xero_last_error text NULL;
 ";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task EnsureJobInvoiceLinesTableAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.job_invoice_lines
+(
+    job_id uuid NOT NULL,
+    line_index integer NOT NULL,
+    description text NULL,
+    quantity decimal(10,2) NOT NULL DEFAULT 1,
+    unit_price decimal(10,2) NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (job_id, line_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_invoice_lines_job_id
+ON public.job_invoice_lines(job_id);";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task RefreshJobInvoiceLinesAsync(NpgsqlConnection conn, JobUploadRequest payload, Guid jobId)
+{
+    await EnsureJobInvoiceLinesTableAsync(conn);
+
+    await using (var deleteCmd = new NpgsqlCommand("DELETE FROM public.job_invoice_lines WHERE job_id = @job_id;", conn))
+    {
+        deleteCmd.Parameters.AddWithValue("job_id", jobId);
+        await deleteCmd.ExecuteNonQueryAsync();
+    }
+
+    if (payload.InvoiceLines == null || payload.InvoiceLines.Count == 0)
+        return;
+
+    const string insertSql = @"
+INSERT INTO public.job_invoice_lines
+(
+    job_id,
+    line_index,
+    description,
+    quantity,
+    unit_price,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @job_id,
+    @line_index,
+    @description,
+    @quantity,
+    @unit_price,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (job_id, line_index)
+DO UPDATE SET
+    description = EXCLUDED.description,
+    quantity = EXCLUDED.quantity,
+    unit_price = EXCLUDED.unit_price,
+    updated_at = NOW();";
+
+    foreach (var line in payload.InvoiceLines.OrderBy(line => line.LineIndex))
+    {
+        var lineIndex = line.LineIndex <= 0 ? payload.InvoiceLines.IndexOf(line) + 1 : line.LineIndex;
+        var quantity = line.Quantity <= 0m ? 1m : line.Quantity;
+
+        await using var cmd = new NpgsqlCommand(insertSql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        cmd.Parameters.AddWithValue("line_index", lineIndex);
+        cmd.Parameters.AddWithValue("description", line.Description ?? "");
+        cmd.Parameters.AddWithValue("quantity", quantity);
+        cmd.Parameters.AddWithValue("unit_price", line.UnitPrice);
+        await cmd.ExecuteNonQueryAsync();
+    }
 }
 
 static string CleanEditorHtml(string? html)
@@ -5075,6 +5559,28 @@ public record XeroAccountResult(
     }
 }
 
+public record XeroInvoiceJobInput(
+    Guid JobId,
+    Guid InspectorId,
+    string JobName,
+    string SiteAddress,
+    DateTime? JobDate,
+    decimal? JobTotal,
+    string PrimaryService,
+    string ContactName,
+    string ContactEmail,
+    string ContactPhone,
+    string XeroContactId,
+    string XeroInvoiceId,
+    string XeroInvoiceNumber,
+    string XeroInvoiceStatus);
+
+public record XeroInvoiceLineInput(
+    string Description,
+    decimal Quantity,
+    decimal UnitAmount,
+    int LineIndex);
+
 public class JobUploadRequest
 {
     public string SourceSystem { get; set; } = "";
@@ -5082,6 +5588,7 @@ public class JobUploadRequest
     public JobSection Job { get; set; } = new JobSection();
     public ServicesSection Services { get; set; } = new ServicesSection();
     public JobDetailsSection JobDetails { get; set; } = new JobDetailsSection();
+    public List<InvoiceLineSection> InvoiceLines { get; set; } = new();
     public ContactFlat Contact1 { get; set; } = new ContactFlat();
     public ContactFlat Contact2 { get; set; } = new ContactFlat();
     public MetaSection Meta { get; set; } = new MetaSection();
@@ -5176,6 +5683,14 @@ public class ContactFlat
     public string LastName { get; set; } = "";
     public string Email { get; set; } = "";
     public string Cellular { get; set; } = "";
+}
+
+public class InvoiceLineSection
+{
+    public int LineIndex { get; set; }
+    public string Description { get; set; } = "";
+    public decimal Quantity { get; set; } = 1m;
+    public decimal UnitPrice { get; set; }
 }
 
 public class MetaSection
