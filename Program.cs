@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Text;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -216,6 +217,30 @@ ADD COLUMN IF NOT EXISTS terms_last_attempt_at timestamptz NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS terms_last_error text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_signed boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_signed_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_document_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_invite_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_template_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_document_status text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_last_checked_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_signing_link text NULL;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS invoice_sent boolean NOT NULL DEFAULT false;
@@ -1825,6 +1850,510 @@ LIMIT 1;";
 });
 
 // =============================
+// SIGNNOW CONNECT URL
+// =============================
+app.MapGet("/integrations/signnow/connect-url", () =>
+{
+    var clientId = builder.Configuration["SIGNNOW_CLIENT_ID"];
+    var redirectUri = builder.Configuration["SIGNNOW_REDIRECT_URI"];
+
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(redirectUri))
+    {
+        return Results.Problem(
+            title: "SignNow config missing",
+            detail: "SIGNNOW_CLIENT_ID and/or SIGNNOW_REDIRECT_URI are missing from Railway variables.",
+            statusCode: 500
+        );
+    }
+
+    var url =
+        "https://app.signnow.com/authorize" +
+        $"?client_id={Uri.EscapeDataString(clientId)}" +
+        $"&response_type=code" +
+        $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
+        $"&scope={Uri.EscapeDataString("*")}" +
+        $"&state=company";
+
+    return Results.Ok(new
+    {
+        success = true,
+        url
+    });
+});
+
+// =============================
+// SIGNNOW CALLBACK
+// =============================
+app.MapGet("/api/integrations/signnow/callback", async (HttpContext context) =>
+{
+    try
+    {
+        var code = context.Request.Query["code"].ToString();
+        var error = context.Request.Query["error"].ToString();
+
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "SignNow authorization failed.",
+                error
+            });
+        }
+
+        if (string.IsNullOrWhiteSpace(code))
+            return Results.BadRequest("Missing code");
+
+        var clientId = builder.Configuration["SIGNNOW_CLIENT_ID"];
+        var clientSecret = builder.Configuration["SIGNNOW_CLIENT_SECRET"];
+        var redirectUri = builder.Configuration["SIGNNOW_REDIRECT_URI"];
+
+        if (string.IsNullOrWhiteSpace(clientId) ||
+            string.IsNullOrWhiteSpace(clientSecret) ||
+            string.IsNullOrWhiteSpace(redirectUri))
+        {
+            return Results.Problem(
+                title: "SignNow config missing",
+                detail: "SIGNNOW_CLIENT_ID, SIGNNOW_CLIENT_SECRET and/or SIGNNOW_REDIRECT_URI are missing from Railway variables.",
+                statusCode: 500
+            );
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "Basic",
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(clientId + ":" + clientSecret)));
+
+        var tokenResponse = await httpClient.PostAsync(
+            "https://api.signnow.com/oauth2/token",
+            new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["grant_type"] = "authorization_code",
+                ["code"] = code,
+                ["redirect_uri"] = redirectUri
+            }));
+
+        var tokenJson = await tokenResponse.Content.ReadAsStringAsync();
+
+        if (!tokenResponse.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "SignNow token exchange failed",
+                detail: tokenJson,
+                statusCode: 500
+            );
+        }
+
+        var tokenDoc = JsonDocument.Parse(tokenJson).RootElement;
+        var accessToken = GetJsonString(tokenDoc, "access_token");
+        var refreshToken = GetJsonString(tokenDoc, "refresh_token");
+        var expiresIn = tokenDoc.TryGetProperty("expires_in", out var expiresInProp) &&
+            expiresInProp.TryGetInt32(out var parsedExpiresIn)
+                ? parsedExpiresIn
+                : 3600;
+        var expiresAt = DateTime.UtcNow.AddSeconds(expiresIn);
+
+        string? accountEmail = null;
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        var userResponse = await httpClient.GetAsync("https://api.signnow.com/user");
+        if (userResponse.IsSuccessStatusCode)
+        {
+            var userJson = await userResponse.Content.ReadAsStringAsync();
+            var userDoc = JsonDocument.Parse(userJson).RootElement;
+            accountEmail = FirstNonEmptyJsonString(userDoc, "email", "primary_email", "user_email");
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string upsertSql = @"
+INSERT INTO public.inspector_integrations
+(
+    inspector_id,
+    provider,
+    status,
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    external_tenant_id,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    'signnow',
+    'connected',
+    @access_token,
+    @refresh_token,
+    @expires_at,
+    @external_account_email,
+    'company',
+    NOW(),
+    NOW()
+)
+ON CONFLICT (inspector_id, provider)
+DO UPDATE SET
+    status = 'connected',
+    access_token_encrypted = EXCLUDED.access_token_encrypted,
+    refresh_token_encrypted = COALESCE(NULLIF(EXCLUDED.refresh_token_encrypted, ''), inspector_integrations.refresh_token_encrypted),
+    expires_at = EXCLUDED.expires_at,
+    external_account_email = EXCLUDED.external_account_email,
+    external_tenant_id = EXCLUDED.external_tenant_id,
+    updated_at = NOW();";
+
+        await using (var cmd = new NpgsqlCommand(upsertSql, conn))
+        {
+            cmd.Parameters.AddWithValue("inspector_id", Guid.Empty);
+            cmd.Parameters.AddWithValue("access_token", accessToken);
+            cmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("expires_at", expiresAt);
+            cmd.Parameters.AddWithValue("external_account_email", (object?)accountEmail ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        return Results.Content(
+            "<html><body style=\"font-family:Segoe UI,Arial,sans-serif;padding:32px;\">" +
+            "<h2>SignNow connected successfully</h2>" +
+            $"<p>Connected account: <strong>{WebUtility.HtmlEncode(accountEmail ?? "SignNow")}</strong></p>" +
+            "<p>You can close this window and return to 3D AutoMate.</p>" +
+            "</body></html>",
+            "text/html");
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "SignNow callback failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// SIGNNOW STATUS
+// =============================
+app.MapGet("/integrations/signnow/status", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    status,
+    external_account_email,
+    expires_at,
+    updated_at
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = 'signnow'
+LIMIT 1;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", Guid.Empty);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                connected = false,
+                status = "Disconnected",
+                accountEmail = "",
+                lastSync = "",
+                expiresAt = ""
+            });
+        }
+
+        string status = reader["status"]?.ToString() ?? "disconnected";
+
+        return Results.Ok(new
+        {
+            success = true,
+            connected = string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase),
+            status,
+            accountEmail = reader["external_account_email"]?.ToString() ?? "",
+            lastSync = reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O"),
+            expiresAt = reader["expires_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["expires_at"]).ToString("O")
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "SignNow status failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// SIGNNOW TEMPLATES
+// =============================
+app.MapGet("/integrations/signnow/templates", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        var account = await GetSignNowAccountAsync(conn, builder.Configuration);
+        if (!account.Success)
+        {
+            return Results.Problem(
+                title: "SignNow is not connected",
+                detail: account.ErrorMessage,
+                statusCode: 400);
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        var response = await httpClient.GetAsync("https://api.signnow.com/template");
+        var json = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "SignNow templates lookup failed",
+                detail: json,
+                statusCode: 500);
+        }
+
+        var root = JsonDocument.Parse(json).RootElement;
+        var templates = ExtractSignNowTemplates(root);
+
+        return Results.Ok(new
+        {
+            success = true,
+            templates
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "SignNow templates failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+// =============================
+// SIGNNOW TEMPLATE MAPPINGS
+// =============================
+app.MapGet("/integrations/signnow/template-mappings", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureSignNowTemplateMappingsTableAsync(conn);
+
+        var mappings = await LoadSignNowTemplateMappingsAsync(conn);
+
+        return Results.Ok(new
+        {
+            success = true,
+            mappings
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "SignNow template mappings failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+app.MapPost("/integrations/signnow/template-mappings", async (SignNowTemplateMappingsRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureSignNowTemplateMappingsTableAsync(conn);
+
+        var rows = 0;
+        foreach (var mapping in request.Mappings ?? new List<SignNowTemplateMappingInput>())
+        {
+            if (string.IsNullOrWhiteSpace(mapping.TemplateKey))
+                continue;
+
+            await UpsertSignNowTemplateMappingAsync(
+                conn,
+                mapping.TemplateKey.Trim(),
+                mapping.TemplateId?.Trim() ?? "",
+                mapping.TemplateName?.Trim() ?? "");
+            rows++;
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "SignNow template mappings saved.",
+            rows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Save SignNow template mappings failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+// =============================
+// SIGNNOW SEND TERMS
+// =============================
+app.MapPost("/integrations/signnow/jobs/{jobId}/send-terms", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
+        await EnsureSignNowTemplateMappingsTableAsync(conn);
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        var job = await LoadScheduleJobAsync(conn, jobId);
+        if (job == null)
+        {
+            return Results.NotFound(new
+            {
+                success = false,
+                message = "Job was not found in Railway. Sync the selected job first.",
+                jobId
+            });
+        }
+
+        var result = await SendSignNowTermsForJobAsync(conn, job, builder.Configuration, forceResend: true);
+        return Results.Ok(new
+        {
+            success = result.Success,
+            message = result.Message,
+            action = result.Action,
+            skipped = result.Skipped,
+            details = result.Details
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Send SignNow terms failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+// =============================
+// SIGNNOW REFRESH STATUS
+// =============================
+app.MapPost("/integrations/signnow/jobs/{jobId}/refresh-status", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        var result = await RefreshSignNowTermsStatusAsync(conn, jobId, builder.Configuration);
+        return Results.Ok(new
+        {
+            success = result.Success,
+            message = result.Message,
+            action = result.Action,
+            skipped = result.Skipped,
+            details = result.Details
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Refresh SignNow terms status failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+// =============================
+// SIGNNOW WEBHOOK
+// =============================
+app.MapPost("/api/integrations/signnow/webhook", async (HttpContext context) =>
+{
+    try
+    {
+        using var reader = new StreamReader(context.Request.Body);
+        var body = await reader.ReadToEndAsync();
+        if (string.IsNullOrWhiteSpace(body))
+            return Results.BadRequest(new { success = false, message = "Missing webhook body." });
+
+        var root = JsonDocument.Parse(body).RootElement;
+        var documentId = FindJsonStringRecursive(root, "document_id", "documentId", "document_unique_id", "id");
+        var eventName = FindJsonStringRecursive(root, "event", "event_type", "type", "status");
+        var jobIdText = FindSignNowJobId(root);
+        Guid.TryParse(jobIdText, out var parsedJobId);
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureSignNowJobColumnsAsync(conn);
+
+        if (parsedJobId == Guid.Empty && !string.IsNullOrWhiteSpace(documentId))
+            parsedJobId = await FindJobIdBySignNowDocumentAsync(conn, documentId);
+
+        if (parsedJobId == Guid.Empty)
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                matched = false,
+                message = "SignNow webhook received but no matching job was found."
+            });
+        }
+
+        var signed = LooksLikeSignNowCompleted(eventName) || LooksLikeSignNowCompleted(FindJsonStringRecursive(root, "status"));
+        await StoreSignNowStatusAsync(
+            conn,
+            parsedJobId,
+            documentId,
+            null,
+            null,
+            eventName,
+            null,
+            signed,
+            signed ? DateTime.UtcNow : null);
+
+        return Results.Ok(new
+        {
+            success = true,
+            matched = true,
+            jobId = parsedJobId,
+            documentId,
+            status = eventName,
+            signed
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "SignNow webhook failed",
+            detail: ex.ToString(),
+            statusCode: 500);
+    }
+});
+
+// =============================
 // XERO TEST CONNECTION
 // =============================
 app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionRequest request) =>
@@ -2135,6 +2664,8 @@ app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
         await conn.OpenAsync();
         await EnsureInspectorIntegrationsTableAsync(conn);
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
+        await EnsureSignNowTemplateMappingsTableAsync(conn);
         await EnsureJobInvoiceLinesTableAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
 
@@ -2171,8 +2702,8 @@ app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
 
         if (job.TermsRequired)
         {
-            await MarkTermsFailedAsync(conn, jobId, "SignNow integration is not configured yet. Booking can continue, but agreement sending still needs the SignNow connector.");
-            results.Add(ScheduleActionResult.Failed("terms", "SignNow integration is not configured yet."));
+            var termsResult = await SendSignNowTermsForJobAsync(conn, job, builder.Configuration, forceResend: false);
+            results.Add(termsResult);
         }
         else
         {
@@ -2222,6 +2753,7 @@ app.MapGet("/jobs/pending-workflows", async () =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
 
         const string sql = @"
 SELECT
@@ -2252,6 +2784,14 @@ SELECT
     j.terms_retry_requested_at,
     j.terms_last_attempt_at,
     j.terms_last_error,
+    j.terms_signed,
+    j.terms_signed_at,
+    j.signnow_document_id,
+    j.signnow_invite_id,
+    j.signnow_template_id,
+    j.signnow_document_status,
+    j.signnow_last_checked_at,
+    j.signnow_signing_link,
     j.invoice_sent,
     j.invoice_sent_at,
     j.invoice_retry_requested,
@@ -2414,6 +2954,14 @@ LIMIT 100;";
                 terms_retry_requested_at = reader["terms_retry_requested_at"]?.ToString(),
                 terms_last_attempt_at = reader["terms_last_attempt_at"]?.ToString(),
                 terms_last_error = reader["terms_last_error"]?.ToString(),
+                terms_signed = reader["terms_signed"]?.ToString(),
+                terms_signed_at = reader["terms_signed_at"]?.ToString(),
+                signnow_document_id = reader["signnow_document_id"]?.ToString(),
+                signnow_invite_id = reader["signnow_invite_id"]?.ToString(),
+                signnow_template_id = reader["signnow_template_id"]?.ToString(),
+                signnow_document_status = reader["signnow_document_status"]?.ToString(),
+                signnow_last_checked_at = reader["signnow_last_checked_at"]?.ToString(),
+                signnow_signing_link = reader["signnow_signing_link"]?.ToString(),
 
                 invoice_sent = reader["invoice_sent"]?.ToString(),
                 invoice_sent_at = reader["invoice_sent_at"]?.ToString(),
@@ -2558,6 +3106,7 @@ app.MapGet("/jobs/workflow-status", async () =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
 
         const string sql = @"
@@ -2580,6 +3129,10 @@ SELECT
     j.terms_required,
     j.terms_sent,
     j.terms_retry_requested,
+    j.terms_signed,
+    j.terms_signed_at,
+    j.signnow_document_status,
+    j.signnow_document_id,
     j.invoice_required,
     j.invoice_sent,
     j.invoice_retry_requested,
@@ -2642,6 +3195,10 @@ LIMIT 500;";
                 terms_required = reader["terms_required"]?.ToString(),
                 terms_sent = reader["terms_sent"]?.ToString(),
                 terms_retry_requested = reader["terms_retry_requested"]?.ToString(),
+                terms_signed = reader["terms_signed"]?.ToString(),
+                terms_signed_at = reader["terms_signed_at"]?.ToString(),
+                signnow_document_status = reader["signnow_document_status"]?.ToString(),
+                signnow_document_id = reader["signnow_document_id"]?.ToString(),
                 invoice_required = reader["invoice_required"]?.ToString(),
                 invoice_sent = reader["invoice_sent"]?.ToString(),
                 invoice_retry_requested = reader["invoice_retry_requested"]?.ToString(),
@@ -2688,6 +3245,7 @@ app.MapGet("/workflow-actions/pending", async () =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
 
         const string sql = @"
@@ -3134,6 +3692,7 @@ app.MapPost("/jobs/{jobId}/hard-reset", async (Guid jobId) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
         await using var tx = await conn.BeginTransactionAsync();
 
         const string resetJobSql = @"
@@ -3154,6 +3713,14 @@ SET
     terms_retry_requested_at = NULL,
     terms_last_attempt_at = NULL,
     terms_last_error = NULL,
+    terms_signed = false,
+    terms_signed_at = NULL,
+    signnow_document_id = NULL,
+    signnow_invite_id = NULL,
+    signnow_template_id = NULL,
+    signnow_document_status = NULL,
+    signnow_last_checked_at = NULL,
+    signnow_signing_link = NULL,
 
     invoice_sent = false,
     invoice_sent_at = NULL,
@@ -3770,6 +4337,7 @@ app.MapPost("/jobs/{jobId}/mark-report-available", async (Guid jobId) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureSignNowJobColumnsAsync(conn);
 
         const string sql = @"
 UPDATE public.jobs_staging
@@ -3974,6 +4542,14 @@ SELECT
     terms_retry_requested_at,
     terms_last_attempt_at,
     terms_last_error,
+    terms_signed,
+    terms_signed_at,
+    signnow_document_id,
+    signnow_invite_id,
+    signnow_template_id,
+    signnow_document_status,
+    signnow_last_checked_at,
+    signnow_signing_link,
     invoice_sent,
     invoice_sent_at,
     invoice_retry_requested,
@@ -4064,6 +4640,14 @@ LIMIT 20;";
                 terms_retry_requested_at = reader["terms_retry_requested_at"]?.ToString(),
                 terms_last_attempt_at = reader["terms_last_attempt_at"]?.ToString(),
                 terms_last_error = reader["terms_last_error"]?.ToString(),
+                terms_signed = reader["terms_signed"]?.ToString(),
+                terms_signed_at = reader["terms_signed_at"]?.ToString(),
+                signnow_document_id = reader["signnow_document_id"]?.ToString(),
+                signnow_invite_id = reader["signnow_invite_id"]?.ToString(),
+                signnow_template_id = reader["signnow_template_id"]?.ToString(),
+                signnow_document_status = reader["signnow_document_status"]?.ToString(),
+                signnow_last_checked_at = reader["signnow_last_checked_at"]?.ToString(),
+                signnow_signing_link = reader["signnow_signing_link"]?.ToString(),
 
                 invoice_sent = reader["invoice_sent"]?.ToString(),
                 invoice_sent_at = reader["invoice_sent_at"]?.ToString(),
@@ -4233,6 +4817,14 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     terms_retry_requested_at timestamptz NULL,
     terms_last_attempt_at timestamptz NULL,
     terms_last_error text NULL,
+    terms_signed boolean NOT NULL DEFAULT false,
+    terms_signed_at timestamptz NULL,
+    signnow_document_id text NULL,
+    signnow_invite_id text NULL,
+    signnow_template_id text NULL,
+    signnow_document_status text NULL,
+    signnow_last_checked_at timestamptz NULL,
+    signnow_signing_link text NULL,
     invoice_sent boolean NOT NULL DEFAULT false,
     invoice_sent_at timestamptz NULL,
     invoice_retry_requested boolean NOT NULL DEFAULT false,
@@ -4933,6 +5525,233 @@ CREATE TABLE IF NOT EXISTS public.inspector_integrations
     await cmd.ExecuteNonQueryAsync();
 }
 
+static async Task EnsureSignNowJobColumnsAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_signed boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS terms_signed_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_document_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_invite_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_template_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_document_status text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_last_checked_at timestamptz NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_signing_link text NULL;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task EnsureSignNowTemplateMappingsTableAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.signnow_template_mappings
+(
+    template_key text PRIMARY KEY,
+    template_id text NOT NULL DEFAULT '',
+    template_name text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW()
+);";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task<List<SignNowTemplateMappingResult>> LoadSignNowTemplateMappingsAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+SELECT template_key, template_id, template_name, updated_at
+FROM public.signnow_template_mappings
+ORDER BY template_key;";
+
+    var mappings = new List<SignNowTemplateMappingResult>();
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        mappings.Add(new SignNowTemplateMappingResult(
+            reader["template_key"]?.ToString() ?? "",
+            reader["template_id"]?.ToString() ?? "",
+            reader["template_name"]?.ToString() ?? "",
+            reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O")));
+    }
+
+    return mappings;
+}
+
+static async Task UpsertSignNowTemplateMappingAsync(NpgsqlConnection conn, string templateKey, string templateId, string templateName)
+{
+    const string sql = @"
+INSERT INTO public.signnow_template_mappings
+(
+    template_key,
+    template_id,
+    template_name,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @template_key,
+    @template_id,
+    @template_name,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (template_key)
+DO UPDATE SET
+    template_id = EXCLUDED.template_id,
+    template_name = EXCLUDED.template_name,
+    updated_at = NOW();";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("template_key", templateKey);
+    cmd.Parameters.AddWithValue("template_id", templateId);
+    cmd.Parameters.AddWithValue("template_name", templateName);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task<SignNowTemplateMappingResult?> GetSignNowTemplateMappingAsync(NpgsqlConnection conn, string templateKey)
+{
+    const string sql = @"
+SELECT template_key, template_id, template_name, updated_at
+FROM public.signnow_template_mappings
+WHERE template_key = @template_key
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("template_key", templateKey);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+        return null;
+
+    return new SignNowTemplateMappingResult(
+        reader["template_key"]?.ToString() ?? "",
+        reader["template_id"]?.ToString() ?? "",
+        reader["template_name"]?.ToString() ?? "",
+        reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O"));
+}
+
+static async Task<IntegrationAccountResult> GetSignNowAccountAsync(
+    NpgsqlConnection conn,
+    IConfiguration configuration)
+{
+    const string sql = @"
+SELECT
+    access_token_encrypted,
+    refresh_token_encrypted,
+    expires_at,
+    external_account_email,
+    status
+FROM public.inspector_integrations
+WHERE inspector_id = @inspector_id
+  AND provider = 'signnow'
+LIMIT 1;";
+
+    string? accessToken = null;
+    string? refreshToken = null;
+    DateTime? expiresAt = null;
+    string? accountName = null;
+    string? status = null;
+
+    await using (var cmd = new NpgsqlCommand(sql, conn))
+    {
+        cmd.Parameters.AddWithValue("inspector_id", Guid.Empty);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            accessToken = reader["access_token_encrypted"]?.ToString();
+            refreshToken = reader["refresh_token_encrypted"]?.ToString();
+            accountName = reader["external_account_email"]?.ToString();
+            status = reader["status"]?.ToString();
+            if (reader["expires_at"] != DBNull.Value)
+                expiresAt = Convert.ToDateTime(reader["expires_at"]);
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(accessToken) ||
+        !string.Equals(status, "connected", StringComparison.OrdinalIgnoreCase))
+    {
+        return IntegrationAccountResult.Failure("SignNow is not connected.");
+    }
+
+    if (expiresAt.HasValue && expiresAt.Value > DateTime.UtcNow.AddMinutes(5))
+        return IntegrationAccountResult.Ok(accessToken, refreshToken, "company", accountName);
+
+    var clientId = configuration["SIGNNOW_CLIENT_ID"];
+    var clientSecret = configuration["SIGNNOW_CLIENT_SECRET"];
+    if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+        return IntegrationAccountResult.Failure("SIGNNOW_CLIENT_ID and/or SIGNNOW_CLIENT_SECRET are missing.");
+
+    if (string.IsNullOrWhiteSpace(refreshToken))
+        return IntegrationAccountResult.Failure("SignNow access token expired and no refresh token is stored.");
+
+    using var refreshClient = new HttpClient();
+    refreshClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+        "Basic",
+        Convert.ToBase64String(Encoding.UTF8.GetBytes(clientId + ":" + clientSecret)));
+
+    var refreshResponse = await refreshClient.PostAsync(
+        "https://api.signnow.com/oauth2/token",
+        new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "refresh_token",
+            ["refresh_token"] = refreshToken
+        }));
+
+    var refreshJson = await refreshResponse.Content.ReadAsStringAsync();
+    if (!refreshResponse.IsSuccessStatusCode)
+        return IntegrationAccountResult.Failure("SignNow token refresh failed: " + refreshJson);
+
+    var refreshDoc = JsonDocument.Parse(refreshJson).RootElement;
+    accessToken = GetJsonString(refreshDoc, "access_token");
+    refreshToken = string.IsNullOrWhiteSpace(GetJsonString(refreshDoc, "refresh_token"))
+        ? refreshToken
+        : GetJsonString(refreshDoc, "refresh_token");
+
+    var refreshedExpiresIn = refreshDoc.TryGetProperty("expires_in", out var refreshedExpiresInProp) &&
+        refreshedExpiresInProp.TryGetInt32(out var parsedExpiresIn)
+            ? parsedExpiresIn
+            : 3600;
+    expiresAt = DateTime.UtcNow.AddSeconds(refreshedExpiresIn);
+
+    const string updateSql = @"
+UPDATE public.inspector_integrations
+SET
+    access_token_encrypted = @access_token,
+    refresh_token_encrypted = @refresh_token,
+    expires_at = @expires_at,
+    updated_at = NOW()
+WHERE inspector_id = @inspector_id
+  AND provider = 'signnow';";
+
+    await using var updateCmd = new NpgsqlCommand(updateSql, conn);
+    updateCmd.Parameters.AddWithValue("access_token", accessToken);
+    updateCmd.Parameters.AddWithValue("refresh_token", (object?)refreshToken ?? DBNull.Value);
+    updateCmd.Parameters.AddWithValue("expires_at", expiresAt.Value);
+    updateCmd.Parameters.AddWithValue("inspector_id", Guid.Empty);
+    await updateCmd.ExecuteNonQueryAsync();
+
+    return IntegrationAccountResult.Ok(accessToken, refreshToken, "company", accountName);
+}
+
 static async Task<XeroAccountResult> GetXeroAccountAsync(
     NpgsqlConnection conn,
     Guid inspectorId,
@@ -5268,9 +6087,14 @@ SELECT
     j.primary_service_key,
     j.additional1_service_key,
     j.additional2_service_key,
+    j.booking_template_key,
     j.booking_email_required,
     j.booking_email_sent,
     j.terms_required,
+    j.terms_sent,
+    j.terms_retry_requested,
+    j.terms_signed,
+    j.signnow_document_id,
     j.invoice_required,
     j.calendar_required,
     j.calendar_created,
@@ -5313,9 +6137,14 @@ LIMIT 1;";
         reader["primary_service_key"]?.ToString() ?? "",
         reader["additional1_service_key"]?.ToString() ?? "",
         reader["additional2_service_key"]?.ToString() ?? "",
+        reader["booking_template_key"]?.ToString() ?? "general_booking",
         reader["booking_email_required"] != DBNull.Value && Convert.ToBoolean(reader["booking_email_required"]),
         reader["booking_email_sent"] != DBNull.Value && Convert.ToBoolean(reader["booking_email_sent"]),
         reader["terms_required"] != DBNull.Value && Convert.ToBoolean(reader["terms_required"]),
+        reader["terms_sent"] != DBNull.Value && Convert.ToBoolean(reader["terms_sent"]),
+        reader["terms_retry_requested"] != DBNull.Value && Convert.ToBoolean(reader["terms_retry_requested"]),
+        reader["terms_signed"] != DBNull.Value && Convert.ToBoolean(reader["terms_signed"]),
+        reader["signnow_document_id"]?.ToString() ?? "",
         reader["invoice_required"] != DBNull.Value && Convert.ToBoolean(reader["invoice_required"]),
         reader["calendar_required"] != DBNull.Value && Convert.ToBoolean(reader["calendar_required"]),
         reader["calendar_created"] != DBNull.Value && Convert.ToBoolean(reader["calendar_created"]),
@@ -5531,6 +6360,315 @@ static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
         invoiceStatus,
         sentToContact = false
     });
+}
+
+static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
+    NpgsqlConnection conn,
+    ScheduleJobInput job,
+    IConfiguration configuration,
+    bool forceResend)
+{
+    if (!job.TermsRequired)
+        return ScheduleActionResult.Skip("terms", "Terms are not required for this job.");
+
+    if (job.TermsSigned && !forceResend)
+        return ScheduleActionResult.Skip("terms", "Terms are already signed.", new { documentId = job.SignNowDocumentId });
+
+    if (job.TermsSent && !job.TermsRetryRequested && !forceResend)
+        return ScheduleActionResult.Skip("terms", "Terms have already been sent.", new { documentId = job.SignNowDocumentId });
+
+    if (string.IsNullOrWhiteSpace(job.ClientEmail))
+    {
+        await MarkTermsFailedAsync(conn, job.JobId, "Client email is missing.");
+        return ScheduleActionResult.Failed("terms", "Client email is missing.");
+    }
+
+    var templateKey = string.IsNullOrWhiteSpace(job.BookingTemplateKey)
+        ? "general_booking"
+        : job.BookingTemplateKey.Trim();
+
+    var mapping = await GetSignNowTemplateMappingAsync(conn, templateKey);
+    if (mapping == null || string.IsNullOrWhiteSpace(mapping.TemplateId))
+    {
+        var message = $"No SignNow template is mapped for service/template key '{templateKey}'. Open Setup / Settings > SignNow Templates and choose a template.";
+        await MarkTermsFailedAsync(conn, job.JobId, message);
+        return ScheduleActionResult.Failed("terms", message);
+    }
+
+    var account = await GetSignNowAccountAsync(conn, configuration);
+    if (!account.Success)
+    {
+        await MarkTermsFailedAsync(conn, job.JobId, account.ErrorMessage ?? "SignNow is not connected.");
+        return ScheduleActionResult.Failed("terms", account.ErrorMessage ?? "SignNow is not connected.");
+    }
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+    httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+    var documentName = BuildSignNowDocumentName(job);
+    var copyResponse = await httpClient.PostAsJsonAsync(
+        $"https://api.signnow.com/template/{Uri.EscapeDataString(mapping.TemplateId)}/copy",
+        new
+        {
+            document_name = documentName,
+            name = documentName
+        });
+    var copyJson = await copyResponse.Content.ReadAsStringAsync();
+
+    if (!copyResponse.IsSuccessStatusCode)
+    {
+        await MarkTermsFailedAsync(conn, job.JobId, copyJson);
+        return ScheduleActionResult.Failed("terms", "SignNow template copy failed: " + copyJson);
+    }
+
+    var copyDoc = JsonDocument.Parse(copyJson).RootElement;
+    var documentId = FirstNonEmptyJsonString(copyDoc, "id", "document_id", "unique_id");
+    if (string.IsNullOrWhiteSpace(documentId))
+    {
+        await MarkTermsFailedAsync(conn, job.JobId, "SignNow did not return a document ID after copying the template.");
+        return ScheduleActionResult.Failed("terms", "SignNow did not return a document ID after copying the template.");
+    }
+
+    var documentResponse = await httpClient.GetAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(documentId)}");
+    var documentJson = await documentResponse.Content.ReadAsStringAsync();
+    JsonElement? documentRoot = null;
+    if (documentResponse.IsSuccessStatusCode && !string.IsNullOrWhiteSpace(documentJson))
+        documentRoot = JsonDocument.Parse(documentJson).RootElement.Clone();
+
+    await TryPrefillSignNowDocumentAsync(httpClient, documentId, job);
+
+    var signerRole = documentRoot.HasValue ? ExtractSignNowSignerRole(documentRoot.Value) : "";
+    if (string.IsNullOrWhiteSpace(signerRole))
+        signerRole = "Signer 1";
+
+    var invitePayload = new
+    {
+        document_id = documentId,
+        subject = "Terms and conditions for your inspection",
+        message = "Please review and sign the terms and conditions for your inspection.",
+        from = account.AccountName,
+        to = new[]
+        {
+            new
+            {
+                email = job.ClientEmail.Trim(),
+                role = signerRole,
+                role_id = ExtractSignNowSignerRoleId(documentRoot),
+                order = 1,
+                subject = "Terms and conditions for your inspection",
+                message = "Please review and sign the terms and conditions for your inspection."
+            }
+        }
+    };
+
+    var inviteResponse = await httpClient.PostAsJsonAsync(
+        $"https://api.signnow.com/document/{Uri.EscapeDataString(documentId)}/invite",
+        invitePayload);
+    var inviteJson = await inviteResponse.Content.ReadAsStringAsync();
+
+    if (!inviteResponse.IsSuccessStatusCode)
+    {
+        await MarkTermsFailedAsync(conn, job.JobId, inviteJson);
+        return ScheduleActionResult.Failed("terms", "SignNow invite failed: " + inviteJson);
+    }
+
+    var inviteId = "";
+    var signingLink = "";
+    if (!string.IsNullOrWhiteSpace(inviteJson))
+    {
+        var inviteDoc = JsonDocument.Parse(inviteJson).RootElement;
+        inviteId = FirstNonEmptyJsonString(inviteDoc, "id", "invite_id", "field_invite_id");
+        signingLink = FirstNonEmptyJsonString(inviteDoc, "signing_link", "signingLink", "link");
+    }
+
+    await StoreSignNowTermsSentAsync(
+        conn,
+        job.JobId,
+        documentId,
+        inviteId,
+        mapping.TemplateId,
+        "sent",
+        signingLink);
+
+    return ScheduleActionResult.Ok("terms", "SignNow terms sent to client.", new
+    {
+        documentId,
+        inviteId,
+        templateKey,
+        templateId = mapping.TemplateId,
+        templateName = mapping.TemplateName,
+        sentTo = job.ClientEmail
+    });
+}
+
+static async Task<ScheduleActionResult> RefreshSignNowTermsStatusAsync(
+    NpgsqlConnection conn,
+    Guid jobId,
+    IConfiguration configuration)
+{
+    const string sql = @"
+SELECT signnow_document_id
+FROM public.jobs_staging
+WHERE job_id = @job_id
+LIMIT 1;";
+
+    string documentId;
+    await using (var cmd = new NpgsqlCommand(sql, conn))
+    {
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        var result = await cmd.ExecuteScalarAsync();
+        documentId = result?.ToString() ?? "";
+    }
+
+    if (string.IsNullOrWhiteSpace(documentId))
+        return ScheduleActionResult.Failed("terms", "No SignNow document ID is stored for this job.");
+
+    var account = await GetSignNowAccountAsync(conn, configuration);
+    if (!account.Success)
+        return ScheduleActionResult.Failed("terms", account.ErrorMessage ?? "SignNow is not connected.");
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+    httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+    var response = await httpClient.GetAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(documentId)}");
+    var json = await response.Content.ReadAsStringAsync();
+    if (!response.IsSuccessStatusCode)
+    {
+        await MarkTermsFailedAsync(conn, jobId, json);
+        return ScheduleActionResult.Failed("terms", "SignNow status lookup failed: " + json);
+    }
+
+    var root = JsonDocument.Parse(json).RootElement;
+    var status = FirstNonEmptyJsonString(root, "status", "state", "invite_status");
+    if (string.IsNullOrWhiteSpace(status))
+        status = FindJsonStringRecursive(root, "status", "state", "invite_status");
+    var signed = LooksLikeSignNowCompleted(status);
+    var signedAt = signed ? DateTime.UtcNow : (DateTime?)null;
+
+    await StoreSignNowStatusAsync(conn, jobId, documentId, null, null, status, null, signed, signedAt);
+
+    return ScheduleActionResult.Ok("terms", signed ? "SignNow terms are signed." : "SignNow terms status refreshed.", new
+    {
+        documentId,
+        status,
+        signed
+    });
+}
+
+static async Task TryPrefillSignNowDocumentAsync(HttpClient httpClient, string documentId, ScheduleJobInput job)
+{
+    var fields = new Dictionary<string, string>
+    {
+        ["JobID"] = job.JobId.ToString(),
+        ["Address of Property to be inspected"] = job.SiteAddress ?? "",
+        ["Full name"] = job.ClientName ?? ""
+    };
+
+    var payload = new
+    {
+        fields = fields.Select(field => new
+        {
+            field_name = field.Key,
+            prefilled_text = field.Value,
+            value = field.Value
+        }).ToArray(),
+        prefill_texts = fields.Select(field => new
+        {
+            field_name = field.Key,
+            prefilled_text = field.Value
+        }).ToArray()
+    };
+
+    try
+    {
+        using var content = JsonContent.Create(payload);
+        await httpClient.PutAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(documentId)}", content);
+    }
+    catch
+    {
+        // Prefill support varies by template shape; sending still proceeds and SignNow returns validation errors if required fields block signing.
+    }
+}
+
+static async Task StoreSignNowTermsSentAsync(
+    NpgsqlConnection conn,
+    Guid jobId,
+    string documentId,
+    string? inviteId,
+    string templateId,
+    string status,
+    string? signingLink)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    terms_sent = true,
+    terms_sent_at = COALESCE(terms_sent_at, NOW()),
+    terms_retry_requested = false,
+    terms_retry_requested_at = NULL,
+    terms_last_attempt_at = NOW(),
+    terms_last_error = NULL,
+    signnow_document_id = @document_id,
+    signnow_invite_id = @invite_id,
+    signnow_template_id = @template_id,
+    signnow_document_status = @status,
+    signnow_last_checked_at = NOW(),
+    signnow_signing_link = @signing_link,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("document_id", documentId);
+    cmd.Parameters.AddWithValue("invite_id", (object?)inviteId ?? DBNull.Value);
+    cmd.Parameters.AddWithValue("template_id", templateId);
+    cmd.Parameters.AddWithValue("status", string.IsNullOrWhiteSpace(status) ? "sent" : status);
+    cmd.Parameters.AddWithValue("signing_link", (object?)signingLink ?? DBNull.Value);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task StoreSignNowStatusAsync(
+    NpgsqlConnection conn,
+    Guid jobId,
+    string? documentId,
+    string? inviteId,
+    string? templateId,
+    string? status,
+    string? signingLink,
+    bool signed,
+    DateTime? signedAt)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET
+    signnow_document_id = COALESCE(NULLIF(@document_id, ''), signnow_document_id),
+    signnow_invite_id = COALESCE(NULLIF(@invite_id, ''), signnow_invite_id),
+    signnow_template_id = COALESCE(NULLIF(@template_id, ''), signnow_template_id),
+    signnow_document_status = COALESCE(NULLIF(@status, ''), signnow_document_status),
+    signnow_last_checked_at = NOW(),
+    signnow_signing_link = COALESCE(NULLIF(@signing_link, ''), signnow_signing_link),
+    terms_signed = CASE WHEN @signed THEN true ELSE terms_signed END,
+    terms_signed_at = CASE WHEN @signed THEN COALESCE(@signed_at, NOW()) ELSE terms_signed_at END,
+    terms_last_error = CASE WHEN @signed THEN NULL ELSE terms_last_error END,
+    terms_retry_requested = CASE WHEN @signed THEN false ELSE terms_retry_requested END,
+    terms_retry_requested_at = CASE WHEN @signed THEN NULL ELSE terms_retry_requested_at END,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("document_id", documentId ?? "");
+    cmd.Parameters.AddWithValue("invite_id", inviteId ?? "");
+    cmd.Parameters.AddWithValue("template_id", templateId ?? "");
+    cmd.Parameters.AddWithValue("status", status ?? "");
+    cmd.Parameters.AddWithValue("signing_link", signingLink ?? "");
+    cmd.Parameters.AddWithValue("signed", signed);
+    cmd.Parameters.AddWithValue("signed_at", signedAt.HasValue ? signedAt.Value : DBNull.Value);
+    await cmd.ExecuteNonQueryAsync();
 }
 
 static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
@@ -5974,6 +7112,165 @@ static string GetJsonString(JsonElement element, string propertyName)
     return element.TryGetProperty(propertyName, out var value) && value.ValueKind != JsonValueKind.Null
         ? value.ToString()
         : "";
+}
+
+static string FirstNonEmptyJsonString(JsonElement element, params string[] propertyNames)
+{
+    foreach (var propertyName in propertyNames)
+    {
+        var value = GetJsonString(element, propertyName);
+        if (!string.IsNullOrWhiteSpace(value))
+            return value;
+    }
+
+    return "";
+}
+
+static string FindJsonStringRecursive(JsonElement element, params string[] propertyNames)
+{
+    if (element.ValueKind == JsonValueKind.Object)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            if (propertyNames.Any(name => string.Equals(name, property.Name, StringComparison.OrdinalIgnoreCase)) &&
+                property.Value.ValueKind != JsonValueKind.Null &&
+                property.Value.ValueKind != JsonValueKind.Object &&
+                property.Value.ValueKind != JsonValueKind.Array)
+            {
+                return property.Value.ToString();
+            }
+
+            var nested = FindJsonStringRecursive(property.Value, propertyNames);
+            if (!string.IsNullOrWhiteSpace(nested))
+                return nested;
+        }
+    }
+    else if (element.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var item in element.EnumerateArray())
+        {
+            var nested = FindJsonStringRecursive(item, propertyNames);
+            if (!string.IsNullOrWhiteSpace(nested))
+                return nested;
+        }
+    }
+
+    return "";
+}
+
+static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root)
+{
+    var templates = new List<SignNowTemplateResult>();
+    var arrays = new List<JsonElement>();
+
+    if (root.ValueKind == JsonValueKind.Array)
+        arrays.Add(root);
+    else if (root.ValueKind == JsonValueKind.Object)
+    {
+        foreach (var name in new[] { "templates", "data", "documents" })
+        {
+            if (root.TryGetProperty(name, out var array) && array.ValueKind == JsonValueKind.Array)
+                arrays.Add(array);
+        }
+    }
+
+    foreach (var array in arrays)
+    {
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var id = FirstNonEmptyJsonString(item, "id", "template_id", "document_id", "unique_id");
+            if (string.IsNullOrWhiteSpace(id))
+                continue;
+
+            templates.Add(new SignNowTemplateResult(
+                id,
+                FirstNonEmptyJsonString(item, "name", "document_name", "template_name"),
+                FirstNonEmptyJsonString(item, "updated", "updated_at", "last_updated")));
+        }
+    }
+
+    return templates
+        .GroupBy(template => template.Id, StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.First())
+        .OrderBy(template => template.Name)
+        .ToList();
+}
+
+static string ExtractSignNowSignerRole(JsonElement document)
+{
+    var role = FindJsonStringRecursive(document, "role", "role_name");
+    if (!string.IsNullOrWhiteSpace(role))
+        return role;
+
+    return "";
+}
+
+static string ExtractSignNowSignerRoleId(JsonElement? document)
+{
+    if (!document.HasValue)
+        return "";
+
+    return FindJsonStringRecursive(document.Value, "role_id", "roleId");
+}
+
+static string FindSignNowJobId(JsonElement root)
+{
+    var direct = FindJsonStringRecursive(root, "JobID", "job_id", "jobId");
+    if (!string.IsNullOrWhiteSpace(direct))
+        return direct;
+
+    if (root.ValueKind == JsonValueKind.Object)
+    {
+        foreach (var property in root.EnumerateObject())
+        {
+            if (string.Equals(property.Name, "field_name", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(property.Value.ToString(), "JobID", StringComparison.OrdinalIgnoreCase))
+            {
+                return FirstNonEmptyJsonString(root, "value", "text", "prefilled_text");
+            }
+        }
+    }
+
+    return "";
+}
+
+static bool LooksLikeSignNowCompleted(string? status)
+{
+    if (string.IsNullOrWhiteSpace(status))
+        return false;
+
+    var value = status.Trim().ToLowerInvariant();
+    return value.Contains("complete") ||
+        value.Contains("completed") ||
+        value.Contains("signed") ||
+        value.Contains("fulfilled");
+}
+
+static string BuildSignNowDocumentName(ScheduleJobInput job)
+{
+    var name = string.IsNullOrWhiteSpace(job.JobName) ? "Inspection terms" : job.JobName.Trim();
+    if (!string.IsNullOrWhiteSpace(job.SiteAddress))
+        name += " - " + job.SiteAddress.Trim();
+
+    return name.Length <= 180 ? name : name.Substring(0, 180);
+}
+
+static async Task<Guid> FindJobIdBySignNowDocumentAsync(NpgsqlConnection conn, string documentId)
+{
+    const string sql = @"
+SELECT job_id
+FROM public.jobs_staging
+WHERE signnow_document_id = @document_id
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("document_id", documentId);
+
+    var result = await cmd.ExecuteScalarAsync();
+    return Guid.TryParse(result?.ToString(), out var jobId) ? jobId : Guid.Empty;
 }
 
 static string BuildPersonName(string? firstName, string? lastName)
@@ -7812,6 +9109,29 @@ public record IntegrationAccountResult(
     }
 }
 
+public class SignNowTemplateMappingsRequest
+{
+    public List<SignNowTemplateMappingInput> Mappings { get; set; } = new();
+}
+
+public class SignNowTemplateMappingInput
+{
+    public string TemplateKey { get; set; } = "";
+    public string TemplateId { get; set; } = "";
+    public string TemplateName { get; set; } = "";
+}
+
+public record SignNowTemplateMappingResult(
+    string TemplateKey,
+    string TemplateId,
+    string TemplateName,
+    string UpdatedAt);
+
+public record SignNowTemplateResult(
+    string Id,
+    string Name,
+    string UpdatedAt);
+
 public record ScheduleServiceInput(
     string Label,
     string ServiceKey,
@@ -7832,9 +9152,14 @@ public record ScheduleJobInput(
     string PrimaryServiceKey,
     string Additional1ServiceKey,
     string Additional2ServiceKey,
+    string BookingTemplateKey,
     bool BookingEmailRequired,
     bool BookingEmailSent,
     bool TermsRequired,
+    bool TermsSent,
+    bool TermsRetryRequested,
+    bool TermsSigned,
+    string SignNowDocumentId,
     bool InvoiceRequired,
     bool CalendarRequired,
     bool CalendarCreated,
