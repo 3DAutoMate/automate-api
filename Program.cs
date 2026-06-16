@@ -1268,7 +1268,7 @@ app.MapGet("/integrations/xero/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "openid profile email offline_access accounting.transactions accounting.contacts accounting.settings.read";
+    var scopes = "openid profile email offline_access accounting.transactions accounting.contacts";
 
     var url =
         "https://login.xero.com/identity/connect/authorize" +
@@ -1568,17 +1568,47 @@ app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionReque
 
         using var httpClient = new HttpClient();
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
-        httpClient.DefaultRequestHeaders.Add("xero-tenant-id", account.TenantId);
         httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        var response = await httpClient.GetAsync("https://api.xero.com/api.xro/2.0/Organisation");
+        var response = await httpClient.GetAsync("https://api.xero.com/connections");
         var responseText = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
         {
             return Results.Problem(
-                title: "Xero organisation lookup failed",
+                title: "Xero connections lookup failed",
                 detail: responseText,
+                statusCode: 500
+            );
+        }
+
+        var connectedTenant = false;
+        var tenantName = account.TenantName;
+        var connections = JsonDocument.Parse(responseText).RootElement;
+        if (connections.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var connection in connections.EnumerateArray())
+            {
+                var tenantId = connection.TryGetProperty("tenantId", out var tenantIdProp)
+                    ? tenantIdProp.GetString() ?? ""
+                    : "";
+
+                if (!string.Equals(tenantId, account.TenantId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                connectedTenant = true;
+                tenantName = connection.TryGetProperty("tenantName", out var tenantNameProp)
+                    ? tenantNameProp.GetString() ?? tenantName
+                    : tenantName;
+                break;
+            }
+        }
+
+        if (!connectedTenant)
+        {
+            return Results.Problem(
+                title: "Xero tenant not found",
+                detail: "The stored Xero tenant was not returned by Xero. Reconnect Xero and try again.",
                 statusCode: 500
             );
         }
@@ -1588,7 +1618,7 @@ app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionReque
             success = true,
             message = "Xero connection verified.",
             tenantId = account.TenantId,
-            tenantName = account.TenantName
+            tenantName
         });
     }
     catch (Exception ex)
