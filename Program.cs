@@ -1268,7 +1268,7 @@ app.MapGet("/integrations/xero/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "offline_access accounting.transactions accounting.contacts accounting.settings.read";
+    var scopes = "openid profile email offline_access accounting.transactions accounting.contacts accounting.settings.read";
 
     var url =
         "https://login.xero.com/identity/connect/authorize" +
