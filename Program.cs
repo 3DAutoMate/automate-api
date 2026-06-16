@@ -1268,7 +1268,7 @@ app.MapGet("/integrations/xero/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "offline_access app.connections accounting.contacts accounting.invoices accounting.payments accounting.settings.read";
+    var scopes = "offline_access app.connections";
 
     var url =
         "https://login.xero.com/identity/connect/authorize" +
@@ -1296,9 +1296,21 @@ app.MapGet("/api/integrations/xero/callback", async (HttpContext context) =>
         var code = context.Request.Query["code"].ToString();
         var state = context.Request.Query["state"].ToString();
         var error = context.Request.Query["error"].ToString();
+        var errorDescription = context.Request.Query["error_description"].ToString();
+        var errorUri = context.Request.Query["error_uri"].ToString();
 
         if (!string.IsNullOrWhiteSpace(error))
-            return Results.BadRequest("Xero authorization failed: " + WebUtility.HtmlEncode(error));
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Xero authorization failed.",
+                error,
+                errorDescription,
+                errorUri,
+                state
+            });
+        }
 
         if (string.IsNullOrWhiteSpace(code))
             return Results.BadRequest("Missing code");
