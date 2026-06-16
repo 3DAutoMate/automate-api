@@ -3124,6 +3124,137 @@ WHERE job_id = @job_id;";
 });
 
 // =============================
+// HARD RESET JOB FOR TESTING
+// Railway-only reset; external Xero/Google/email artifacts are not deleted.
+// =============================
+app.MapPost("/jobs/{jobId}/hard-reset", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        await using var tx = await conn.BeginTransactionAsync();
+
+        const string resetJobSql = @"
+UPDATE public.jobs_staging
+SET
+    status = 'Pending',
+
+    booking_email_sent = false,
+    booking_email_sent_at = NULL,
+    booking_email_retry_requested = false,
+    booking_email_retry_requested_at = NULL,
+    booking_email_last_attempt_at = NULL,
+    booking_email_last_error = NULL,
+
+    terms_sent = false,
+    terms_sent_at = NULL,
+    terms_retry_requested = false,
+    terms_retry_requested_at = NULL,
+    terms_last_attempt_at = NULL,
+    terms_last_error = NULL,
+
+    invoice_sent = false,
+    invoice_sent_at = NULL,
+    invoice_retry_requested = false,
+    invoice_retry_requested_at = NULL,
+    invoice_last_attempt_at = NULL,
+    invoice_last_error = NULL,
+
+    calendar_created = false,
+    calendar_created_at = NULL,
+    calendar_retry_requested = false,
+    calendar_retry_requested_at = NULL,
+    calendar_last_attempt_at = NULL,
+    calendar_last_error = NULL,
+
+    report_workflow_sent = false,
+    report_workflow_sent_at = NULL,
+    report_retry_requested = false,
+    report_retry_requested_at = NULL,
+    report_last_attempt_at = NULL,
+    report_last_error = NULL,
+    report_available = false,
+
+    paid = false,
+    marked_as_paid_override = false,
+    amount_paid = 0,
+    amount_outstanding = job_total,
+    payment_status = 'unpaid',
+
+    xero_contact_id = NULL,
+    xero_invoice_id = NULL,
+    xero_invoice_number = NULL,
+    xero_invoice_status = NULL,
+    xero_invoice_created_at = NULL,
+    xero_last_error = NULL,
+
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+        int jobRows;
+        await using (var resetJobCmd = new NpgsqlCommand(resetJobSql, conn, tx))
+        {
+            resetJobCmd.Parameters.AddWithValue("job_id", jobId);
+            jobRows = await resetJobCmd.ExecuteNonQueryAsync();
+        }
+
+        if (jobRows == 0)
+        {
+            await tx.RollbackAsync();
+            return Results.NotFound(new
+            {
+                success = false,
+                message = "Job was not found in Railway. Sync the selected job first.",
+                jobId
+            });
+        }
+
+        const string resetActionsSql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'pending',
+    retry_requested = false,
+    retry_requested_at = NULL,
+    sent_at = NULL,
+    last_attempt_at = NULL,
+    last_error = NULL,
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+        int actionRows;
+        await using (var resetActionsCmd = new NpgsqlCommand(resetActionsSql, conn, tx))
+        {
+            resetActionsCmd.Parameters.AddWithValue("job_id", jobId);
+            actionRows = await resetActionsCmd.ExecuteNonQueryAsync();
+        }
+
+        await tx.CommitAsync();
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Job hard reset for testing. Railway state was cleared; external Xero, Google, and email artifacts were not deleted.",
+            jobId,
+            jobRows,
+            workflowActionRows = actionRows
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Hard reset job failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // MARK BOOKING EMAIL SENT
 // =============================
 app.MapPost("/jobs/{jobId}/mark-booking-email-sent", async (Guid jobId) =>
