@@ -3212,34 +3212,6 @@ WHERE job_id = @job_id;";
             });
         }
 
-        var actionRows = 0;
-        var hasWorkflowActionsTable = false;
-
-        const string tableExistsSql = "SELECT to_regclass('public.job_workflow_actions') IS NOT NULL;";
-        await using (var tableExistsCmd = new NpgsqlCommand(tableExistsSql, conn, tx))
-        {
-            hasWorkflowActionsTable = Convert.ToBoolean(await tableExistsCmd.ExecuteScalarAsync());
-        }
-
-        if (hasWorkflowActionsTable)
-        {
-            const string resetActionsSql = @"
-UPDATE public.job_workflow_actions
-SET
-    status = 'pending',
-    retry_requested = false,
-    retry_requested_at = NULL,
-    sent_at = NULL,
-    last_attempt_at = NULL,
-    last_error = NULL,
-    updated_at = NOW()
-WHERE job_id = @job_id;";
-
-            await using var resetActionsCmd = new NpgsqlCommand(resetActionsSql, conn, tx);
-            resetActionsCmd.Parameters.AddWithValue("job_id", jobId);
-            actionRows = await resetActionsCmd.ExecuteNonQueryAsync();
-        }
-
         await tx.CommitAsync();
 
         return Results.Ok(new
@@ -3248,7 +3220,7 @@ WHERE job_id = @job_id;";
             message = "Job hard reset for testing. Railway state was cleared; external Xero, Google, and email artifacts were not deleted.",
             jobId,
             jobRows,
-            workflowActionRows = actionRows
+            workflowActionRows = 0
         });
     }
     catch (Exception ex)
