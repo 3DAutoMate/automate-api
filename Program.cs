@@ -1759,6 +1759,19 @@ app.MapPost("/integrations/xero/jobs/{jobId}/create-draft-invoice", async (Guid 
 
         if (!invoiceResponse.IsSuccessStatusCode)
         {
+            if (invoiceResponse.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                var reconnectMessage = "Xero rejected invoice creation. Reconnect Xero from Setup / Settings > Integrations > Xero so 3D AutoMate can request the new contact and invoice permissions.";
+                await StoreXeroJobErrorAsync(conn, jobId, reconnectMessage);
+                return Results.BadRequest(new
+                {
+                    success = false,
+                    message = reconnectMessage,
+                    xeroStatus = (int)invoiceResponse.StatusCode,
+                    xeroResponse = invoiceJson
+                });
+            }
+
             await StoreXeroJobErrorAsync(conn, jobId, invoiceJson);
             return Results.Problem(
                 title: "Xero draft invoice creation failed",
@@ -4675,7 +4688,15 @@ static async Task<string> CreateXeroContactAsync(HttpClient httpClient, string n
     var body = await response.Content.ReadAsStringAsync();
 
     if (!response.IsSuccessStatusCode)
+    {
+        if (response.StatusCode == HttpStatusCode.Unauthorized)
+        {
+            throw new InvalidOperationException(
+                "Xero rejected contact creation. Reconnect Xero from Setup / Settings > Integrations > Xero so 3D AutoMate can request the new contact and invoice permissions.");
+        }
+
         throw new InvalidOperationException("Xero contact creation failed: " + body);
+    }
 
     var doc = JsonDocument.Parse(body).RootElement;
     if (!doc.TryGetProperty("Contacts", out var contacts) ||
