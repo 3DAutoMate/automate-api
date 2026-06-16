@@ -1268,7 +1268,7 @@ app.MapGet("/integrations/xero/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "offline_access app.connections";
+    var scopes = "offline_access accounting.settings.read";
 
     var url =
         "https://login.xero.com/identity/connect/authorize" +
