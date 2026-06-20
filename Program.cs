@@ -306,7 +306,10 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS booking_email_required boolean NOT NULL DEFAULT true;
 
 ALTER TABLE public.jobs_staging
-ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT true;
+ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ALTER COLUMN terms_required SET DEFAULT false;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS invoice_required boolean NOT NULL DEFAULT true;
@@ -2117,13 +2120,16 @@ app.MapGet("/integrations/signnow/templates", async () =>
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
         httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        var response = await httpClient.GetAsync("https://api.signnow.com/template");
-        var json = await response.Content.ReadAsStringAsync();
-        if (!response.IsSuccessStatusCode)
+        var (response, json, lookupUrl) = await LookupSignNowTemplatesAsync(httpClient);
+        if (response == null || !response.IsSuccessStatusCode)
         {
             return Results.Problem(
                 title: "SignNow templates lookup failed",
-                detail: json,
+                detail: JsonSerializer.Serialize(new
+                {
+                    endpoint = lookupUrl,
+                    response = json
+                }),
                 statusCode: 500);
         }
 
@@ -3682,6 +3688,97 @@ WHERE job_id = @job_id;";
 });
 
 // =============================
+// UPDATE JOB WORKFLOW REQUIREMENTS
+// Connector Automation screen checkboxes for per-job workflow steps.
+// =============================
+app.MapPatch("/jobs/{jobId}/workflow-requirements", async (Guid jobId, JobWorkflowRequirementsRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureWorkflowActionsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    booking_email_required = COALESCE(@booking_email_required, booking_email_required),
+    terms_required = COALESCE(@terms_required, terms_required),
+    invoice_required = COALESCE(@invoice_required, invoice_required),
+    calendar_required = COALESCE(@calendar_required, calendar_required),
+    report_required = COALESCE(@report_required, report_required),
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+
+        await using (var cmd = new NpgsqlCommand(sql, conn))
+        {
+            cmd.Parameters.AddWithValue("job_id", jobId);
+            cmd.Parameters.AddWithValue("booking_email_required", request.BookingEmailRequired.HasValue ? request.BookingEmailRequired.Value : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("terms_required", request.TermsRequired.HasValue ? request.TermsRequired.Value : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("invoice_required", request.InvoiceRequired.HasValue ? request.InvoiceRequired.Value : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("calendar_required", request.CalendarRequired.HasValue ? request.CalendarRequired.Value : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("report_required", request.ReportRequired.HasValue ? request.ReportRequired.Value : (object)DBNull.Value);
+
+            var updated = await cmd.ExecuteNonQueryAsync();
+            if (updated == 0)
+            {
+                return Results.NotFound(new
+                {
+                    success = false,
+                    message = "Job was not found.",
+                    jobId
+                });
+            }
+        }
+
+        if (request.BookingEmailRequired == false)
+        {
+            await using var disableActionsCmd = new NpgsqlCommand(@"
+UPDATE public.job_workflow_actions
+SET
+    status = 'disabled',
+    retry_requested = false,
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_type = 'booking_email'
+  AND status <> 'sent';", conn);
+            disableActionsCmd.Parameters.AddWithValue("job_id", jobId);
+            await disableActionsCmd.ExecuteNonQueryAsync();
+        }
+        else if (request.BookingEmailRequired == true)
+        {
+            await using var enableActionsCmd = new NpgsqlCommand(@"
+UPDATE public.job_workflow_actions
+SET
+    status = 'pending',
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_type = 'booking_email'
+  AND status = 'disabled';", conn);
+            enableActionsCmd.Parameters.AddWithValue("job_id", jobId);
+            await enableActionsCmd.ExecuteNonQueryAsync();
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Workflow requirements updated.",
+            jobId
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Update workflow requirements failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
 // HARD RESET JOB FOR TESTING
 // Railway-only reset; external Xero/Google/email artifacts are not deleted.
 // =============================
@@ -4846,7 +4943,7 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     additional2_service_key text,
     booking_template_key text NOT NULL DEFAULT 'general_booking',
     booking_email_required boolean NOT NULL DEFAULT true,
-    terms_required boolean NOT NULL DEFAULT true,
+    terms_required boolean NOT NULL DEFAULT false,
     invoice_required boolean NOT NULL DEFAULT true,
     calendar_required boolean NOT NULL DEFAULT true,
     report_required boolean NOT NULL DEFAULT true,
@@ -5131,7 +5228,7 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("additional2_service_key", payload.Services?.Additional2ServiceKey ?? InferCanonicalServiceType(payload.Services?.Additional2));
             cmd.Parameters.AddWithValue("booking_template_key", BuildBookingTemplateKey(payload.Services));
             cmd.Parameters.AddWithValue("booking_email_required", payload.Services?.BookingEmailRequired ?? true);
-            cmd.Parameters.AddWithValue("terms_required", payload.Services?.TermsRequired ?? true);
+            cmd.Parameters.AddWithValue("terms_required", payload.Services?.TermsRequired ?? ShouldRequireTermsForBooking(payload.Services));
             cmd.Parameters.AddWithValue("invoice_required", payload.Services?.InvoiceRequired ?? true);
             cmd.Parameters.AddWithValue("calendar_required", payload.Services?.CalendarRequired ?? true);
             cmd.Parameters.AddWithValue("report_required", payload.Services?.ReportRequired ?? true);
@@ -7158,6 +7255,35 @@ static string FindJsonStringRecursive(JsonElement element, params string[] prope
     return "";
 }
 
+static async Task<(HttpResponseMessage? Response, string Json, string Endpoint)> LookupSignNowTemplatesAsync(HttpClient httpClient)
+{
+    var endpoints = new[]
+    {
+        "https://api.signnow.com/template",
+        "https://api.signnow.com/user/documents?type=template",
+        "https://api.signnow.com/user/documentsv2?type=template"
+    };
+
+    HttpResponseMessage? lastResponse = null;
+    string lastJson = "";
+    string lastEndpoint = endpoints[0];
+
+    foreach (var endpoint in endpoints)
+    {
+        lastEndpoint = endpoint;
+        lastResponse = await httpClient.GetAsync(endpoint);
+        lastJson = await lastResponse.Content.ReadAsStringAsync();
+
+        if (lastResponse.IsSuccessStatusCode)
+            return (lastResponse, lastJson, endpoint);
+
+        if ((int)lastResponse.StatusCode != StatusCodes.Status405MethodNotAllowed)
+            break;
+    }
+
+    return (lastResponse, lastJson, lastEndpoint);
+}
+
 static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root)
 {
     var templates = new List<SignNowTemplateResult>();
@@ -7331,7 +7457,7 @@ CREATE TABLE IF NOT EXISTS public.inspector_service_catalog
     booking_template_key text NOT NULL DEFAULT 'general_booking',
     pricing_affects boolean NOT NULL DEFAULT true,
     booking_email_required boolean NOT NULL DEFAULT true,
-    terms_required boolean NOT NULL DEFAULT true,
+    terms_required boolean NOT NULL DEFAULT false,
     invoice_required boolean NOT NULL DEFAULT true,
     calendar_required boolean NOT NULL DEFAULT true,
     report_required boolean NOT NULL DEFAULT true,
@@ -7359,7 +7485,7 @@ ALTER TABLE public.inspector_service_catalog
 ADD COLUMN IF NOT EXISTS booking_email_required boolean NOT NULL DEFAULT true;
 
 ALTER TABLE public.inspector_service_catalog
-ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT true;
+ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.inspector_service_catalog
 ADD COLUMN IF NOT EXISTS invoice_required boolean NOT NULL DEFAULT true;
@@ -7559,7 +7685,7 @@ DO UPDATE SET
     cmd.Parameters.AddWithValue("booking_template_key", string.IsNullOrWhiteSpace(item.BookingTemplateKey) ? "general_booking" : item.BookingTemplateKey);
     cmd.Parameters.AddWithValue("pricing_affects", item.PricingAffects);
     cmd.Parameters.AddWithValue("booking_email_required", item.BookingEmailRequired);
-    cmd.Parameters.AddWithValue("terms_required", item.TermsRequired);
+    cmd.Parameters.AddWithValue("terms_required", item.TermsRequired ?? ShouldRequireTermsForService(item));
     cmd.Parameters.AddWithValue("invoice_required", item.InvoiceRequired);
     cmd.Parameters.AddWithValue("calendar_required", item.CalendarRequired);
     cmd.Parameters.AddWithValue("report_required", item.ReportRequired);
@@ -8560,6 +8686,42 @@ static string BuildBookingTemplateKey(ServicesSection? services)
     return keys.Count == 0 ? "general_booking" : string.Join("_", keys);
 }
 
+static bool ShouldRequireTermsForBooking(ServicesSection? services)
+{
+    if (services == null)
+        return false;
+
+    var bookingTemplateKey = BuildBookingTemplateKey(services);
+    if (IsBuildingInspectionTermsKey(bookingTemplateKey))
+        return true;
+
+    return IsBuildingInspectionTermsKey(services.PrimaryServiceKey)
+        || IsBuildingInspectionTermsKey(InferCanonicalServiceType(services.Primary));
+}
+
+static bool ShouldRequireTermsForService(ServiceCatalogItemInput item)
+{
+    return IsBuildingInspectionTermsKey(item.BookingTemplateKey)
+        || IsBuildingInspectionTermsKey(item.CanonicalServiceType)
+        || IsBuildingInspectionTermsKey(item.ListItemName)
+        || IsBuildingInspectionTermsKey(item.InvoiceItemName);
+}
+
+static bool IsBuildingInspectionTermsKey(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return false;
+
+    var normalized = NormalizeServiceTypeKey(value);
+    if (normalized == "building_inspection"
+        || normalized.StartsWith("building_inspection_", StringComparison.OrdinalIgnoreCase))
+        return true;
+
+    var inferred = NormalizeServiceTypeKey(InferCanonicalServiceType(value));
+    return inferred == "building_inspection"
+        || inferred.StartsWith("building_inspection_", StringComparison.OrdinalIgnoreCase);
+}
+
 static string InferCanonicalServiceType(string? serviceName)
 {
     if (string.IsNullOrWhiteSpace(serviceName))
@@ -8700,7 +8862,10 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS booking_email_required boolean NOT NULL DEFAULT true;
 
 ALTER TABLE public.jobs_staging
-ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT true;
+ADD COLUMN IF NOT EXISTS terms_required boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.jobs_staging
+ALTER COLUMN terms_required SET DEFAULT false;
 
 ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS invoice_required boolean NOT NULL DEFAULT true;
@@ -8943,6 +9108,15 @@ public record TermsFailureRequest(string ErrorMessage);
 public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
+public class JobWorkflowRequirementsRequest
+{
+    public bool? BookingEmailRequired { get; set; }
+    public bool? TermsRequired { get; set; }
+    public bool? InvoiceRequired { get; set; }
+    public bool? CalendarRequired { get; set; }
+    public bool? ReportRequired { get; set; }
+}
+
 public record WorkflowActionSeed(
     Guid JobId,
     Guid TenantId,
@@ -9003,7 +9177,7 @@ public class ServiceCatalogItemInput
     public string BookingTemplateKey { get; set; } = "general_booking";
     public bool PricingAffects { get; set; } = true;
     public bool BookingEmailRequired { get; set; } = true;
-    public bool TermsRequired { get; set; } = true;
+    public bool? TermsRequired { get; set; }
     public bool InvoiceRequired { get; set; } = true;
     public bool CalendarRequired { get; set; } = true;
     public bool ReportRequired { get; set; } = true;
