@@ -2120,26 +2120,26 @@ app.MapGet("/integrations/signnow/templates", async () =>
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
         httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        var (response, json, lookupUrl) = await LookupSignNowTemplatesAsync(httpClient);
-        if (response == null || !response.IsSuccessStatusCode)
+        var lookup = await LookupSignNowTemplatesAsync(httpClient);
+        if (lookup.SuccessfulEndpointCount == 0)
         {
             return Results.Problem(
                 title: "SignNow templates lookup failed",
                 detail: JsonSerializer.Serialize(new
                 {
-                    endpoint = lookupUrl,
-                    response = json
+                    endpoint = lookup.LastEndpoint,
+                    statusCode = lookup.LastStatusCode,
+                    response = lookup.LastResponse,
+                    diagnostics = lookup.Diagnostics
                 }),
                 statusCode: 500);
         }
 
-        var root = JsonDocument.Parse(json).RootElement;
-        var templates = ExtractSignNowTemplates(root);
-
         return Results.Ok(new
         {
             success = true,
-            templates
+            templates = lookup.Templates,
+            diagnostics = lookup.Diagnostics
         });
     }
     catch (Exception ex)
@@ -6480,9 +6480,7 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         return ScheduleActionResult.Failed("terms", "Client email is missing.");
     }
 
-    var templateKey = string.IsNullOrWhiteSpace(job.BookingTemplateKey)
-        ? "general_booking"
-        : job.BookingTemplateKey.Trim();
+    var templateKey = ResolveSignNowTermsTemplateKey(job.BookingTemplateKey);
 
     var mapping = await GetSignNowTemplateMappingAsync(conn, templateKey);
     if (mapping == null || string.IsNullOrWhiteSpace(mapping.TemplateId))
@@ -7255,36 +7253,72 @@ static string FindJsonStringRecursive(JsonElement element, params string[] prope
     return "";
 }
 
-static async Task<(HttpResponseMessage? Response, string Json, string Endpoint)> LookupSignNowTemplatesAsync(HttpClient httpClient)
+static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpClient httpClient)
 {
     var endpoints = new[]
     {
-        "https://api.signnow.com/template",
-        "https://api.signnow.com/user/documents?type=template",
-        "https://api.signnow.com/user/documentsv2?type=template"
+        new SignNowTemplateEndpoint("template", "https://api.signnow.com/template"),
+        new SignNowTemplateEndpoint("user_documents_template", "https://api.signnow.com/user/documents?type=template"),
+        new SignNowTemplateEndpoint("user_documentsv2_template", "https://api.signnow.com/user/documentsv2?type=template")
     };
 
-    HttpResponseMessage? lastResponse = null;
+    var templates = new List<SignNowTemplateResult>();
+    var diagnostics = new List<object>();
+    var successfulEndpointCount = 0;
     string lastJson = "";
-    string lastEndpoint = endpoints[0];
+    string lastEndpoint = endpoints[0].Url;
+    int lastStatusCode = 0;
 
     foreach (var endpoint in endpoints)
     {
-        lastEndpoint = endpoint;
-        lastResponse = await httpClient.GetAsync(endpoint);
+        lastEndpoint = endpoint.Url;
+        var lastResponse = await httpClient.GetAsync(endpoint.Url);
         lastJson = await lastResponse.Content.ReadAsStringAsync();
+        lastStatusCode = (int)lastResponse.StatusCode;
 
         if (lastResponse.IsSuccessStatusCode)
-            return (lastResponse, lastJson, endpoint);
-
-        if ((int)lastResponse.StatusCode != StatusCodes.Status405MethodNotAllowed)
-            break;
+        {
+            successfulEndpointCount++;
+            var root = JsonDocument.Parse(lastJson).RootElement;
+            var endpointTemplates = ExtractSignNowTemplates(root, endpoint.Url, endpoint.SourceType);
+            templates.AddRange(endpointTemplates);
+            diagnostics.Add(new
+            {
+                endpoint = endpoint.Url,
+                sourceType = endpoint.SourceType,
+                statusCode = lastStatusCode,
+                success = true,
+                count = endpointTemplates.Count
+            });
+        }
+        else
+        {
+            diagnostics.Add(new
+            {
+                endpoint = endpoint.Url,
+                sourceType = endpoint.SourceType,
+                statusCode = lastStatusCode,
+                success = false,
+                count = 0,
+                response = TruncateForDiagnostics(lastJson, 1000)
+            });
+        }
     }
 
-    return (lastResponse, lastJson, lastEndpoint);
+    return new SignNowTemplateLookupResult(
+        templates
+            .GroupBy(template => template.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .OrderBy(template => template.Name)
+            .ToList(),
+        diagnostics.ToArray(),
+        successfulEndpointCount,
+        lastEndpoint,
+        lastStatusCode,
+        TruncateForDiagnostics(lastJson, 2000));
 }
 
-static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root)
+static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root, string sourceEndpoint, string sourceType)
 {
     var templates = new List<SignNowTemplateResult>();
     var arrays = new List<JsonElement>();
@@ -7314,7 +7348,9 @@ static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root)
             templates.Add(new SignNowTemplateResult(
                 id,
                 FirstNonEmptyJsonString(item, "name", "document_name", "template_name"),
-                FirstNonEmptyJsonString(item, "updated", "updated_at", "last_updated")));
+                FirstNonEmptyJsonString(item, "updated", "updated_at", "last_updated"),
+                sourceEndpoint,
+                sourceType));
         }
     }
 
@@ -7323,6 +7359,30 @@ static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root)
         .Select(group => group.First())
         .OrderBy(template => template.Name)
         .ToList();
+}
+
+static string ResolveSignNowTermsTemplateKey(string? value)
+{
+    var normalized = NormalizeServiceTypeKey(value);
+
+    if (normalized.StartsWith("building_inspection_", StringComparison.OrdinalIgnoreCase))
+        return "building_inspection";
+
+    return normalized switch
+    {
+        "meth_field_composite" => "meth_testing",
+        "meth_lab_composite" => "meth_testing",
+        "meth_individual_sample" => "meth_testing",
+        _ => normalized
+    };
+}
+
+static string TruncateForDiagnostics(string? value, int maxLength)
+{
+    if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+        return value ?? "";
+
+    return value.Substring(0, maxLength) + "...";
 }
 
 static string ExtractSignNowSignerRole(JsonElement document)
@@ -7702,8 +7762,10 @@ static string NormalizeServiceTypeKey(string? value)
 
     return normalized switch
     {
+        "investigation" => "building_investigation",
         "pre_purchase" => "building_inspection",
         "pre_sale" => "building_inspection",
+        "meth_test" => "meth_testing",
         "additional_outbuilding" => "garage_outbuilding",
         "council_file_review" => "property_file_review",
         _ => normalized
@@ -9304,7 +9366,21 @@ public record SignNowTemplateMappingResult(
 public record SignNowTemplateResult(
     string Id,
     string Name,
-    string UpdatedAt);
+    string UpdatedAt,
+    string SourceEndpoint,
+    string SourceType);
+
+public record SignNowTemplateEndpoint(
+    string SourceType,
+    string Url);
+
+public record SignNowTemplateLookupResult(
+    List<SignNowTemplateResult> Templates,
+    object[] Diagnostics,
+    int SuccessfulEndpointCount,
+    string LastEndpoint,
+    int LastStatusCode,
+    string LastResponse);
 
 public record ScheduleServiceInput(
     string Label,
