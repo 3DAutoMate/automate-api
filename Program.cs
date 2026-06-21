@@ -7306,11 +7306,7 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
     }
 
     return new SignNowTemplateLookupResult(
-        templates
-            .GroupBy(template => template.Id, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.First())
-            .OrderBy(template => template.Name)
-            .ToList(),
+        GroupSignNowTemplatesByName(templates),
         diagnostics.ToArray(),
         successfulEndpointCount,
         lastEndpoint,
@@ -7359,6 +7355,32 @@ static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root, str
         .Select(group => group.First())
         .OrderBy(template => template.Name)
         .ToList();
+}
+
+static List<SignNowTemplateResult> GroupSignNowTemplatesByName(IEnumerable<SignNowTemplateResult> templates)
+{
+    return templates
+        .Where(template => !string.IsNullOrWhiteSpace(template.Id))
+        .GroupBy(template => NormalizeSignNowTemplateName(template.Name), StringComparer.OrdinalIgnoreCase)
+        .Select(group => group
+            .OrderByDescending(template => ParseSignNowUpdatedAt(template.UpdatedAt))
+            .ThenBy(template => template.Id)
+            .First())
+        .OrderBy(template => template.Name)
+        .ToList();
+}
+
+static string NormalizeSignNowTemplateName(string? name)
+{
+    if (string.IsNullOrWhiteSpace(name))
+        return "";
+
+    return Regex.Replace(name.Trim(), "\\s+", " ");
+}
+
+static long ParseSignNowUpdatedAt(string? value)
+{
+    return long.TryParse(value, out var parsed) ? parsed : 0;
 }
 
 static string ResolveSignNowTermsTemplateKey(string? value)
