@@ -2151,66 +2151,6 @@ app.MapGet("/integrations/signnow/templates", async () =>
     }
 });
 
-// =============================
-// SIGNNOW TEMPLATE LOCATION PROBE
-// =============================
-app.MapGet("/integrations/signnow/template-location-probe", async (string ids) =>
-{
-    try
-    {
-        var requestedIds = (ids ?? "")
-            .Split(new[] { ',', ';', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(id => id.Trim())
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (requestedIds.Length == 0)
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "Provide one or more SignNow IDs in the ids query string."
-            });
-        }
-
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await EnsureInspectorIntegrationsTableAsync(conn);
-
-        var account = await GetSignNowAccountAsync(conn, builder.Configuration);
-        if (!account.Success)
-        {
-            return Results.Problem(
-                title: "SignNow is not connected",
-                detail: account.ErrorMessage,
-                statusCode: 400);
-        }
-
-        using var httpClient = new HttpClient();
-        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
-        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-
-        var probes = new List<object>();
-        foreach (var requestedId in requestedIds)
-        {
-            probes.Add(await ProbeSignNowIdAsync(httpClient, requestedId));
-        }
-
-        return Results.Ok(new
-        {
-            success = true,
-            probes
-        });
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem(
-            title: "SignNow template location probe failed",
-            detail: ex.ToString(),
-            statusCode: 500);
-    }
-});
 
 // =============================
 // SIGNNOW TEMPLATE MAPPINGS
@@ -6574,8 +6514,20 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
 
     if (!copyResponse.IsSuccessStatusCode)
     {
+        copyResponse = await httpClient.PostAsJsonAsync(
+            $"https://api.signnow.com/document/{Uri.EscapeDataString(mapping.TemplateId)}/copy",
+            new
+            {
+                document_name = documentName,
+                name = documentName
+            });
+        copyJson = await copyResponse.Content.ReadAsStringAsync();
+    }
+
+    if (!copyResponse.IsSuccessStatusCode)
+    {
         await MarkTermsFailedAsync(conn, job.JobId, copyJson);
-        return ScheduleActionResult.Failed("terms", "SignNow template copy failed: " + copyJson);
+        return ScheduleActionResult.Failed("terms", "SignNow template/document copy failed: " + copyJson);
     }
 
     var copyDoc = JsonDocument.Parse(copyJson).RootElement;
@@ -7317,30 +7269,20 @@ static string FindJsonStringRecursive(JsonElement element, params string[] prope
 static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpClient httpClient)
 {
     var signNowTermsParentId = "274f64b07a6e4d3bb14a0e7f6b51086d983d4240";
-    var endpoints = new[]
-    {
-        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
-        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_page", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=1&limit=100"),
-        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_page2", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=2&limit=100"),
-        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_per_page", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=1&per_page=100"),
-        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_page2_per_page", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=2&per_page=100"),
-        new SignNowTemplateEndpoint("terms_parent_documentsv2_folder_id", $"https://api.signnow.com/user/documentsv2?folder_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
-        new SignNowTemplateEndpoint("terms_parent_documents_parent_id", $"https://api.signnow.com/user/documents?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
-        new SignNowTemplateEndpoint("terms_parent_documents_folder_id", $"https://api.signnow.com/user/documents?folder_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
-        new SignNowTemplateEndpoint("template", "https://api.signnow.com/template"),
-        new SignNowTemplateEndpoint("user_documents_template", "https://api.signnow.com/user/documents?type=template"),
-        new SignNowTemplateEndpoint("user_documentsv2_template", "https://api.signnow.com/user/documentsv2?type=template")
-    };
-
     var templates = new List<SignNowTemplateResult>();
     var diagnostics = new List<object>();
     var successfulEndpointCount = 0;
     string lastJson = "";
-    string lastEndpoint = endpoints[0].Url;
+    string lastEndpoint = "";
     int lastStatusCode = 0;
 
-    foreach (var endpoint in endpoints)
+    const int pageSize = 100;
+    for (var page = 1; page <= 10; page++)
     {
+        var endpoint = new SignNowTemplateEndpoint(
+            "terms_parent_documentsv2",
+            $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page={page}&per_page={pageSize}");
+
         lastEndpoint = endpoint.Url;
         var lastResponse = await httpClient.GetAsync(endpoint.Url);
         lastJson = await lastResponse.Content.ReadAsStringAsync();
@@ -7351,6 +7293,7 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
             successfulEndpointCount++;
             var root = JsonDocument.Parse(lastJson).RootElement;
             var endpointTemplates = ExtractSignNowTemplates(root, endpoint.Url, endpoint.SourceType);
+            var rawCount = CountSignNowArrayItems(root);
             templates.AddRange(endpointTemplates);
             diagnostics.Add(new
             {
@@ -7358,8 +7301,12 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
                 sourceType = endpoint.SourceType,
                 statusCode = lastStatusCode,
                 success = true,
-                count = endpointTemplates.Count
+                count = endpointTemplates.Count,
+                rawCount
             });
+
+            if (rawCount < pageSize)
+                break;
         }
         else
         {
@@ -7372,19 +7319,24 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
                 count = 0,
                 response = TruncateForDiagnostics(lastJson, 1000)
             });
+
+            break;
         }
     }
 
-    var preferredTemplates = templates.Any(template => template.SourceType.StartsWith("terms_parent_documentsv2_parent_id", StringComparison.OrdinalIgnoreCase))
-        ? templates.Where(template => template.SourceType.StartsWith("terms_parent_documentsv2_parent_id", StringComparison.OrdinalIgnoreCase))
-        : templates.Any(template => string.Equals(template.SourceType, "terms_parent_documentsv2_folder_id", StringComparison.OrdinalIgnoreCase))
-            ? templates.Where(template => string.Equals(template.SourceType, "terms_parent_documentsv2_folder_id", StringComparison.OrdinalIgnoreCase))
-            : templates.Any(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
-        ? templates.Where(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
-        : templates;
+    if (templates.Count == 0)
+    {
+        var fallback = await LookupSignNowTemplateFallbacksAsync(httpClient);
+        templates.AddRange(fallback.Templates);
+        diagnostics.AddRange(fallback.Diagnostics);
+        successfulEndpointCount += fallback.SuccessfulEndpointCount;
+        lastEndpoint = fallback.LastEndpoint;
+        lastStatusCode = fallback.LastStatusCode;
+        lastJson = fallback.LastResponse;
+    }
 
     return new SignNowTemplateLookupResult(
-        GroupSignNowTemplatesByName(preferredTemplates),
+        GroupSignNowTemplatesByName(templates),
         diagnostics.ToArray(),
         successfulEndpointCount,
         lastEndpoint,
@@ -7392,65 +7344,85 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
         TruncateForDiagnostics(lastJson, 2000));
 }
 
-static async Task<object> ProbeSignNowIdAsync(HttpClient httpClient, string id)
+
+static async Task<SignNowTemplateLookupResult> LookupSignNowTemplateFallbacksAsync(HttpClient httpClient)
 {
     var endpoints = new[]
     {
-        new SignNowTemplateEndpoint("template_by_id", $"https://api.signnow.com/template/{Uri.EscapeDataString(id)}"),
-        new SignNowTemplateEndpoint("document_by_id", $"https://api.signnow.com/document/{Uri.EscapeDataString(id)}"),
-        new SignNowTemplateEndpoint("document_group_by_id", $"https://api.signnow.com/documentgroup/{Uri.EscapeDataString(id)}"),
-        new SignNowTemplateEndpoint("user_document_by_id", $"https://api.signnow.com/user/document/{Uri.EscapeDataString(id)}")
+        new SignNowTemplateEndpoint("template", "https://api.signnow.com/template"),
+        new SignNowTemplateEndpoint("user_documents_template", "https://api.signnow.com/user/documents?type=template"),
+        new SignNowTemplateEndpoint("user_documentsv2_template", "https://api.signnow.com/user/documentsv2?type=template")
     };
 
-    var results = new List<object>();
+    var templates = new List<SignNowTemplateResult>();
+    var diagnostics = new List<object>();
+    var successfulEndpointCount = 0;
+    string lastJson = "";
+    string lastEndpoint = "";
+    int lastStatusCode = 0;
+
     foreach (var endpoint in endpoints)
     {
+        lastEndpoint = endpoint.Url;
         var response = await httpClient.GetAsync(endpoint.Url);
-        var json = await response.Content.ReadAsStringAsync();
-        object? metadata = null;
+        lastJson = await response.Content.ReadAsStringAsync();
+        lastStatusCode = (int)response.StatusCode;
 
-        if (response.IsSuccessStatusCode && !string.IsNullOrWhiteSpace(json))
+        if (response.IsSuccessStatusCode)
         {
-            using var doc = JsonDocument.Parse(json);
-            metadata = BuildSignNowProbeMetadata(doc.RootElement);
+            successfulEndpointCount++;
+            var root = JsonDocument.Parse(lastJson).RootElement;
+            var endpointTemplates = ExtractSignNowTemplates(root, endpoint.Url, endpoint.SourceType);
+            templates.AddRange(endpointTemplates);
+            diagnostics.Add(new
+            {
+                endpoint = endpoint.Url,
+                sourceType = endpoint.SourceType,
+                statusCode = lastStatusCode,
+                success = true,
+                count = endpointTemplates.Count,
+                rawCount = CountSignNowArrayItems(root)
+            });
         }
-
-        results.Add(new
+        else
         {
-            sourceType = endpoint.SourceType,
-            endpoint = endpoint.Url,
-            statusCode = (int)response.StatusCode,
-            success = response.IsSuccessStatusCode,
-            metadata,
-            response = response.IsSuccessStatusCode ? null : TruncateForDiagnostics(json, 1000)
-        });
+            diagnostics.Add(new
+            {
+                endpoint = endpoint.Url,
+                sourceType = endpoint.SourceType,
+                statusCode = lastStatusCode,
+                success = false,
+                count = 0,
+                rawCount = 0,
+                response = TruncateForDiagnostics(lastJson, 1000)
+            });
+        }
     }
 
-    return new
-    {
-        id,
-        results
-    };
+    return new SignNowTemplateLookupResult(
+        templates,
+        diagnostics.ToArray(),
+        successfulEndpointCount,
+        lastEndpoint,
+        lastStatusCode,
+        TruncateForDiagnostics(lastJson, 2000));
 }
 
-static object BuildSignNowProbeMetadata(JsonElement root)
+static int CountSignNowArrayItems(JsonElement root)
 {
-    return new
+    if (root.ValueKind == JsonValueKind.Array)
+        return root.GetArrayLength();
+
+    if (root.ValueKind == JsonValueKind.Object)
     {
-        id = FirstNonEmptyJsonString(root, "id", "template_id", "document_id", "unique_id"),
-        name = FirstNonEmptyJsonString(root, "name", "document_name", "template_name"),
-        type = FirstNonEmptyJsonString(root, "type", "document_type"),
-        status = FirstNonEmptyJsonString(root, "status", "document_status"),
-        folderId = FirstNonEmptyJsonString(root, "folder_id", "folderId"),
-        parentId = FirstNonEmptyJsonString(root, "parent_id", "parentId"),
-        groupId = FirstNonEmptyJsonString(root, "document_group_id", "documentGroupId", "group_id"),
-        templateId = FirstNonEmptyJsonString(root, "template_id", "templateId"),
-        template = FirstNonEmptyJsonString(root, "template"),
-        updatedAt = FirstNonEmptyJsonString(root, "updated", "updated_at", "last_updated"),
-        topLevelKeys = root.ValueKind == JsonValueKind.Object
-            ? root.EnumerateObject().Select(property => property.Name).Take(80).ToArray()
-            : Array.Empty<string>()
-    };
+        foreach (var name in new[] { "templates", "data", "documents" })
+        {
+            if (root.TryGetProperty(name, out var array) && array.ValueKind == JsonValueKind.Array)
+                return array.GetArrayLength();
+        }
+    }
+
+    return 0;
 }
 
 static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root, string sourceEndpoint, string sourceType)
@@ -9731,4 +9703,3 @@ public class MetaSection
     public string ConnectorVersion { get; set; } = "";
     public string SourceInstance { get; set; } = "";
 }
-
