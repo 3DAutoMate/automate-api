@@ -375,6 +375,15 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS hhs_compliance text NULL;
 
 ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS notes text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS directions text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS instructions text NULL;
+
+ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS contact1_salutation text NULL;
 
 ALTER TABLE public.jobs_staging
@@ -1602,7 +1611,7 @@ app.MapGet("/integrations/google/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email";
+    var scopes = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/userinfo.email";
 
     var url =
         "https://accounts.google.com/o/oauth2/v2/auth" +
@@ -1846,6 +1855,145 @@ LIMIT 1;";
     {
         return Results.Problem(
             title: "Google status failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapGet("/integrations/google/calendars", async (string inspectorId) =>
+{
+    try
+    {
+        if (!Guid.TryParse(inspectorId.Trim(), out Guid parsedInspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid inspectorId"
+            });
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        var account = await GetGoogleCalendarAccountAsync(conn, parsedInspectorId, builder.Configuration);
+        if (!account.Success)
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = account.ErrorMessage ?? "Google Calendar is not connected."
+            });
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+
+        var response = await httpClient.GetAsync("https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=writer");
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return Results.Problem(
+                title: "Google calendars failed",
+                detail: body,
+                statusCode: (int)response.StatusCode
+            );
+        }
+
+        var selectedCalendarId = string.IsNullOrWhiteSpace(account.CalendarId) ? "primary" : account.CalendarId;
+        var doc = JsonDocument.Parse(body).RootElement;
+        var calendars = new List<object>();
+
+        if (doc.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in items.EnumerateArray())
+            {
+                var id = GetJsonString(item, "id");
+                if (string.IsNullOrWhiteSpace(id))
+                    continue;
+
+                calendars.Add(new
+                {
+                    id,
+                    summary = GetJsonString(item, "summary"),
+                    primary = item.TryGetProperty("primary", out var primaryProp) && primaryProp.ValueKind == JsonValueKind.True,
+                    selected = string.Equals(id, selectedCalendarId, StringComparison.OrdinalIgnoreCase)
+                });
+            }
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            selectedCalendarId,
+            calendars
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Google calendars failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapPost("/integrations/google/calendar", async (GoogleCalendarSelectionRequest request) =>
+{
+    try
+    {
+        if (!Guid.TryParse(request.InspectorId?.Trim(), out Guid parsedInspectorId))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Invalid inspectorId"
+            });
+        }
+
+        var calendarId = string.IsNullOrWhiteSpace(request.CalendarId) ? "primary" : request.CalendarId.Trim();
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.inspector_integrations
+SET
+    external_tenant_id = @calendar_id,
+    updated_at = NOW()
+WHERE inspector_id = @inspector_id
+  AND provider = 'google'
+  AND status = 'connected';";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", parsedInspectorId);
+        cmd.Parameters.AddWithValue("calendar_id", calendarId);
+        var updated = await cmd.ExecuteNonQueryAsync();
+
+        if (updated == 0)
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Google Calendar is not connected for this inspector."
+            });
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            calendarId
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Save Google calendar failed",
             detail: ex.ToString(),
             statusCode: 500
         );
@@ -4966,6 +5114,9 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     hhs_reinspect_date text,
     access_by text,
     hhs_compliance text,
+    notes text,
+    directions text,
+    instructions text,
     contact1_salutation text,
     contact1_first_name text,
     contact1_last_name text,
@@ -5053,6 +5204,9 @@ INSERT INTO public.jobs_staging
     hhs_reinspect_date,
     access_by,
     hhs_compliance,
+    notes,
+    directions,
+    instructions,
     contact1_salutation,
     contact1_first_name,
     contact1_last_name,
@@ -5117,6 +5271,9 @@ VALUES
     @hhs_reinspect_date,
     @access_by,
     @hhs_compliance,
+    @notes,
+    @directions,
+    @instructions,
     @contact1_salutation,
     @contact1_first_name,
     @contact1_last_name,
@@ -5180,6 +5337,9 @@ DO UPDATE SET
     hhs_reinspect_date           = EXCLUDED.hhs_reinspect_date,
     access_by                    = EXCLUDED.access_by,
     hhs_compliance               = EXCLUDED.hhs_compliance,
+    notes                        = EXCLUDED.notes,
+    directions                   = EXCLUDED.directions,
+    instructions                 = EXCLUDED.instructions,
     contact1_salutation          = EXCLUDED.contact1_salutation,
     contact1_first_name          = EXCLUDED.contact1_first_name,
     contact1_last_name           = EXCLUDED.contact1_last_name,
@@ -5251,6 +5411,9 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("hhs_reinspect_date", payload.JobDetails?.HhsReinspectDate ?? "");
             cmd.Parameters.AddWithValue("access_by", payload.JobDetails?.AccessBy ?? "");
             cmd.Parameters.AddWithValue("hhs_compliance", payload.JobDetails?.HhsCompliance ?? "");
+            cmd.Parameters.AddWithValue("notes", payload.Job.Notes ?? "");
+            cmd.Parameters.AddWithValue("directions", payload.Job.Directions ?? "");
+            cmd.Parameters.AddWithValue("instructions", payload.Job.Instructions ?? "");
             cmd.Parameters.AddWithValue("contact1_salutation", payload.Contact1?.Salutation ?? "");
             cmd.Parameters.AddWithValue("contact1_first_name", payload.Contact1?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact1_last_name", payload.Contact1?.LastName ?? "");
@@ -6196,12 +6359,24 @@ SELECT
     j.invoice_required,
     j.calendar_required,
     j.calendar_created,
+    j.notes,
+    j.directions,
+    j.instructions,
+    j.age_of_building,
+    j.stories,
+    j.bedrooms,
+    j.bathrooms,
+    j.monolithic,
+    j.foundation_space,
+    j.access_by,
     j.contact1_first_name,
     j.contact1_last_name,
     j.contact1_email,
+    j.contact1_cellular,
     j.contact2_first_name,
     j.contact2_last_name,
     j.contact2_email,
+    j.contact2_cellular,
     COALESCE(i.timezone, 'Pacific/Auckland') AS timezone,
     i.company_name,
     i.email_from_name,
@@ -6246,10 +6421,22 @@ LIMIT 1;";
         reader["invoice_required"] != DBNull.Value && Convert.ToBoolean(reader["invoice_required"]),
         reader["calendar_required"] != DBNull.Value && Convert.ToBoolean(reader["calendar_required"]),
         reader["calendar_created"] != DBNull.Value && Convert.ToBoolean(reader["calendar_created"]),
+        reader["notes"]?.ToString() ?? "",
+        reader["directions"]?.ToString() ?? "",
+        reader["instructions"]?.ToString() ?? "",
+        reader["age_of_building"]?.ToString() ?? "",
+        reader["stories"]?.ToString() ?? "",
+        reader["bedrooms"]?.ToString() ?? "",
+        reader["bathrooms"]?.ToString() ?? "",
+        reader["monolithic"]?.ToString() ?? "",
+        reader["foundation_space"]?.ToString() ?? "",
+        reader["access_by"]?.ToString() ?? "",
         BuildPersonName(reader["contact1_first_name"]?.ToString(), reader["contact1_last_name"]?.ToString()),
         reader["contact1_email"]?.ToString() ?? "",
+        reader["contact1_cellular"]?.ToString() ?? "",
         BuildPersonName(reader["contact2_first_name"]?.ToString(), reader["contact2_last_name"]?.ToString()),
         reader["contact2_email"]?.ToString() ?? "",
+        reader["contact2_cellular"]?.ToString() ?? "",
         reader["timezone"]?.ToString() ?? "Pacific/Auckland",
         reader["company_name"]?.ToString() ?? "",
         reader["email_from_name"]?.ToString() ?? "",
@@ -6835,14 +7022,13 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
     if (!string.IsNullOrWhiteSpace(job.SiteAddress))
         summary += " - " + job.SiteAddress.Trim();
 
+    var invoiceLines = await LoadXeroInvoiceLinesAsync(conn, job.JobId);
+
     var eventPayload = new
     {
         summary,
         location = job.SiteAddress,
-        description =
-            "Created by 3D AutoMate." +
-            (string.IsNullOrWhiteSpace(job.ClientName) ? "" : "\nClient: " + job.ClientName) +
-            (string.IsNullOrWhiteSpace(job.ClientEmail) ? "" : "\nClient email: " + job.ClientEmail),
+        description = BuildGoogleCalendarDescription(job, invoiceLines),
         start = new
         {
             dateTime = start.ToUniversalTime().ToString("O"),
@@ -6880,6 +7066,83 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
         eventId = GetJsonString(created, "id"),
         htmlLink = GetJsonString(created, "htmlLink")
     });
+}
+
+static string BuildGoogleCalendarDescription(ScheduleJobInput job, List<XeroInvoiceLineInput> invoiceLines)
+{
+    var sb = new StringBuilder();
+    var addOns = BuildCalendarAddOns(job, invoiceLines);
+    var additionalServices = JoinNonEmpty(job.Additional1, job.Additional2);
+
+    AppendDescriptionLine(sb, "Client Name", job.ClientName);
+    AppendDescriptionLine(sb, "Client Phone", job.ClientPhone);
+    AppendDescriptionLine(sb, "Service", job.PrimaryService);
+    AppendDescriptionLine(sb, "Service Add-ons", addOns);
+    AppendDescriptionLine(sb, "Additional Service(s)", additionalServices);
+    AppendDescriptionLine(sb, "Client Concerns", job.Notes);
+    AppendDescriptionLine(sb, "Directions", job.Directions);
+    AppendDescriptionLine(sb, "Access Instructions", job.Instructions);
+
+    var agentDetails = JoinNonEmpty(job.AgentName, job.AgentPhone, job.AgentEmail);
+    AppendDescriptionLine(sb, "Agent Details", agentDetails);
+    AppendDescriptionLine(sb, "Access By", job.AccessBy);
+
+    if (sb.Length > 0)
+        sb.AppendLine();
+
+    sb.AppendLine("Building Details:");
+    AppendDescriptionLine(sb, "Age", job.AgeOfBuilding);
+    AppendDescriptionLine(sb, "Levels", job.Stories);
+    AppendDescriptionLine(sb, "Bedrooms", job.Bedrooms);
+    AppendDescriptionLine(sb, "Bathrooms", job.Bathrooms);
+    AppendDescriptionLine(sb, "Plaster Cladding?", job.Monolithic);
+    AppendDescriptionLine(sb, "Foundation Space?", job.FoundationSpace);
+
+    if (sb.Length > 0)
+        sb.AppendLine();
+
+    sb.Append("Created by 3D AutoMate.");
+    return sb.ToString().Trim();
+}
+
+static string BuildCalendarAddOns(ScheduleJobInput job, List<XeroInvoiceLineInput> invoiceLines)
+{
+    var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    AddIfNotEmpty(excluded, job.PrimaryService);
+    AddIfNotEmpty(excluded, job.Additional1);
+    AddIfNotEmpty(excluded, job.Additional2);
+
+    var values = invoiceLines
+        .Select(line => (line.Description ?? "").Trim())
+        .Where(description => !string.IsNullOrWhiteSpace(description))
+        .Where(description => !excluded.Contains(description))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    return values.Length == 0 ? "" : string.Join(", ", values);
+}
+
+static void AddIfNotEmpty(HashSet<string> values, string? value)
+{
+    if (!string.IsNullOrWhiteSpace(value))
+        values.Add(value.Trim());
+}
+
+static void AppendDescriptionLine(StringBuilder sb, string label, string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return;
+
+    sb.Append(label);
+    sb.Append(": ");
+    sb.AppendLine(value.Trim());
+}
+
+static string JoinNonEmpty(params string?[] values)
+{
+    return string.Join(", ", values
+        .Select(value => value?.Trim() ?? "")
+        .Where(value => !string.IsNullOrWhiteSpace(value)));
 }
 
 static async Task<IntegrationAccountResult> GetMicrosoftMailAccountAsync(
@@ -9333,6 +9596,7 @@ public record TermsFailureRequest(string ErrorMessage);
 public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
+public record GoogleCalendarSelectionRequest(string InspectorId, string CalendarId);
 public class JobWorkflowRequirementsRequest
 {
     public bool? BookingEmailRequired { get; set; }
@@ -9576,10 +9840,22 @@ public record ScheduleJobInput(
     bool InvoiceRequired,
     bool CalendarRequired,
     bool CalendarCreated,
+    string Notes,
+    string Directions,
+    string Instructions,
+    string AgeOfBuilding,
+    string Stories,
+    string Bedrooms,
+    string Bathrooms,
+    string Monolithic,
+    string FoundationSpace,
+    string AccessBy,
     string ClientName,
     string ClientEmail,
+    string ClientPhone,
     string AgentName,
     string AgentEmail,
+    string AgentPhone,
     string Timezone,
     string CompanyName,
     string EmailFromName,
@@ -9617,6 +9893,9 @@ public class JobSection
     public string ZapProcessed { get; set; } = "";
     public string ReportSent { get; set; } = "";
     public string InvoiceTotal { get; set; } = "";
+    public string Notes { get; set; } = "";
+    public string Directions { get; set; } = "";
+    public string Instructions { get; set; } = "";
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtraFields { get; set; }
 
