@@ -2627,6 +2627,371 @@ app.MapGet("/email-templates/service-types", () => Results.Ok(new
 // EMAIL TEMPLATE MAKER UI
 // =============================
 app.MapGet("/email-template-maker", () => Results.Content(GetEmailTemplateMakerHtml(), "text/html"));
+
+// =============================
+// EMAIL SENDER MODE
+// =============================
+app.MapGet("/integrations/email/status", async (Guid inspectorId) =>
+{
+    try
+    {
+        if (inspectorId == Guid.Empty)
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "InspectorId is required."
+            });
+        }
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorsTableAsync(conn);
+
+        const string sql = @"
+SELECT COALESCE(email_sender_mode, 'microsoft') AS email_sender_mode
+FROM public.inspectors
+WHERE inspector_id = @inspector_id
+LIMIT 1;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+
+        var result = await cmd.ExecuteScalarAsync();
+        var senderMode = NormalizeEmailSenderMode(result?.ToString());
+
+        return Results.Ok(new
+        {
+            success = true,
+            inspectorId,
+            senderMode,
+            senderModeLabel = GetEmailSenderModeLabel(senderMode),
+            cloudCanSend = !IsSmtpEmailSenderMode(senderMode)
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Email sender status failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapPost("/integrations/email/sender-mode", async (EmailSenderModeRequest request) =>
+{
+    try
+    {
+        if (!Guid.TryParse(request.InspectorId, out var inspectorId) || inspectorId == Guid.Empty)
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "Valid InspectorId is required."
+            });
+        }
+
+        var senderMode = NormalizeEmailSenderMode(request.SenderMode);
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorsTableAsync(conn);
+
+        const string sql = @"
+UPDATE public.inspectors
+SET
+    email_sender_mode = @email_sender_mode,
+    updated_at = NOW()
+WHERE inspector_id = @inspector_id;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("email_sender_mode", senderMode);
+        cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+        var rows = await cmd.ExecuteNonQueryAsync();
+
+        return Results.Ok(new
+        {
+            success = rows > 0,
+            updated = rows,
+            inspectorId,
+            senderMode,
+            senderModeLabel = GetEmailSenderModeLabel(senderMode),
+            cloudCanSend = !IsSmtpEmailSenderMode(senderMode)
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Email sender mode save failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+// =============================
+// EMAIL TEMPLATE CRUD / RENDER / SEND
+// =============================
+app.MapGet("/inspectors/{inspectorId}/email-templates/{templateType}", async (Guid inspectorId, string templateType, string? serviceTypeKey) =>
+{
+    try
+    {
+        if (inspectorId == Guid.Empty)
+            return Results.BadRequest(new { success = false, message = "InspectorId is required." });
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn);
+
+        var normalizedTemplateType = NormalizeTemplateType(templateType);
+        var normalizedServiceTypeKey = NormalizeServiceTypeKey(serviceTypeKey);
+        var template = await LoadEmailTemplateAsync(conn, inspectorId, normalizedTemplateType, normalizedServiceTypeKey);
+
+        return Results.Ok(new
+        {
+            success = true,
+            template
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Load email template failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapPut("/inspectors/{inspectorId}/email-templates/{templateType}", async (Guid inspectorId, string templateType, EmailTemplateSaveRequest request) =>
+{
+    try
+    {
+        if (inspectorId == Guid.Empty)
+            return Results.BadRequest(new { success = false, message = "InspectorId is required." });
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn);
+
+        var normalizedTemplateType = NormalizeTemplateType(templateType);
+        var normalizedServiceTypeKey = NormalizeServiceTypeKey(request.ServiceTypeKey);
+        var template = new EmailTemplateResult(
+            Guid.Empty,
+            inspectorId,
+            normalizedTemplateType,
+            normalizedServiceTypeKey,
+            string.IsNullOrWhiteSpace(request.Name) ? GetEmailTemplateServiceLabel(normalizedServiceTypeKey) : request.Name.Trim(),
+            string.IsNullOrWhiteSpace(request.Subject) ? BuildDefaultBookingTemplateSubject(normalizedServiceTypeKey) : request.Subject,
+            CleanEditorHtml(string.IsNullOrWhiteSpace(request.HtmlBody) ? BuildDefaultBookingTemplateHtml() : request.HtmlBody),
+            request.IsActive,
+            "",
+            "");
+
+        template = await UpsertEmailTemplateAsync(conn, template);
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Template saved.",
+            template
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Save email template failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureInspectorsTableAsync(conn);
+
+        var job = await LoadScheduleJobAsync(conn, jobId);
+        if (job == null)
+            return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
+
+        var fields = BuildEmailTemplateFields(job, null);
+
+        return Results.Ok(new
+        {
+            success = true,
+            jobId,
+            inspectorId = job.InspectorId,
+            inspectorName = job.InspectorName,
+            clientEmail = job.ClientEmail,
+            serviceTypeKey = job.BookingTemplateKey,
+            fields
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Email template context failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapPost("/jobs/{jobId}/email-templates/booking-email/preview", async (Guid jobId, EmailTemplateRenderRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureInspectorsTableAsync(conn);
+
+        var rendered = await RenderBookingEmailTemplateAsync(conn, jobId, request, preferDraft: true);
+        if (rendered == null)
+            return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
+
+        return Results.Ok(new
+        {
+            success = true,
+            rendered.Subject,
+            rendered.HtmlBody,
+            rendered.ToEmail,
+            rendered.ActionKey,
+            rendered.ServiceTypeKey,
+            rendered.ServiceLabel
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Preview email template failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapPost("/jobs/{jobId}/email-templates/booking-email/render", async (Guid jobId, EmailTemplateRenderRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureInspectorsTableAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn);
+
+        var rendered = await RenderBookingEmailTemplateAsync(conn, jobId, request, preferDraft: false);
+        if (rendered == null)
+            return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
+
+        return Results.Ok(new
+        {
+            success = true,
+            rendered.Subject,
+            rendered.HtmlBody,
+            rendered.ToEmail,
+            rendered.ActionKey,
+            rendered.ServiceTypeKey,
+            rendered.ServiceLabel,
+            provider = "api-render"
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Render email template failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapPost("/jobs/{jobId}/email-templates/booking-email/send", async (Guid jobId, EmailTemplateSendRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureInspectorIntegrationsTableAsync(conn);
+        await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureWorkflowActionsTableAsync(conn);
+        await EnsureInspectorsTableAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn);
+
+        var rendered = await RenderBookingEmailTemplateAsync(conn, jobId, request, preferDraft: false);
+        if (rendered == null)
+            return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
+
+        if (string.IsNullOrWhiteSpace(rendered.ToEmail))
+            return Results.BadRequest(new { success = false, message = "Recipient email is required." });
+
+        if (IsSmtpEmailSenderMode(rendered.EmailSenderMode))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "This inspector is set to SMTP. Send from the desktop connector so SMTP credentials stay local.",
+                senderMode = rendered.EmailSenderMode,
+                provider = GetEmailSenderModeLabel(rendered.EmailSenderMode)
+            });
+        }
+
+        var account = await GetMicrosoftMailAccountAsync(conn, rendered.InspectorId, builder.Configuration);
+        if (!account.Success)
+        {
+            await MarkBookingEmailFailedAsync(conn, jobId, account.ErrorMessage ?? "Microsoft email is not connected.");
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = account.ErrorMessage ?? "Microsoft email is not connected."
+            });
+        }
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+        var response = await SendMicrosoftMailAsync(httpClient, rendered.ToEmail, rendered.Subject, rendered.HtmlBody);
+        if (!response.Success)
+        {
+            await MarkBookingEmailFailedAsync(conn, jobId, response.Message);
+            await MarkWorkflowActionFailedAsync(conn, jobId, rendered.ActionKey, response.Message);
+            return Results.Problem(
+                title: "Microsoft send mail failed",
+                detail: response.Message,
+                statusCode: 500);
+        }
+
+        if (request.MarkWorkflowComplete)
+        {
+            await MarkWorkflowActionSentAsync(conn, jobId, rendered.ActionKey);
+            await MarkBookingEmailSentIfNoPendingActionsAsync(conn, jobId);
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Email sent via Microsoft Test Mode.",
+            provider = "Microsoft Test Mode",
+            toEmail = rendered.ToEmail,
+            actionKey = rendered.ActionKey
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Send email template failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
 // XERO CREATE DRAFT INVOICE
 // =============================
 app.MapPost("/integrations/xero/jobs/{jobId}/create-draft-invoice", async (Guid jobId) =>
@@ -3260,6 +3625,7 @@ app.MapGet("/jobs/workflow-status", async () =>
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        await EnsureInspectorsTableAsync(conn);
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
@@ -3393,7 +3759,7 @@ LIMIT 500;";
 // GET PENDING WORKFLOW ACTIONS
 // One row per service-level action for new V1 Zaps
 // =============================
-app.MapGet("/workflow-actions/pending", async () =>
+app.MapGet("/workflow-actions/pending", async (Guid? inspectorId) =>
 {
     try
     {
@@ -3480,6 +3846,7 @@ SELECT
     i.email_from_address,
     i.phone,
     i.timezone,
+    COALESCE(i.email_sender_mode, 'microsoft') AS email_sender_mode,
     i.allow_report_release_before_payment,
     i.onboarding_status,
     i.logo_url,
@@ -3519,12 +3886,16 @@ LEFT JOIN LATERAL (
 ) s ON TRUE
 WHERE a.action_type = 'booking_email'
   AND (a.status = 'pending' OR a.retry_requested = true)
+  AND (@inspector_id IS NULL OR a.inspector_id = @inspector_id)
 ORDER BY a.updated_at ASC
 LIMIT 100;";
 
         var rows = new List<object>();
 
         await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", inspectorId.HasValue && inspectorId.Value != Guid.Empty
+            ? inspectorId.Value
+            : DBNull.Value);
         await using var reader = await cmd.ExecuteReaderAsync();
 
         while (await reader.ReadAsync())
@@ -3628,6 +3999,7 @@ LIMIT 100;";
                 email_from_address = reader["email_from_address"]?.ToString(),
                 phone = reader["phone"]?.ToString(),
                 timezone = reader["timezone"]?.ToString(),
+                email_sender_mode = reader["email_sender_mode"]?.ToString(),
                 allow_report_release_before_payment = reader["allow_report_release_before_payment"]?.ToString(),
                 onboarding_status = reader["onboarding_status"]?.ToString(),
                 logo_url = reader["logo_url"]?.ToString(),
@@ -5720,6 +6092,14 @@ ADD COLUMN IF NOT EXISTS onboarding_status text NOT NULL DEFAULT 'not_started';
 ALTER TABLE public.inspectors
 ADD COLUMN IF NOT EXISTS logo_url text NULL;
 
+ALTER TABLE public.inspectors
+ADD COLUMN IF NOT EXISTS email_sender_mode text NOT NULL DEFAULT 'microsoft';
+
+UPDATE public.inspectors
+SET email_sender_mode = 'microsoft'
+WHERE email_sender_mode IS NULL
+   OR email_sender_mode NOT IN ('microsoft', 'threed-smtp', 'manual-smtp');
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -6381,7 +6761,8 @@ SELECT
     i.company_name,
     i.email_from_name,
     i.email_from_address,
-    i.phone
+    i.phone,
+    COALESCE(i.email_sender_mode, 'microsoft') AS email_sender_mode
 FROM public.jobs_staging j
 LEFT JOIN public.inspectors i
     ON i.inspector_id = j.inspector_id
@@ -6441,7 +6822,8 @@ LIMIT 1;";
         reader["company_name"]?.ToString() ?? "",
         reader["email_from_name"]?.ToString() ?? "",
         reader["email_from_address"]?.ToString() ?? "",
-        reader["phone"]?.ToString() ?? "");
+        reader["phone"]?.ToString() ?? "",
+        NormalizeEmailSenderMode(reader["email_sender_mode"]?.ToString()));
 }
 
 static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
@@ -6461,6 +6843,19 @@ static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
     var services = GetSchedulableServices(job).ToArray();
     if (services.Length == 0)
         return ScheduleActionResult.Skip("booking-email", "No schedulable services were found.");
+
+    if (IsSmtpEmailSenderMode(job.EmailSenderMode))
+    {
+        return ScheduleActionResult.Skip(
+            "booking-email",
+            "Booking email is pending for local SMTP sending in the desktop connector.",
+            new
+            {
+                senderMode = job.EmailSenderMode,
+                provider = GetEmailSenderModeLabel(job.EmailSenderMode),
+                pending = services.Select(service => service.Label).ToArray()
+            });
+    }
 
     var account = await GetMicrosoftMailAccountAsync(conn, job.InspectorId, configuration);
     if (!account.Success)
@@ -8203,6 +8598,447 @@ static string BuildAddOnPlaceholderKey(string serviceTypeKey)
     return "HAS_" + NormalizeServiceTypeKey(serviceTypeKey).ToUpperInvariant();
 }
 
+static string NormalizeEmailSenderMode(string? mode)
+{
+    if (string.IsNullOrWhiteSpace(mode))
+        return "microsoft";
+
+    var normalized = mode.Trim().ToLowerInvariant()
+        .Replace(" ", "-")
+        .Replace("_", "-");
+
+    return normalized switch
+    {
+        "microsoft" or "microsoft-test" or "microsoft-test-mode" or "test" => "microsoft",
+        "threed" or "3d" or "threed-smtp" or "3d-smtp" or "smtp-threed" => "threed-smtp",
+        "manual" or "manual-smtp" or "smtp" => "manual-smtp",
+        _ => "microsoft"
+    };
+}
+
+static bool IsSmtpEmailSenderMode(string? mode)
+{
+    var normalized = NormalizeEmailSenderMode(mode);
+    return normalized == "threed-smtp" || normalized == "manual-smtp";
+}
+
+static string GetEmailSenderModeLabel(string? mode)
+{
+    return NormalizeEmailSenderMode(mode) switch
+    {
+        "threed-smtp" => "THREED SMTP",
+        "manual-smtp" => "Manual SMTP",
+        _ => "Microsoft Test Mode"
+    };
+}
+
+static string NormalizeTemplateType(string? templateType)
+{
+    return string.IsNullOrWhiteSpace(templateType)
+        ? "booking-email"
+        : templateType.Trim().ToLowerInvariant().Replace("_", "-");
+}
+
+static async Task EnsureEmailTemplatesTableAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.email_templates
+(
+    template_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    inspector_id uuid NOT NULL,
+    template_type text NOT NULL DEFAULT 'booking-email',
+    service_type_key text NOT NULL DEFAULT 'general_booking',
+    email_type text NOT NULL DEFAULT 'transactional',
+    name text NOT NULL DEFAULT '',
+    subject text NOT NULL DEFAULT '',
+    html_body text NOT NULL DEFAULT '',
+    is_active boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_email_templates_inspector_type_service UNIQUE (inspector_id, template_type, service_type_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_templates_inspector
+ON public.email_templates(inspector_id);";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task<EmailTemplateResult> LoadEmailTemplateAsync(
+    NpgsqlConnection conn,
+    Guid inspectorId,
+    string templateType,
+    string serviceTypeKey)
+{
+    await EnsureEmailTemplatesTableAsync(conn);
+
+    const string sql = @"
+SELECT
+    template_id,
+    inspector_id,
+    template_type,
+    service_type_key,
+    name,
+    subject,
+    html_body,
+    is_active,
+    created_at,
+    updated_at
+FROM public.email_templates
+WHERE inspector_id = @inspector_id
+  AND template_type = @template_type
+  AND service_type_key = @service_type_key
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    cmd.Parameters.AddWithValue("template_type", NormalizeTemplateType(templateType));
+    cmd.Parameters.AddWithValue("service_type_key", NormalizeServiceTypeKey(serviceTypeKey));
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (await reader.ReadAsync())
+    {
+        return new EmailTemplateResult(
+            (Guid)reader["template_id"],
+            (Guid)reader["inspector_id"],
+            reader["template_type"]?.ToString() ?? "booking-email",
+            reader["service_type_key"]?.ToString() ?? "general_booking",
+            reader["name"]?.ToString() ?? "",
+            reader["subject"]?.ToString() ?? "",
+            reader["html_body"]?.ToString() ?? "",
+            reader["is_active"] != DBNull.Value && Convert.ToBoolean(reader["is_active"]),
+            reader["created_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["created_at"]).ToString("O"),
+            reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O"));
+    }
+
+    return new EmailTemplateResult(
+        Guid.Empty,
+        inspectorId,
+        NormalizeTemplateType(templateType),
+        NormalizeServiceTypeKey(serviceTypeKey),
+        GetEmailTemplateServiceLabel(serviceTypeKey),
+        BuildDefaultBookingTemplateSubject(serviceTypeKey),
+        BuildDefaultBookingTemplateHtml(),
+        true,
+        "",
+        "");
+}
+
+static async Task<EmailTemplateResult> UpsertEmailTemplateAsync(NpgsqlConnection conn, EmailTemplateResult template)
+{
+    await EnsureEmailTemplatesTableAsync(conn);
+
+    const string sql = @"
+INSERT INTO public.email_templates
+(
+    inspector_id,
+    template_type,
+    service_type_key,
+    email_type,
+    name,
+    subject,
+    html_body,
+    is_active,
+    created_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    @template_type,
+    @service_type_key,
+    'transactional',
+    @name,
+    @subject,
+    @html_body,
+    @is_active,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (inspector_id, template_type, service_type_key)
+DO UPDATE SET
+    name = EXCLUDED.name,
+    subject = EXCLUDED.subject,
+    html_body = EXCLUDED.html_body,
+    is_active = EXCLUDED.is_active,
+    updated_at = NOW()
+RETURNING template_id, created_at, updated_at;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("inspector_id", template.InspectorId);
+    cmd.Parameters.AddWithValue("template_type", NormalizeTemplateType(template.TemplateType));
+    cmd.Parameters.AddWithValue("service_type_key", NormalizeServiceTypeKey(template.ServiceTypeKey));
+    cmd.Parameters.AddWithValue("name", template.Name ?? "");
+    cmd.Parameters.AddWithValue("subject", template.Subject ?? "");
+    cmd.Parameters.AddWithValue("html_body", CleanEditorHtml(template.HtmlBody ?? ""));
+    cmd.Parameters.AddWithValue("is_active", template.IsActive);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (await reader.ReadAsync())
+    {
+        return template with
+        {
+            TemplateId = (Guid)reader["template_id"],
+            CreatedAt = reader["created_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["created_at"]).ToString("O"),
+            UpdatedAt = reader["updated_at"] == DBNull.Value ? "" : Convert.ToDateTime(reader["updated_at"]).ToString("O")
+        };
+    }
+
+    return template;
+}
+
+static string GetEmailTemplateServiceLabel(string? serviceTypeKey)
+{
+    var normalized = NormalizeServiceTypeKey(serviceTypeKey);
+    var serviceType = GetEmailTemplateServiceTypeRecords()
+        .FirstOrDefault(service => string.Equals(service.Key, normalized, StringComparison.OrdinalIgnoreCase));
+    return serviceType?.Label ?? ToTitle(normalized.Replace("_", " "));
+}
+
+static string BuildDefaultBookingTemplateSubject(string? serviceTypeKey)
+{
+    return "Booking confirmation - {{PRIMARY_SERVICE}}";
+}
+
+static string BuildDefaultBookingTemplateHtml()
+{
+    return
+        "<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937;\">" +
+        "<p>Hi {{CLIENT_FIRST_NAME}},</p>" +
+        "<p>Your <strong>{{SERVICES}}</strong> booking has been scheduled.</p>" +
+        "<table style=\"border-collapse:collapse;margin:16px 0;\">" +
+        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Address</td><td>{{PROPERTY_ADDRESS}}</td></tr>" +
+        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Date/time</td><td>{{INSPECTION_DATE}} {{INSPECTION_TIME}}</td></tr>" +
+        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Inspector</td><td>{{INSPECTOR_NAME}}</td></tr>" +
+        "</table>" +
+        "<p>Regards,<br>{{COMPANY_NAME}}</p>" +
+        "</div>";
+}
+
+static async Task<RenderedEmailTemplate?> RenderBookingEmailTemplateAsync(
+    NpgsqlConnection conn,
+    Guid jobId,
+    EmailTemplateRenderRequest request,
+    bool preferDraft)
+{
+    var job = await LoadScheduleJobAsync(conn, jobId);
+    if (job == null)
+        return null;
+
+    var serviceTypeKey = NormalizeServiceTypeKey(request.ServiceTypeKey);
+    if (string.IsNullOrWhiteSpace(request.ServiceTypeKey))
+        serviceTypeKey = NormalizeServiceTypeKey(job.BookingTemplateKey);
+
+    var service = ResolveTemplateService(job, serviceTypeKey);
+    if (!string.IsNullOrWhiteSpace(service.ServiceKey))
+        serviceTypeKey = NormalizeServiceTypeKey(service.ServiceKey);
+
+    var template = await LoadEmailTemplateAsync(conn, job.InspectorId, "booking-email", serviceTypeKey);
+
+    var subjectTemplate = preferDraft && !string.IsNullOrWhiteSpace(request.Subject)
+        ? request.Subject
+        : template.Subject;
+    var htmlTemplate = preferDraft && !string.IsNullOrWhiteSpace(request.HtmlBody)
+        ? request.HtmlBody
+        : template.HtmlBody;
+
+    if (string.IsNullOrWhiteSpace(subjectTemplate))
+        subjectTemplate = BuildDefaultBookingTemplateSubject(serviceTypeKey);
+
+    if (string.IsNullOrWhiteSpace(htmlTemplate))
+        htmlTemplate = BuildDefaultBookingTemplateHtml();
+
+    var fields = BuildEmailTemplateFields(job, service);
+    var subject = RenderTemplateTokens(subjectTemplate, fields, htmlEncode: false);
+    var htmlBody = RenderTemplateTokens(CleanEditorHtml(htmlTemplate), fields, htmlEncode: true);
+    var toEmail = string.IsNullOrWhiteSpace(request.ToEmail) ? job.ClientEmail : request.ToEmail.Trim();
+    var actionKey = !string.IsNullOrWhiteSpace(request.ActionKey)
+        ? request.ActionKey.Trim()
+        : BuildBookingActionKey(service.ServiceKey, service.Label);
+
+    return new RenderedEmailTemplate(
+        job.JobId,
+        job.InspectorId,
+        job.EmailSenderMode,
+        toEmail,
+        subject,
+        htmlBody,
+        serviceTypeKey,
+        service.Label,
+        actionKey,
+        fields);
+}
+
+static ScheduleServiceInput ResolveTemplateService(ScheduleJobInput job, string serviceTypeKey)
+{
+    var services = GetSchedulableServices(job).ToArray();
+    var normalized = NormalizeServiceTypeKey(serviceTypeKey);
+
+    foreach (var service in services)
+    {
+        if (string.Equals(NormalizeServiceTypeKey(service.ServiceKey), normalized, StringComparison.OrdinalIgnoreCase))
+            return service;
+    }
+
+    if (services.Length > 0)
+    {
+        var bookingTemplateKey = NormalizeServiceTypeKey(job.BookingTemplateKey);
+        if (string.Equals(bookingTemplateKey, normalized, StringComparison.OrdinalIgnoreCase))
+            return services[0];
+
+        return services[0];
+    }
+
+    var fallbackLabel = string.IsNullOrWhiteSpace(job.PrimaryService)
+        ? GetEmailTemplateServiceLabel(normalized)
+        : job.PrimaryService;
+
+    return new ScheduleServiceInput(fallbackLabel, normalized, "primary");
+}
+
+static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job, ScheduleServiceInput? service)
+{
+    var resolvedService = service ?? ResolveTemplateService(job, job.BookingTemplateKey);
+    var start = job.JobDate;
+    var end = start.HasValue ? start.Value.AddMinutes(Math.Max(1, job.InspectionDurationMinutes)) : (DateTime?)null;
+    var services = GetSchedulableServices(job).Select(item => item.Label).Where(value => !string.IsNullOrWhiteSpace(value)).ToArray();
+    var additionalServices = new[] { job.Additional1, job.Additional2 }.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()).ToArray();
+    var addOnKeys = GetSchedulableServices(job)
+        .Where(item => !string.Equals(item.Slot, "primary", StringComparison.OrdinalIgnoreCase))
+        .Select(item => NormalizeServiceTypeKey(item.ServiceKey))
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .ToArray();
+    var company = string.IsNullOrWhiteSpace(job.CompanyName) ? "3D AutoMate" : job.CompanyName.Trim();
+    var inspector = !string.IsNullOrWhiteSpace(job.EmailFromName) ? job.EmailFromName.Trim() : job.InspectorName;
+
+    var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SERVICES"] = string.Join(", ", services.Length == 0 ? new[] { resolvedService.Label } : services),
+        ["PRIMARY_SERVICE"] = string.IsNullOrWhiteSpace(job.PrimaryService) ? resolvedService.Label : job.PrimaryService,
+        ["ADDITIONAL_SERVICES"] = additionalServices.Length == 0 ? "None" : string.Join(", ", additionalServices),
+        ["PRIMARY_SERVICE_KEY"] = NormalizeServiceTypeKey(job.PrimaryServiceKey),
+        ["ADDITIONAL1_SERVICE_KEY"] = NormalizeServiceTypeKey(job.Additional1ServiceKey),
+        ["ADDITIONAL2_SERVICE_KEY"] = NormalizeServiceTypeKey(job.Additional2ServiceKey),
+        ["CANONICAL_SERVICES"] = string.Join(", ", GetSchedulableServices(job).Select(item => NormalizeServiceTypeKey(item.ServiceKey))),
+        ["ADD_ON_SERVICE_KEYS"] = string.Join(", ", addOnKeys),
+        ["BOOKING_TEMPLATE_KEY"] = NormalizeServiceTypeKey(job.BookingTemplateKey),
+        ["BOOKING_EMAIL_REQUIRED"] = job.BookingEmailRequired ? "Yes" : "No",
+        ["TERMS_REQUIRED"] = job.TermsRequired ? "Yes" : "No",
+        ["INVOICE_REQUIRED"] = job.InvoiceRequired ? "Yes" : "No",
+        ["CALENDAR_REQUIRED"] = job.CalendarRequired ? "Yes" : "No",
+        ["REPORT_REQUIRED"] = "Yes",
+        ["PROPERTY_ADDRESS"] = job.SiteAddress,
+        ["ADDRESS"] = job.SiteAddress,
+        ["PROPERTY_COUNTY"] = "",
+        ["STREET_ADDRESS"] = job.SiteAddress,
+        ["INSPECTION_DATE"] = start.HasValue ? start.Value.ToString("dd MMM yyyy") : "To be confirmed",
+        ["INSPECTION_TIME"] = start.HasValue ? start.Value.ToString("h:mm tt") : "",
+        ["INSPECTION_END_TIME"] = end.HasValue ? end.Value.ToString("h:mm tt") : "",
+        ["CLIENT_NAME"] = job.ClientName,
+        ["CLIENT_FIRST_NAME"] = FirstWord(job.ClientName),
+        ["CLIENT_ADDRESS"] = "",
+        ["CLIENT_EMAIL"] = job.ClientEmail,
+        ["CLIENT_PHONE"] = job.ClientPhone,
+        ["AGENT_NAME"] = job.AgentName,
+        ["AGENT_FIRST_NAME"] = FirstWord(job.AgentName),
+        ["AGENT_FULL_ADDRESS"] = "",
+        ["AGENT_ADDRESS"] = "",
+        ["AGENT_CITY"] = "",
+        ["AGENT_STATE"] = "",
+        ["AGENT_ZIP"] = "",
+        ["LISTING_AGENT_NAME"] = job.AgentName,
+        ["LISTING_AGENT_FIRST_NAME"] = FirstWord(job.AgentName),
+        ["LISTING_AGENT_FULL_ADDRESS"] = "",
+        ["LISTING_AGENT_ADDRESS"] = "",
+        ["LISTING_AGENT_CITY"] = "",
+        ["LISTING_AGENT_STATE"] = "",
+        ["LISTING_AGENT_ZIP"] = "",
+        ["INSPECTOR_NAME"] = inspector,
+        ["INSPECTOR_FIRST_NAME"] = FirstWord(inspector),
+        ["INSPECTOR_PHONE"] = string.IsNullOrWhiteSpace(job.Phone) ? job.ClientPhone : job.Phone,
+        ["INSPECTOR_EMAIL"] = job.EmailFromAddress,
+        ["INSPECTORS_NAMES"] = inspector,
+        ["COMPANY_NAME"] = company,
+        ["LOGO_URL"] = "",
+        ["COMPANY_LOGO_URL"] = "",
+        ["JOB_NAME"] = job.JobName,
+        ["INSPECTION_LINK"] = "",
+        ["REPORT_LINK"] = "",
+        ["INVOICE_LINK"] = ""
+    };
+
+    foreach (var serviceType in GetEmailTemplateAddOnServiceTypes())
+    {
+        var key = BuildAddOnPlaceholderKey(serviceType.Key);
+        fields[key] = addOnKeys.Any(value => string.Equals(value, NormalizeServiceTypeKey(serviceType.Key), StringComparison.OrdinalIgnoreCase))
+            ? "Yes"
+            : "No";
+    }
+
+    return fields;
+}
+
+static string RenderTemplateTokens(string template, Dictionary<string, string> fields, bool htmlEncode)
+{
+    return Regex.Replace(
+        template ?? "",
+        "\\{\\{\\s*([A-Z0-9_]+)\\s*\\}\\}",
+        match =>
+        {
+            var key = match.Groups[1].Value;
+            if (!fields.TryGetValue(key, out var replacement))
+                return match.Value;
+
+            return htmlEncode ? SafeHtml(replacement) : replacement;
+        },
+        RegexOptions.IgnoreCase);
+}
+
+static async Task MarkWorkflowActionFailedAsync(NpgsqlConnection conn, Guid jobId, string actionKey, string error)
+{
+    if (string.IsNullOrWhiteSpace(actionKey))
+        return;
+
+    const string sql = @"
+UPDATE public.job_workflow_actions
+SET
+    status = 'failed',
+    retry_requested = false,
+    retry_requested_at = NULL,
+    last_attempt_at = NOW(),
+    last_error = @error_message,
+    updated_at = NOW()
+WHERE job_id = @job_id
+  AND action_key = @action_key;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("action_key", actionKey);
+    cmd.Parameters.AddWithValue("error_message", error ?? "");
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task MarkBookingEmailSentIfNoPendingActionsAsync(NpgsqlConnection conn, Guid jobId)
+{
+    const string pendingSql = @"
+SELECT COUNT(*)
+FROM public.job_workflow_actions
+WHERE job_id = @job_id
+  AND action_type = 'booking_email'
+  AND (status = 'pending' OR retry_requested = true);";
+
+    await using (var pendingCmd = new NpgsqlCommand(pendingSql, conn))
+    {
+        pendingCmd.Parameters.AddWithValue("job_id", jobId);
+        var pending = Convert.ToInt32(await pendingCmd.ExecuteScalarAsync());
+        if (pending > 0)
+            return;
+    }
+
+    await MarkBookingEmailSentAsync(conn, jobId);
+}
+
 static object BuildAddOnPlaceholder(EmailTemplateServiceType serviceType)
 {
     var key = BuildAddOnPlaceholderKey(serviceType.Key);
@@ -9597,6 +10433,55 @@ public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
 public record GoogleCalendarSelectionRequest(string InspectorId, string CalendarId);
+public record EmailSenderModeRequest(string InspectorId, string SenderMode);
+public class EmailTemplateSaveRequest
+{
+    public string? EmailType { get; set; }
+    public string? ServiceTypeKey { get; set; }
+    public string? Name { get; set; }
+    public string? Subject { get; set; }
+    public string? HtmlBody { get; set; }
+    public bool IsActive { get; set; } = true;
+}
+
+public class EmailTemplateRenderRequest
+{
+    public string? EmailType { get; set; }
+    public string? ServiceTypeKey { get; set; }
+    public string? Subject { get; set; }
+    public string? HtmlBody { get; set; }
+    public string? ToEmail { get; set; }
+    public string? ActionKey { get; set; }
+}
+
+public class EmailTemplateSendRequest : EmailTemplateRenderRequest
+{
+    public bool MarkWorkflowComplete { get; set; } = true;
+}
+
+public record EmailTemplateResult(
+    Guid TemplateId,
+    Guid InspectorId,
+    string TemplateType,
+    string ServiceTypeKey,
+    string Name,
+    string Subject,
+    string HtmlBody,
+    bool IsActive,
+    string CreatedAt,
+    string UpdatedAt);
+
+public record RenderedEmailTemplate(
+    Guid JobId,
+    Guid InspectorId,
+    string EmailSenderMode,
+    string ToEmail,
+    string Subject,
+    string HtmlBody,
+    string ServiceTypeKey,
+    string ServiceLabel,
+    string ActionKey,
+    Dictionary<string, string> Fields);
 public class JobWorkflowRequirementsRequest
 {
     public bool? BookingEmailRequired { get; set; }
@@ -9860,7 +10745,8 @@ public record ScheduleJobInput(
     string CompanyName,
     string EmailFromName,
     string EmailFromAddress,
-    string Phone);
+    string Phone,
+    string EmailSenderMode);
 
 public class JobUploadRequest
 {
