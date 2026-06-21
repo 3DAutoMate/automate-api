@@ -7305,8 +7305,12 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
         }
     }
 
+    var preferredTemplates = templates.Any(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
+        ? templates.Where(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
+        : templates;
+
     return new SignNowTemplateLookupResult(
-        GroupSignNowTemplatesByName(templates),
+        GroupSignNowTemplatesByName(preferredTemplates),
         diagnostics.ToArray(),
         successfulEndpointCount,
         lastEndpoint,
@@ -7361,6 +7365,7 @@ static List<SignNowTemplateResult> GroupSignNowTemplatesByName(IEnumerable<SignN
 {
     return templates
         .Where(template => !string.IsNullOrWhiteSpace(template.Id))
+        .Where(template => !LooksLikePropertySpecificSignNowTemplate(template.Name))
         .GroupBy(template => NormalizeSignNowTemplateName(template.Name), StringComparer.OrdinalIgnoreCase)
         .Select(group => group
             .OrderByDescending(template => ParseSignNowUpdatedAt(template.UpdatedAt))
@@ -7381,6 +7386,23 @@ static string NormalizeSignNowTemplateName(string? name)
 static long ParseSignNowUpdatedAt(string? value)
 {
     return long.TryParse(value, out var parsed) ? parsed : 0;
+}
+
+static bool LooksLikePropertySpecificSignNowTemplate(string? name)
+{
+    if (string.IsNullOrWhiteSpace(name))
+        return false;
+
+    var trimmed = name.Trim();
+    var separatorIndex = trimmed.IndexOf(" - ", StringComparison.Ordinal);
+    if (separatorIndex <= 0)
+        return false;
+
+    var prefix = trimmed.Substring(0, separatorIndex).Trim();
+    if (prefix.Length == 0 || !char.IsDigit(prefix[0]))
+        return false;
+
+    return Regex.IsMatch(prefix, "[A-Za-z]") && Regex.IsMatch(prefix, "\\d");
 }
 
 static string ResolveSignNowTermsTemplateKey(string? value)
