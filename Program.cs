@@ -7316,8 +7316,11 @@ static string FindJsonStringRecursive(JsonElement element, params string[] prope
 
 static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpClient httpClient)
 {
+    var signNowTermsParentId = "274f64b07a6e4d3bb14a0e7f6b51086d983d4240";
     var endpoints = new[]
     {
+        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}"),
+        new SignNowTemplateEndpoint("terms_parent_documentsv2_folder_id", $"https://api.signnow.com/user/documentsv2?folder_id={Uri.EscapeDataString(signNowTermsParentId)}"),
         new SignNowTemplateEndpoint("template", "https://api.signnow.com/template"),
         new SignNowTemplateEndpoint("user_documents_template", "https://api.signnow.com/user/documents?type=template"),
         new SignNowTemplateEndpoint("user_documentsv2_template", "https://api.signnow.com/user/documentsv2?type=template")
@@ -7366,7 +7369,11 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
         }
     }
 
-    var preferredTemplates = templates.Any(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
+    var preferredTemplates = templates.Any(template => string.Equals(template.SourceType, "terms_parent_documentsv2_parent_id", StringComparison.OrdinalIgnoreCase))
+        ? templates.Where(template => string.Equals(template.SourceType, "terms_parent_documentsv2_parent_id", StringComparison.OrdinalIgnoreCase))
+        : templates.Any(template => string.Equals(template.SourceType, "terms_parent_documentsv2_folder_id", StringComparison.OrdinalIgnoreCase))
+            ? templates.Where(template => string.Equals(template.SourceType, "terms_parent_documentsv2_folder_id", StringComparison.OrdinalIgnoreCase))
+            : templates.Any(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
         ? templates.Where(template => string.Equals(template.SourceType, "user_documentsv2_template", StringComparison.OrdinalIgnoreCase))
         : templates;
 
