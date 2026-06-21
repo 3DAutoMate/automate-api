@@ -7380,7 +7380,11 @@ static string NormalizeSignNowTemplateName(string? name)
     if (string.IsNullOrWhiteSpace(name))
         return "";
 
-    return Regex.Replace(name.Trim(), "\\s+", " ");
+    var normalized = Regex.Replace(name.Trim(), "\\s+", " ");
+    if (string.Equals(normalized, "Terms and Conditions - Pro-Spect", StringComparison.OrdinalIgnoreCase))
+        return "Pro-Spect Terms and Conditions";
+
+    return normalized;
 }
 
 static long ParseSignNowUpdatedAt(string? value)
