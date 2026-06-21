@@ -7321,7 +7321,12 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
     {
         new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
         new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_page", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=1&limit=100"),
+        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_page2", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=2&limit=100"),
+        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_per_page", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=1&per_page=100"),
+        new SignNowTemplateEndpoint("terms_parent_documentsv2_parent_id_page2_per_page", $"https://api.signnow.com/user/documentsv2?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&page=2&per_page=100"),
         new SignNowTemplateEndpoint("terms_parent_documentsv2_folder_id", $"https://api.signnow.com/user/documentsv2?folder_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
+        new SignNowTemplateEndpoint("terms_parent_documents_parent_id", $"https://api.signnow.com/user/documents?parent_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
+        new SignNowTemplateEndpoint("terms_parent_documents_folder_id", $"https://api.signnow.com/user/documents?folder_id={Uri.EscapeDataString(signNowTermsParentId)}&limit=100"),
         new SignNowTemplateEndpoint("template", "https://api.signnow.com/template"),
         new SignNowTemplateEndpoint("user_documents_template", "https://api.signnow.com/user/documents?type=template"),
         new SignNowTemplateEndpoint("user_documentsv2_template", "https://api.signnow.com/user/documentsv2?type=template")
