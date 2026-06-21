@@ -7445,6 +7445,7 @@ static object BuildSignNowProbeMetadata(JsonElement root)
         parentId = FirstNonEmptyJsonString(root, "parent_id", "parentId"),
         groupId = FirstNonEmptyJsonString(root, "document_group_id", "documentGroupId", "group_id"),
         templateId = FirstNonEmptyJsonString(root, "template_id", "templateId"),
+        template = FirstNonEmptyJsonString(root, "template"),
         updatedAt = FirstNonEmptyJsonString(root, "updated", "updated_at", "last_updated"),
         topLevelKeys = root.ValueKind == JsonValueKind.Object
             ? root.EnumerateObject().Select(property => property.Name).Take(80).ToArray()
@@ -7474,6 +7475,13 @@ static List<SignNowTemplateResult> ExtractSignNowTemplates(JsonElement root, str
         {
             if (item.ValueKind != JsonValueKind.Object)
                 continue;
+
+            if (sourceType.StartsWith("terms_parent_", StringComparison.OrdinalIgnoreCase) &&
+                item.TryGetProperty("template", out var templateFlag) &&
+                templateFlag.ValueKind == JsonValueKind.False)
+            {
+                continue;
+            }
 
             var id = FirstNonEmptyJsonString(item, "id", "template_id", "document_id", "unique_id");
             if (string.IsNullOrWhiteSpace(id))
