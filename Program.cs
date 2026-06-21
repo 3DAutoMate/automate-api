@@ -7277,7 +7277,8 @@ static async Task<SignNowTemplateLookupResult> LookupSignNowTemplatesAsync(HttpC
     int lastStatusCode = 0;
 
     const int pageSize = 100;
-    for (var page = 1; page <= 10; page++)
+    const int maxActiveFolderPages = 2;
+    for (var page = 1; page <= maxActiveFolderPages; page++)
     {
         var endpoint = new SignNowTemplateEndpoint(
             "terms_parent_documentsv2",
