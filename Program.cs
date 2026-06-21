@@ -1896,9 +1896,10 @@ app.MapGet("/integrations/google/calendars", async (string inspectorId) =>
 
         if (!response.IsSuccessStatusCode)
         {
+            var googleMessage = BuildGoogleApiFriendlyError(body);
             return Results.Problem(
                 title: "Google calendars failed",
-                detail: body,
+                detail: googleMessage,
                 statusCode: (int)response.StatusCode
             );
         }
@@ -7878,6 +7879,53 @@ static string GetJsonString(JsonElement element, string propertyName)
     return element.TryGetProperty(propertyName, out var value) && value.ValueKind != JsonValueKind.Null
         ? value.ToString()
         : "";
+}
+
+static string BuildGoogleApiFriendlyError(string body)
+{
+    if (string.IsNullOrWhiteSpace(body))
+        return "Google Calendar returned an empty error response.";
+
+    try
+    {
+        var root = JsonDocument.Parse(body).RootElement;
+        if (!root.TryGetProperty("error", out var error))
+            return body;
+
+        var message = GetJsonString(error, "message");
+        var status = GetJsonString(error, "status");
+        var service = FindJsonStringRecursive(error, "service");
+        var consumer = FindJsonStringRecursive(error, "consumer");
+        var reason = FindJsonStringRecursive(error, "reason");
+        var activationUrl = FindJsonStringRecursive(error, "activationUrl");
+
+        if (string.Equals(status, "PERMISSION_DENIED", StringComparison.OrdinalIgnoreCase) &&
+            (string.Equals(reason, "SERVICE_DISABLED", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(reason, "accessNotConfigured", StringComparison.OrdinalIgnoreCase) ||
+             message.Contains("has not been used", StringComparison.OrdinalIgnoreCase) ||
+             message.Contains("is disabled", StringComparison.OrdinalIgnoreCase)))
+        {
+            var project = "";
+            if (!string.IsNullOrWhiteSpace(consumer))
+            {
+                var match = Regex.Match(consumer, "projects/(\\d+)");
+                if (match.Success)
+                    project = match.Groups[1].Value;
+            }
+
+            var target = string.IsNullOrWhiteSpace(project) ? "the Google Cloud project used by AutoMate" : "Google Cloud project " + project;
+            var apiName = string.IsNullOrWhiteSpace(service) ? "Google Calendar API" : service;
+
+            return apiName + " is disabled for " + target + ". Enable Google Calendar API, wait a few minutes, then reconnect or refresh calendars."
+                + (string.IsNullOrWhiteSpace(activationUrl) ? "" : " Enable it here: " + activationUrl);
+        }
+
+        return string.IsNullOrWhiteSpace(message) ? body : message;
+    }
+    catch
+    {
+        return body;
+    }
 }
 
 static string FirstNonEmptyJsonString(JsonElement element, params string[] propertyNames)
