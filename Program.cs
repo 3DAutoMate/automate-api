@@ -150,6 +150,201 @@ app.MapPost("/accounts/ensure-tables", async () =>
     }
 });
 
+app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request) =>
+{
+    try
+    {
+        if (request.TenantId == Guid.Empty)
+            return Results.BadRequest(new { success = false, message = "Tenant ID is required." });
+
+        if (request.InspectorId == Guid.Empty)
+            return Results.BadRequest(new { success = false, message = "Inspector ID is required." });
+
+        if (string.IsNullOrWhiteSpace(request.Email))
+            return Results.BadRequest(new { success = false, message = "Email is required." });
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await EnsureInspectorsTableAsync(conn);
+        await EnsureSubscriptionsTableAsync(conn);
+        await EnsureInspectorIntegrationsTableAsync(conn);
+
+        const string inspectorSql = @"
+INSERT INTO public.inspectors
+(
+    inspector_id,
+    tenant_id,
+    inspector_name,
+    company_name,
+    contact_name,
+    email_from_name,
+    email_from_address,
+    onboarding_status,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    @tenant_id,
+    @inspector_name,
+    @company_name,
+    @contact_name,
+    @email_from_name,
+    @email_from_address,
+    'trial_registered',
+    NOW()
+)
+ON CONFLICT (inspector_id) DO UPDATE
+SET
+    tenant_id = EXCLUDED.tenant_id,
+    inspector_name = EXCLUDED.inspector_name,
+    company_name = EXCLUDED.company_name,
+    contact_name = EXCLUDED.contact_name,
+    email_from_name = EXCLUDED.email_from_name,
+    email_from_address = EXCLUDED.email_from_address,
+    onboarding_status = 'trial_registered',
+    updated_at = NOW();";
+
+        await using (var inspectorCmd = new NpgsqlCommand(inspectorSql, conn))
+        {
+            inspectorCmd.Parameters.AddWithValue("inspector_id", request.InspectorId);
+            inspectorCmd.Parameters.AddWithValue("tenant_id", request.TenantId);
+            inspectorCmd.Parameters.AddWithValue("inspector_name", FirstNonBlank(request.InspectorName, request.Email));
+            inspectorCmd.Parameters.AddWithValue("company_name", request.CompanyName ?? "");
+            inspectorCmd.Parameters.AddWithValue("contact_name", request.InspectorName ?? "");
+            inspectorCmd.Parameters.AddWithValue("email_from_name", FirstNonBlank(request.InspectorName, request.CompanyName, request.Email));
+            inspectorCmd.Parameters.AddWithValue("email_from_address", request.Email.Trim());
+            await inspectorCmd.ExecuteNonQueryAsync();
+        }
+
+        const string subscriptionSql = @"
+INSERT INTO public.subscriptions
+(
+    inspector_id,
+    status,
+    plan_name,
+    trial_ends_at,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    'trialing',
+    'pilot',
+    NOW() + INTERVAL '30 days',
+    NOW()
+)
+ON CONFLICT (inspector_id) DO UPDATE
+SET
+    status = CASE
+        WHEN public.subscriptions.status IN ('active', 'trialing') THEN public.subscriptions.status
+        ELSE 'trialing'
+    END,
+    plan_name = COALESCE(public.subscriptions.plan_name, 'pilot'),
+    trial_ends_at = COALESCE(public.subscriptions.trial_ends_at, NOW() + INTERVAL '30 days'),
+    updated_at = NOW();";
+
+        await using (var subscriptionCmd = new NpgsqlCommand(subscriptionSql, conn))
+        {
+            subscriptionCmd.Parameters.AddWithValue("inspector_id", request.InspectorId);
+            await subscriptionCmd.ExecuteNonQueryAsync();
+        }
+
+        var trialEndsAt = await GetTrialEndsAtAsync(conn, request.InspectorId);
+
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Trial registered.",
+            tenantId = request.TenantId,
+            inspectorId = request.InspectorId,
+            email = request.Email.Trim(),
+            status = "trialing",
+            trialEndsAt,
+            daysRemaining = CalculateTrialDaysRemaining(trialEndsAt)
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Trial registration failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
+app.MapGet("/accounts/trial-status", async (Guid inspectorId) =>
+{
+    try
+    {
+        if (inspectorId == Guid.Empty)
+            return Results.BadRequest(new { success = false, message = "Inspector ID is required." });
+
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        await EnsureInspectorsTableAsync(conn);
+        await EnsureSubscriptionsTableAsync(conn);
+
+        const string sql = @"
+SELECT
+    COALESCE(s.status, 'not_registered') AS status,
+    s.trial_ends_at,
+    i.inspector_name,
+    i.company_name,
+    i.email_from_address
+FROM public.inspectors i
+LEFT JOIN public.subscriptions s
+    ON s.inspector_id = i.inspector_id
+WHERE i.inspector_id = @inspector_id
+ORDER BY s.created_at DESC NULLS LAST
+LIMIT 1;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                registered = false,
+                status = "not_registered",
+                trialEndsAt = (DateTime?)null,
+                daysRemaining = 0
+            });
+        }
+
+        var trialEndsAt = reader["trial_ends_at"] == DBNull.Value
+            ? (DateTime?)null
+            : Convert.ToDateTime(reader["trial_ends_at"]);
+
+        var status = reader["status"]?.ToString() ?? "not_registered";
+        return Results.Ok(new
+        {
+            success = true,
+            registered = true,
+            status,
+            trialEndsAt,
+            daysRemaining = CalculateTrialDaysRemaining(trialEndsAt),
+            inspectorName = reader["inspector_name"]?.ToString(),
+            companyName = reader["company_name"]?.ToString(),
+            email = reader["email_from_address"]?.ToString()
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(
+            title: "Trial status failed",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+    }
+});
+
 // =============================
 // ENSURE WORKFLOW + PAYLOAD COLUMNS
 // =============================
@@ -6101,17 +6296,8 @@ SET email_sender_mode = 'microsoft'
 WHERE email_sender_mode IS NULL
    OR email_sender_mode NOT IN ('microsoft', 'threed-smtp', 'manual-smtp');
 
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'inspectors_tenant_id_unique'
-    ) THEN
-        ALTER TABLE public.inspectors
-        ADD CONSTRAINT inspectors_tenant_id_unique UNIQUE (tenant_id);
-    END IF;
-END $$;
+ALTER TABLE public.inspectors
+DROP CONSTRAINT IF EXISTS inspectors_tenant_id_unique;
 ";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
@@ -6137,6 +6323,9 @@ CREATE TABLE IF NOT EXISTS public.subscriptions
 );
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_inspector_id
+ON public.subscriptions(inspector_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_subscriptions_inspector_id
 ON public.subscriptions(inspector_id);
 ";
 
@@ -10470,9 +10659,68 @@ static string FirstWord(string? value)
     return value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
 }
 
+static string FirstNonBlank(params string?[] values)
+{
+    foreach (var value in values)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+            return value.Trim();
+    }
+
+    return "";
+}
+
+static async Task<DateTime?> GetTrialEndsAtAsync(NpgsqlConnection conn, Guid inspectorId)
+{
+    const string sql = @"
+SELECT trial_ends_at
+FROM public.subscriptions
+WHERE inspector_id = @inspector_id
+ORDER BY created_at DESC
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    var result = await cmd.ExecuteScalarAsync();
+
+    return result == null || result == DBNull.Value
+        ? (DateTime?)null
+        : Convert.ToDateTime(result);
+}
+
+static int CalculateTrialDaysRemaining(DateTime? trialEndsAt)
+{
+    if (!trialEndsAt.HasValue)
+        return 0;
+
+    var remaining = trialEndsAt.Value.ToUniversalTime() - DateTime.UtcNow;
+    if (remaining <= TimeSpan.Zero)
+        return 0;
+
+    return Math.Max(1, (int)Math.Ceiling(remaining.TotalDays));
+}
+
 public class BookingEmailFailureRequest
 {
     public string? ErrorMessage { get; set; }
+}
+
+public class TrialRegistrationRequest
+{
+    [JsonPropertyName("tenant_id")]
+    public Guid TenantId { get; set; }
+
+    [JsonPropertyName("inspector_id")]
+    public Guid InspectorId { get; set; }
+
+    [JsonPropertyName("inspector_name")]
+    public string InspectorName { get; set; } = "";
+
+    [JsonPropertyName("company_name")]
+    public string CompanyName { get; set; } = "";
+
+    [JsonPropertyName("email")]
+    public string Email { get; set; } = "";
 }
 
 public record WorkflowActionFailureRequest(string ErrorMessage);
