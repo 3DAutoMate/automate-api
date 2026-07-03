@@ -80,6 +80,7 @@ var V1MappingFields = new List<V1MappingField>
 
 var app = builder.Build();
 app.UseCors("LocalTemplateMaker");
+const string FoundersTrialAccessCode = "PILOT";
 
 // =============================
 // ROOT
@@ -163,6 +164,17 @@ app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request)
         if (string.IsNullOrWhiteSpace(request.Email))
             return Results.BadRequest(new { success = false, message = "Email is required." });
 
+        if (!string.Equals((request.AccessCode ?? "").Trim(), FoundersTrialAccessCode, StringComparison.OrdinalIgnoreCase))
+        {
+            return Results.BadRequest(new
+            {
+                success = false,
+                allowed = false,
+                status = "invalid_code",
+                message = "Enter the valid 3D AutoMate founders trial access code."
+            });
+        }
+
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
 
@@ -170,53 +182,58 @@ app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request)
         await EnsureSubscriptionsTableAsync(conn);
         await EnsureInspectorIntegrationsTableAsync(conn);
 
-        const string inspectorSql = @"
-INSERT INTO public.inspectors
-(
-    inspector_id,
-    tenant_id,
-    inspector_name,
-    company_name,
-    contact_name,
-    email_from_name,
-    email_from_address,
-    onboarding_status,
-    updated_at
-)
-VALUES
-(
-    @inspector_id,
-    @tenant_id,
-    @inspector_name,
-    @company_name,
-    @contact_name,
-    @email_from_name,
-    @email_from_address,
-    'trial_registered',
-    NOW()
-)
-ON CONFLICT (inspector_id) DO UPDATE
-SET
-    tenant_id = EXCLUDED.tenant_id,
-    inspector_name = EXCLUDED.inspector_name,
-    company_name = EXCLUDED.company_name,
-    contact_name = EXCLUDED.contact_name,
-    email_from_name = EXCLUDED.email_from_name,
-    email_from_address = EXCLUDED.email_from_address,
-    onboarding_status = 'trial_registered',
-    updated_at = NOW();";
-
-        await using (var inspectorCmd = new NpgsqlCommand(inspectorSql, conn))
+        var existingAccount = await LoadCompanyAccountByTenantAsync(conn, request.TenantId);
+        if (existingAccount != null)
         {
-            inspectorCmd.Parameters.AddWithValue("inspector_id", request.InspectorId);
-            inspectorCmd.Parameters.AddWithValue("tenant_id", request.TenantId);
-            inspectorCmd.Parameters.AddWithValue("inspector_name", FirstNonBlank(request.InspectorName, request.Email));
-            inspectorCmd.Parameters.AddWithValue("company_name", request.CompanyName ?? "");
-            inspectorCmd.Parameters.AddWithValue("contact_name", request.InspectorName ?? "");
-            inspectorCmd.Parameters.AddWithValue("email_from_name", FirstNonBlank(request.InspectorName, request.CompanyName, request.Email));
-            inspectorCmd.Parameters.AddWithValue("email_from_address", request.Email.Trim());
-            await inspectorCmd.ExecuteNonQueryAsync();
+            var existingDaysRemaining = CalculateTrialDaysRemaining(existingAccount.TrialEndsAt);
+            var existingStatus = existingAccount.Status;
+
+            if (string.Equals(existingStatus, "active", StringComparison.OrdinalIgnoreCase))
+            {
+                await UpsertInspectorAsync(conn, request, "active_company");
+                return Results.Ok(BuildAccountResponse(
+                    success: true,
+                    allowed: true,
+                    status: "active",
+                    message: "This company already has an active subscription.",
+                    request: request,
+                    trialEndsAt: existingAccount.TrialEndsAt,
+                    daysRemaining: existingDaysRemaining,
+                    registeredEmail: existingAccount.Email,
+                    registeredInspectorId: existingAccount.InspectorId));
+            }
+
+            if (string.Equals(existingStatus, "trialing", StringComparison.OrdinalIgnoreCase) && existingDaysRemaining > 0)
+            {
+                await UpsertInspectorAsync(conn, request, "trial_registered");
+                return Results.Ok(BuildAccountResponse(
+                    success: true,
+                    allowed: true,
+                    status: "trialing",
+                    message: "This company already has a founders trial. The existing trial countdown was not reset.",
+                    request: request,
+                    trialEndsAt: existingAccount.TrialEndsAt,
+                    daysRemaining: existingDaysRemaining,
+                    registeredEmail: existingAccount.Email,
+                    registeredInspectorId: existingAccount.InspectorId));
+            }
+
+            if (!string.Equals(existingStatus, "not_registered", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Ok(BuildAccountResponse(
+                    success: false,
+                    allowed: false,
+                    status: "expired",
+                    message: "This company trial has expired. Contact 3D AutoMate to activate your subscription.",
+                    request: request,
+                    trialEndsAt: existingAccount.TrialEndsAt,
+                    daysRemaining: 0,
+                    registeredEmail: existingAccount.Email,
+                    registeredInspectorId: existingAccount.InspectorId));
+            }
         }
+
+        await UpsertInspectorAsync(conn, request, "trial_registered");
 
         const string subscriptionSql = @"
 INSERT INTO public.subscriptions
@@ -231,7 +248,7 @@ VALUES
 (
     @inspector_id,
     'trialing',
-    'pilot',
+    'founders_trial',
     NOW() + INTERVAL '30 days',
     NOW()
 )
@@ -241,7 +258,7 @@ SET
         WHEN public.subscriptions.status IN ('active', 'trialing') THEN public.subscriptions.status
         ELSE 'trialing'
     END,
-    plan_name = COALESCE(public.subscriptions.plan_name, 'pilot'),
+    plan_name = COALESCE(public.subscriptions.plan_name, 'founders_trial'),
     trial_ends_at = COALESCE(public.subscriptions.trial_ends_at, NOW() + INTERVAL '30 days'),
     updated_at = NOW();";
 
@@ -256,6 +273,7 @@ SET
         return Results.Ok(new
         {
             success = true,
+            allowed = true,
             message = "Trial registered.",
             tenantId = request.TenantId,
             inspectorId = request.InspectorId,
@@ -275,12 +293,12 @@ SET
     }
 });
 
-app.MapGet("/accounts/trial-status", async (Guid inspectorId) =>
+app.MapGet("/accounts/trial-status", async (Guid inspectorId, Guid? tenantId) =>
 {
     try
     {
-        if (inspectorId == Guid.Empty)
-            return Results.BadRequest(new { success = false, message = "Inspector ID is required." });
+        if (inspectorId == Guid.Empty && (!tenantId.HasValue || tenantId.Value == Guid.Empty))
+            return Results.BadRequest(new { success = false, allowed = false, message = "Inspector ID or Tenant ID is required." });
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
@@ -288,51 +306,52 @@ app.MapGet("/accounts/trial-status", async (Guid inspectorId) =>
         await EnsureInspectorsTableAsync(conn);
         await EnsureSubscriptionsTableAsync(conn);
 
-        const string sql = @"
-SELECT
-    COALESCE(s.status, 'not_registered') AS status,
-    s.trial_ends_at,
-    i.inspector_name,
-    i.company_name,
-    i.email_from_address
-FROM public.inspectors i
-LEFT JOIN public.subscriptions s
-    ON s.inspector_id = i.inspector_id
-WHERE i.inspector_id = @inspector_id
-ORDER BY s.created_at DESC NULLS LAST
-LIMIT 1;";
+        CompanyAccountStatus? account = null;
+        if (tenantId.HasValue && tenantId.Value != Guid.Empty)
+            account = await LoadCompanyAccountByTenantAsync(conn, tenantId.Value);
 
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+        if (account == null && inspectorId != Guid.Empty)
+            account = await LoadCompanyAccountByInspectorAsync(conn, inspectorId);
 
-        await using var reader = await cmd.ExecuteReaderAsync();
-        if (!await reader.ReadAsync())
+        if (account == null)
         {
             return Results.Ok(new
             {
                 success = true,
+                allowed = false,
                 registered = false,
                 status = "not_registered",
+                message = "This company is not registered.",
                 trialEndsAt = (DateTime?)null,
                 daysRemaining = 0
             });
         }
 
-        var trialEndsAt = reader["trial_ends_at"] == DBNull.Value
-            ? (DateTime?)null
-            : Convert.ToDateTime(reader["trial_ends_at"]);
+        var daysRemaining = CalculateTrialDaysRemaining(account.TrialEndsAt);
+        var status = account.Status;
+        var allowed = string.Equals(status, "active", StringComparison.OrdinalIgnoreCase)
+            || (string.Equals(status, "trialing", StringComparison.OrdinalIgnoreCase) && daysRemaining > 0);
 
-        var status = reader["status"]?.ToString() ?? "not_registered";
+        var message = allowed
+            ? (string.Equals(status, "active", StringComparison.OrdinalIgnoreCase)
+                ? "This company has an active subscription."
+                : "This company has an active founders trial.")
+            : "This company trial has expired. Contact 3D AutoMate to activate your subscription.";
+
         return Results.Ok(new
         {
             success = true,
+            allowed,
             registered = true,
             status,
-            trialEndsAt,
-            daysRemaining = CalculateTrialDaysRemaining(trialEndsAt),
-            inspectorName = reader["inspector_name"]?.ToString(),
-            companyName = reader["company_name"]?.ToString(),
-            email = reader["email_from_address"]?.ToString()
+            message,
+            trialEndsAt = account.TrialEndsAt,
+            daysRemaining = allowed ? daysRemaining : 0,
+            inspectorName = account.InspectorName,
+            companyName = account.CompanyName,
+            email = account.Email,
+            tenantId = account.TenantId,
+            registeredInspectorId = account.InspectorId
         });
     }
     catch (Exception ex)
@@ -10670,6 +10689,154 @@ static string FirstNonBlank(params string?[] values)
     return "";
 }
 
+static async Task UpsertInspectorAsync(NpgsqlConnection conn, TrialRegistrationRequest request, string onboardingStatus)
+{
+    const string inspectorSql = @"
+INSERT INTO public.inspectors
+(
+    inspector_id,
+    tenant_id,
+    inspector_name,
+    company_name,
+    contact_name,
+    email_from_name,
+    email_from_address,
+    onboarding_status,
+    updated_at
+)
+VALUES
+(
+    @inspector_id,
+    @tenant_id,
+    @inspector_name,
+    @company_name,
+    @contact_name,
+    @email_from_name,
+    @email_from_address,
+    @onboarding_status,
+    NOW()
+)
+ON CONFLICT (inspector_id) DO UPDATE
+SET
+    tenant_id = EXCLUDED.tenant_id,
+    inspector_name = EXCLUDED.inspector_name,
+    company_name = EXCLUDED.company_name,
+    contact_name = EXCLUDED.contact_name,
+    email_from_name = EXCLUDED.email_from_name,
+    email_from_address = EXCLUDED.email_from_address,
+    onboarding_status = EXCLUDED.onboarding_status,
+    updated_at = NOW();";
+
+    await using var inspectorCmd = new NpgsqlCommand(inspectorSql, conn);
+    inspectorCmd.Parameters.AddWithValue("inspector_id", request.InspectorId);
+    inspectorCmd.Parameters.AddWithValue("tenant_id", request.TenantId);
+    inspectorCmd.Parameters.AddWithValue("inspector_name", FirstNonBlank(request.InspectorName, request.Email));
+    inspectorCmd.Parameters.AddWithValue("company_name", request.CompanyName ?? "");
+    inspectorCmd.Parameters.AddWithValue("contact_name", request.InspectorName ?? "");
+    inspectorCmd.Parameters.AddWithValue("email_from_name", FirstNonBlank(request.InspectorName, request.CompanyName, request.Email));
+    inspectorCmd.Parameters.AddWithValue("email_from_address", request.Email.Trim());
+    inspectorCmd.Parameters.AddWithValue("onboarding_status", onboardingStatus);
+    await inspectorCmd.ExecuteNonQueryAsync();
+}
+
+static async Task<CompanyAccountStatus?> LoadCompanyAccountByTenantAsync(NpgsqlConnection conn, Guid tenantId)
+{
+    const string sql = @"
+SELECT
+    i.inspector_id,
+    i.tenant_id,
+    i.inspector_name,
+    i.company_name,
+    i.email_from_address,
+    COALESCE(s.status, 'not_registered') AS status,
+    s.trial_ends_at
+FROM public.inspectors i
+LEFT JOIN public.subscriptions s
+    ON s.inspector_id = i.inspector_id
+WHERE i.tenant_id = @tenant_id
+ORDER BY
+    CASE
+        WHEN s.status = 'active' THEN 0
+        WHEN s.status = 'trialing' AND s.trial_ends_at > NOW() THEN 1
+        WHEN s.status = 'trialing' THEN 2
+        ELSE 3
+    END,
+    s.trial_ends_at DESC NULLS LAST,
+    i.created_at ASC
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("tenant_id", tenantId);
+    return await ReadCompanyAccountStatusAsync(cmd);
+}
+
+static async Task<CompanyAccountStatus?> LoadCompanyAccountByInspectorAsync(NpgsqlConnection conn, Guid inspectorId)
+{
+    const string sql = @"
+SELECT
+    i.inspector_id,
+    i.tenant_id,
+    i.inspector_name,
+    i.company_name,
+    i.email_from_address,
+    COALESCE(s.status, 'not_registered') AS status,
+    s.trial_ends_at
+FROM public.inspectors i
+LEFT JOIN public.subscriptions s
+    ON s.inspector_id = i.inspector_id
+WHERE i.inspector_id = @inspector_id
+LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    return await ReadCompanyAccountStatusAsync(cmd);
+}
+
+static async Task<CompanyAccountStatus?> ReadCompanyAccountStatusAsync(NpgsqlCommand cmd)
+{
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+        return null;
+
+    return new CompanyAccountStatus
+    {
+        InspectorId = reader["inspector_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["inspector_id"],
+        TenantId = reader["tenant_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["tenant_id"],
+        InspectorName = reader["inspector_name"]?.ToString() ?? "",
+        CompanyName = reader["company_name"]?.ToString() ?? "",
+        Email = reader["email_from_address"]?.ToString() ?? "",
+        Status = reader["status"]?.ToString() ?? "not_registered",
+        TrialEndsAt = reader["trial_ends_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["trial_ends_at"])
+    };
+}
+
+static object BuildAccountResponse(
+    bool success,
+    bool allowed,
+    string status,
+    string message,
+    TrialRegistrationRequest request,
+    DateTime? trialEndsAt,
+    int daysRemaining,
+    string registeredEmail,
+    Guid registeredInspectorId)
+{
+    return new
+    {
+        success,
+        allowed,
+        status,
+        message,
+        tenantId = request.TenantId,
+        inspectorId = request.InspectorId,
+        registeredInspectorId,
+        email = request.Email.Trim(),
+        registeredEmail,
+        trialEndsAt,
+        daysRemaining
+    };
+}
+
 static async Task<DateTime?> GetTrialEndsAtAsync(NpgsqlConnection conn, Guid inspectorId)
 {
     const string sql = @"
@@ -10721,6 +10888,20 @@ public class TrialRegistrationRequest
 
     [JsonPropertyName("email")]
     public string Email { get; set; } = "";
+
+    [JsonPropertyName("access_code")]
+    public string AccessCode { get; set; } = "";
+}
+
+public class CompanyAccountStatus
+{
+    public Guid InspectorId { get; set; }
+    public Guid TenantId { get; set; }
+    public string InspectorName { get; set; } = "";
+    public string CompanyName { get; set; } = "";
+    public string Email { get; set; } = "";
+    public string Status { get; set; } = "";
+    public DateTime? TrialEndsAt { get; set; }
 }
 
 public record WorkflowActionFailureRequest(string ErrorMessage);
