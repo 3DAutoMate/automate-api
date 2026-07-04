@@ -198,6 +198,7 @@ app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request)
                     message: "This company already has an active subscription.",
                     request: request,
                     trialEndsAt: existingAccount.TrialEndsAt,
+                    companyStartAt: existingAccount.CompanyStartAt,
                     daysRemaining: existingDaysRemaining,
                     registeredEmail: existingAccount.Email,
                     registeredInspectorId: existingAccount.InspectorId));
@@ -213,6 +214,7 @@ app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request)
                     message: "This company already has a founders trial. The existing trial countdown was not reset.",
                     request: request,
                     trialEndsAt: existingAccount.TrialEndsAt,
+                    companyStartAt: existingAccount.CompanyStartAt,
                     daysRemaining: existingDaysRemaining,
                     registeredEmail: existingAccount.Email,
                     registeredInspectorId: existingAccount.InspectorId));
@@ -227,6 +229,7 @@ app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request)
                     message: "This company trial has expired. Contact 3D AutoMate to activate your subscription.",
                     request: request,
                     trialEndsAt: existingAccount.TrialEndsAt,
+                    companyStartAt: existingAccount.CompanyStartAt,
                     daysRemaining: 0,
                     registeredEmail: existingAccount.Email,
                     registeredInspectorId: existingAccount.InspectorId));
@@ -269,6 +272,7 @@ SET
         }
 
         var trialEndsAt = await GetTrialEndsAtAsync(conn, request.InspectorId);
+        var newAccount = await LoadCompanyAccountByTenantAsync(conn, request.TenantId);
 
         return Results.Ok(new
         {
@@ -280,6 +284,7 @@ SET
             email = request.Email.Trim(),
             status = "trialing",
             trialEndsAt,
+            companyStartAt = newAccount?.CompanyStartAt,
             daysRemaining = CalculateTrialDaysRemaining(trialEndsAt)
         });
     }
@@ -322,8 +327,9 @@ app.MapGet("/accounts/trial-status", async (Guid inspectorId, Guid? tenantId) =>
                 registered = false,
                 status = "not_registered",
                 message = "This company is not registered.",
-                trialEndsAt = (DateTime?)null,
-                daysRemaining = 0
+            trialEndsAt = (DateTime?)null,
+            daysRemaining = 0,
+            companyStartAt = (DateTime?)null
             });
         }
 
@@ -347,6 +353,7 @@ app.MapGet("/accounts/trial-status", async (Guid inspectorId, Guid? tenantId) =>
             message,
             trialEndsAt = account.TrialEndsAt,
             daysRemaining = allowed ? daysRemaining : 0,
+            companyStartAt = account.CompanyStartAt,
             inspectorName = account.InspectorName,
             companyName = account.CompanyName,
             email = account.Email,
@@ -10748,6 +10755,7 @@ SELECT
     i.inspector_name,
     i.company_name,
     i.email_from_address,
+    i.created_at AS company_start_at,
     COALESCE(s.status, 'not_registered') AS status,
     s.trial_ends_at
 FROM public.inspectors i
@@ -10779,6 +10787,7 @@ SELECT
     i.inspector_name,
     i.company_name,
     i.email_from_address,
+    i.created_at AS company_start_at,
     COALESCE(s.status, 'not_registered') AS status,
     s.trial_ends_at
 FROM public.inspectors i
@@ -10806,7 +10815,8 @@ static async Task<CompanyAccountStatus?> ReadCompanyAccountStatusAsync(NpgsqlCom
         CompanyName = reader["company_name"]?.ToString() ?? "",
         Email = reader["email_from_address"]?.ToString() ?? "",
         Status = reader["status"]?.ToString() ?? "not_registered",
-        TrialEndsAt = reader["trial_ends_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["trial_ends_at"])
+        TrialEndsAt = reader["trial_ends_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["trial_ends_at"]),
+        CompanyStartAt = reader["company_start_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["company_start_at"])
     };
 }
 
@@ -10817,6 +10827,7 @@ static object BuildAccountResponse(
     string message,
     TrialRegistrationRequest request,
     DateTime? trialEndsAt,
+    DateTime? companyStartAt,
     int daysRemaining,
     string registeredEmail,
     Guid registeredInspectorId)
@@ -10833,6 +10844,7 @@ static object BuildAccountResponse(
         email = request.Email.Trim(),
         registeredEmail,
         trialEndsAt,
+        companyStartAt,
         daysRemaining
     };
 }
@@ -10902,6 +10914,7 @@ public class CompanyAccountStatus
     public string Email { get; set; } = "";
     public string Status { get; set; } = "";
     public DateTime? TrialEndsAt { get; set; }
+    public DateTime? CompanyStartAt { get; set; }
 }
 
 public record WorkflowActionFailureRequest(string ErrorMessage);
