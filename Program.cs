@@ -4860,6 +4860,54 @@ WHERE job_id = @job_id;
 });
 
 // =============================
+// RESET SIGNNOW TERMS ONLY
+// Preserves all non-terms workflow state and leaves the old document in SignNow.
+// =============================
+app.MapPost("/jobs/{jobId}/terms/reset", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureSignNowJobColumnsAsync(conn);
+
+        const string sql = @"
+UPDATE public.jobs_staging
+SET
+    terms_required = true,
+    terms_sent = false,
+    terms_sent_at = NULL,
+    terms_signed = false,
+    terms_signed_at = NULL,
+    terms_retry_requested = false,
+    terms_retry_requested_at = NULL,
+    terms_last_attempt_at = NULL,
+    terms_last_error = NULL,
+    signnow_document_id = NULL,
+    signnow_invite_id = NULL,
+    signnow_template_id = NULL,
+    signnow_document_status = NULL,
+    signnow_last_checked_at = NULL,
+    signnow_signing_link = NULL,
+    workflow_updated_at = NOW(),
+    updated_at = NOW()
+WHERE job_id = @job_id
+RETURNING job_id;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId);
+        var updated = await cmd.ExecuteScalarAsync();
+        return updated == null
+            ? Results.NotFound(new { success = false, message = "Job was not found.", jobId })
+            : Results.Ok(new { success = true, message = "SignNow Terms state reset only.", jobId });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Reset SignNow Terms failed", detail: ex.ToString(), statusCode: 500);
+    }
+});
+
+// =============================
 // MARK TERMS FAILED
 // =============================
 
