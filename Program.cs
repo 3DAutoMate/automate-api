@@ -6073,6 +6073,7 @@ CREATE TABLE IF NOT EXISTS public.job_workflow_actions
     service_slot text NULL,
     status text NOT NULL DEFAULT 'pending',
     retry_requested boolean NOT NULL DEFAULT false,
+    retry_requested_at timestamptz NULL,
     sent_at timestamptz NULL,
     last_attempt_at timestamptz NULL,
     last_error text NULL,
@@ -6080,6 +6081,9 @@ CREATE TABLE IF NOT EXISTS public.job_workflow_actions
     updated_at timestamptz NOT NULL DEFAULT NOW(),
     PRIMARY KEY (job_id, action_key)
 );
+
+ALTER TABLE public.job_workflow_actions
+ADD COLUMN IF NOT EXISTS retry_requested_at timestamptz NULL;
 
 CREATE INDEX IF NOT EXISTS idx_job_workflow_actions_pending
 ON public.job_workflow_actions(status, retry_requested, action_type);
