@@ -2591,6 +2591,35 @@ app.MapPost("/integrations/signnow/template-mappings", async (SignNowTemplateMap
 // =============================
 // SIGNNOW SEND TERMS
 // =============================
+app.MapPost("/integrations/signnow/jobs/{jobId}/ensure-webhook", async (Guid jobId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureSignNowJobColumnsAsync(conn);
+        await using var lookup = new NpgsqlCommand("SELECT signnow_document_id FROM public.jobs_staging WHERE job_id = @job_id LIMIT 1", conn);
+        lookup.Parameters.AddWithValue("job_id", jobId);
+        var documentId = Convert.ToString(await lookup.ExecuteScalarAsync()) ?? "";
+        if (string.IsNullOrWhiteSpace(documentId))
+            return Results.NotFound(new { success = false, message = "No SignNow document is stored for this job." });
+
+        var account = await GetSignNowAccountAsync(conn, builder.Configuration);
+        if (!account.Success)
+            return Results.BadRequest(new { success = false, message = account.ErrorMessage });
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        var result = await CreateSignNowDocumentWebhookAsync(httpClient, documentId, builder.Configuration);
+        await StoreSignNowWebhookResultAsync(conn, jobId, result);
+        return Results.Ok(new { success = result.Success, documentId, subscriptionId = result.SubscriptionId, error = result.Error });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Ensure SignNow webhook failed", detail: ex.ToString(), statusCode: 500);
+    }
+});
+
 app.MapPost("/integrations/signnow/jobs/{jobId}/send-terms", async (Guid jobId) =>
 {
     try
@@ -2677,17 +2706,18 @@ app.MapPost("/api/integrations/signnow/webhook", async (HttpContext context) =>
             return Results.BadRequest(new { success = false, message = "Missing webhook body." });
 
         var root = JsonDocument.Parse(body).RootElement;
-        var documentId = FindJsonStringRecursive(root, "document_id", "documentId", "document_unique_id", "id");
+        var documentId = FindJsonStringRecursive(root, "entity_id", "entityId", "document_id", "documentId", "document_unique_id");
         var eventName = FindJsonStringRecursive(root, "event", "event_type", "type", "status");
-        var jobIdText = FindSignNowJobId(root);
-        Guid.TryParse(jobIdText, out var parsedJobId);
+        if (!string.Equals(eventName, "document.complete", StringComparison.OrdinalIgnoreCase))
+            return Results.Ok(new { success = true, ignored = true, eventName });
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureSignNowJobColumnsAsync(conn);
 
-        if (parsedJobId == Guid.Empty && !string.IsNullOrWhiteSpace(documentId))
-            parsedJobId = await FindJobIdBySignNowDocumentAsync(conn, documentId);
+        var parsedJobId = string.IsNullOrWhiteSpace(documentId)
+            ? Guid.Empty
+            : await FindJobIdBySignNowDocumentAsync(conn, documentId);
 
         if (parsedJobId == Guid.Empty)
         {
@@ -2699,26 +2729,16 @@ app.MapPost("/api/integrations/signnow/webhook", async (HttpContext context) =>
             });
         }
 
-        var signed = LooksLikeSignNowCompleted(eventName) || LooksLikeSignNowCompleted(FindJsonStringRecursive(root, "status"));
-        await StoreSignNowStatusAsync(
-            conn,
-            parsedJobId,
-            documentId,
-            null,
-            null,
-            eventName,
-            null,
-            signed,
-            signed ? DateTime.UtcNow : null);
+        var verification = await RefreshSignNowTermsStatusAsync(conn, parsedJobId, builder.Configuration);
 
         return Results.Ok(new
         {
-            success = true,
+            success = verification.Success,
             matched = true,
             jobId = parsedJobId,
             documentId,
-            status = eventName,
-            signed
+            eventName,
+            verified = verification.Details
         });
     }
     catch (Exception ex)
@@ -4561,6 +4581,9 @@ SET
     signnow_document_status = NULL,
     signnow_last_checked_at = NULL,
     signnow_signing_link = NULL,
+    signnow_webhook_subscription_id = NULL,
+    signnow_webhook_status = NULL,
+    signnow_webhook_last_error = NULL,
 
     invoice_sent = false,
     invoice_sent_at = NULL,
@@ -4889,6 +4912,9 @@ SET
     signnow_document_status = NULL,
     signnow_last_checked_at = NULL,
     signnow_signing_link = NULL,
+    signnow_webhook_subscription_id = NULL,
+    signnow_webhook_status = NULL,
+    signnow_webhook_last_error = NULL,
     workflow_updated_at = NOW(),
     updated_at = NOW()
 WHERE job_id = @job_id
@@ -6443,7 +6469,16 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS signnow_last_checked_at timestamptz NULL;
 
 ALTER TABLE public.jobs_staging
-ADD COLUMN IF NOT EXISTS signnow_signing_link text NULL;";
+ADD COLUMN IF NOT EXISTS signnow_signing_link text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_webhook_subscription_id text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_webhook_status text NULL;
+
+ALTER TABLE public.jobs_staging
+ADD COLUMN IF NOT EXISTS signnow_webhook_last_error text NULL;";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
@@ -7381,6 +7416,8 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         return ScheduleActionResult.Failed("terms", "SignNow did not return a document ID after copying the template.");
     }
 
+    var webhook = await CreateSignNowDocumentWebhookAsync(httpClient, documentId, configuration);
+
     var documentResponse = await httpClient.GetAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(documentId)}");
     var documentJson = await documentResponse.Content.ReadAsStringAsync();
     JsonElement? documentRoot = null;
@@ -7441,6 +7478,7 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         mapping.TemplateId,
         "sent",
         signingLink);
+    await StoreSignNowWebhookResultAsync(conn, job.JobId, webhook);
 
     return ScheduleActionResult.Ok("terms", "SignNow terms sent to client.", new
     {
@@ -7449,8 +7487,60 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         templateKey,
         templateId = mapping.TemplateId,
         templateName = mapping.TemplateName,
-        sentTo = job.ClientEmail
+        sentTo = job.ClientEmail,
+        webhookCreated = webhook.Success,
+        webhookSubscriptionId = webhook.SubscriptionId,
+        webhookError = webhook.Error
     });
+}
+
+static async Task<SignNowWebhookRegistrationResult> CreateSignNowDocumentWebhookAsync(HttpClient httpClient, string documentId, IConfiguration configuration)
+{
+    var callbackUrl = configuration["SIGNNOW_WEBHOOK_URL"];
+    if (string.IsNullOrWhiteSpace(callbackUrl))
+        callbackUrl = "https://automate-api-production.up.railway.app/api/integrations/signnow/webhook";
+
+    var payload = new
+    {
+        @event = "document.complete",
+        entity_id = documentId,
+        action = "callback",
+        attributes = new { callback = callbackUrl, use_tls_12 = true },
+        secret_key = ""
+    };
+
+    try
+    {
+        var response = await httpClient.PostAsJsonAsync("https://api.signnow.com/api/v2/events", payload);
+        var json = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+            return new SignNowWebhookRegistrationResult(false, "", json);
+        var subscriptionId = "";
+        if (!string.IsNullOrWhiteSpace(json))
+            subscriptionId = FindJsonStringRecursive(JsonDocument.Parse(json).RootElement, "event_subscription_id", "subscription_id", "id");
+        return new SignNowWebhookRegistrationResult(true, subscriptionId, "");
+    }
+    catch (Exception ex)
+    {
+        return new SignNowWebhookRegistrationResult(false, "", ex.Message);
+    }
+}
+
+static async Task StoreSignNowWebhookResultAsync(NpgsqlConnection conn, Guid jobId, SignNowWebhookRegistrationResult result)
+{
+    const string sql = @"
+UPDATE public.jobs_staging
+SET signnow_webhook_subscription_id = NULLIF(@subscription_id, ''),
+    signnow_webhook_status = @status,
+    signnow_webhook_last_error = NULLIF(@last_error, ''),
+    updated_at = NOW()
+WHERE job_id = @job_id;";
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("job_id", jobId);
+    cmd.Parameters.AddWithValue("subscription_id", result.SubscriptionId ?? "");
+    cmd.Parameters.AddWithValue("status", result.Success ? "active" : "failed");
+    cmd.Parameters.AddWithValue("last_error", result.Error ?? "");
+    await cmd.ExecuteNonQueryAsync();
 }
 
 static async Task<ScheduleActionResult> RefreshSignNowTermsStatusAsync(
@@ -8529,27 +8619,6 @@ static string ExtractSignNowSignerRoleId(JsonElement? document)
         return "";
 
     return FindJsonStringRecursive(document.Value, "role_id", "roleId");
-}
-
-static string FindSignNowJobId(JsonElement root)
-{
-    var direct = FindJsonStringRecursive(root, "JobID", "job_id", "jobId");
-    if (!string.IsNullOrWhiteSpace(direct))
-        return direct;
-
-    if (root.ValueKind == JsonValueKind.Object)
-    {
-        foreach (var property in root.EnumerateObject())
-        {
-            if (string.Equals(property.Name, "field_name", StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(property.Value.ToString(), "JobID", StringComparison.OrdinalIgnoreCase))
-            {
-                return FirstNonEmptyJsonString(root, "value", "text", "prefilled_text");
-            }
-        }
-    }
-
-    return "";
 }
 
 static bool LooksLikeSignNowCompleted(string? status)
@@ -10967,6 +11036,7 @@ public record TermsFailureRequest(string ErrorMessage);
 public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
+public record SignNowWebhookRegistrationResult(bool Success, string SubscriptionId, string Error);
 public record GoogleCalendarSelectionRequest(string InspectorId, string CalendarId);
 public record EmailSenderModeRequest(string InspectorId, string SenderMode);
 public class EmailTemplateSaveRequest
