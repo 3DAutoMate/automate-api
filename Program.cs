@@ -6168,40 +6168,24 @@ DO UPDATE SET
 
 static List<WorkflowActionSeed> BuildBookingWorkflowActions(JobUploadRequest payload, Guid jobId, Guid tenantId, Guid inspectorId)
 {
-    var actions = new List<WorkflowActionSeed>();
+    if (!(payload.Services?.BookingEmailRequired ?? true))
+        return new List<WorkflowActionSeed>();
 
-    AddBookingWorkflowAction(actions, jobId, tenantId, inspectorId, "primary", payload.Services?.Primary, NormalizeServiceKey(payload.Services?.PrimaryServiceKey, payload.Services?.Primary), payload.Services?.BookingEmailRequired ?? true);
-    AddBookingWorkflowAction(actions, jobId, tenantId, inspectorId, "additional1", payload.Services?.Additional1, NormalizeServiceKey(payload.Services?.Additional1ServiceKey, payload.Services?.Additional1), payload.Services?.BookingEmailRequired ?? true);
-    AddBookingWorkflowAction(actions, jobId, tenantId, inspectorId, "additional2", payload.Services?.Additional2, NormalizeServiceKey(payload.Services?.Additional2ServiceKey, payload.Services?.Additional2), payload.Services?.BookingEmailRequired ?? true);
+    var labels = new[] { payload.Services?.Primary, payload.Services?.Additional1, payload.Services?.Additional2 }
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Select(value => value!.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+    if (labels.Length == 0)
+        return new List<WorkflowActionSeed>();
 
-    return actions
-        .GroupBy(action => action.ActionKey, StringComparer.OrdinalIgnoreCase)
-        .Select(group => group.First())
-        .ToList();
-}
-
-static void AddBookingWorkflowAction(List<WorkflowActionSeed> actions, Guid jobId, Guid tenantId, Guid inspectorId, string serviceSlot, string? serviceLabel, string serviceKey, bool bookingEmailRequired)
-{
-    if (!bookingEmailRequired || string.IsNullOrWhiteSpace(serviceLabel))
-        return;
-
-    if (string.IsNullOrWhiteSpace(serviceKey) || IsModifierServiceKey(serviceKey))
-        return;
-
-    var actionKey = BuildBookingActionKey(serviceKey, serviceLabel);
-
-    if (string.IsNullOrWhiteSpace(actionKey))
-        return;
-
-    actions.Add(new WorkflowActionSeed(
-        jobId,
-        tenantId,
-        inspectorId,
-        actionKey,
-        "booking_email",
-        serviceKey,
-        serviceLabel.Trim(),
-        serviceSlot));
+    var templateKey = string.IsNullOrWhiteSpace(payload.Services?.BookingTemplateKey)
+        ? "general_booking"
+        : payload.Services.BookingTemplateKey.Trim();
+    return new List<WorkflowActionSeed>
+    {
+        new(jobId, tenantId, inspectorId, "booking_job_confirmation", "booking_email", templateKey, string.Join(", ", labels), "job")
+    };
 }
 
 static string NormalizeServiceKey(string? serviceKey, string? serviceLabel)
