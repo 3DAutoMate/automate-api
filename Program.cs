@@ -6993,9 +6993,9 @@ LIMIT 1;";
         return null;
 
     return new ScheduleJobInput(
-        (Guid)reader["job_id"],
-        reader["tenant_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["tenant_id"],
-        (Guid)reader["inspector_id"],
+        ReadDatabaseGuid(reader["job_id"]),
+        ReadDatabaseGuid(reader["tenant_id"]),
+        ReadDatabaseGuid(reader["inspector_id"]),
         reader["inspector_name"]?.ToString() ?? "",
         reader["job_name"]?.ToString() ?? "",
         reader["site_address"]?.ToString() ?? "",
@@ -7040,6 +7040,15 @@ LIMIT 1;";
         reader["email_from_address"]?.ToString() ?? "",
         reader["phone"]?.ToString() ?? "",
         NormalizeEmailSenderMode(reader["email_sender_mode"]?.ToString()));
+}
+
+static Guid ReadDatabaseGuid(object? value)
+{
+    if (value == null || value == DBNull.Value)
+        return Guid.Empty;
+    if (value is Guid guid)
+        return guid;
+    return Guid.TryParse(Convert.ToString(value), out var parsed) ? parsed : Guid.Empty;
 }
 
 static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
