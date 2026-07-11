@@ -864,6 +864,87 @@ app.MapPost("/admin/jobs/{jobId}/online-property/force-refresh", async (HttpCont
     return branz.Status == "available" ? Results.Ok(branz) : Results.Json(branz, statusCode: 422);
 });
 
+app.MapGet("/jobs/{jobId}/change-review", async (Guid jobId, Guid? tenantId) =>
+{
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
+    await using var cmd = new NpgsqlCommand(@"SELECT tenant_id,change_review_pending,pending_change_json,pending_change_fingerprint,pending_change_reasons,
+change_detected_at,approved_snapshot_version,xero_review_required,report_review_required,source_missing,unscheduled
+FROM public.jobs_staging WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn);
+    cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value;
+    await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return Results.NotFound(new { success = false, message = "Job not found for this company." });
+    object? changes = null; if (reader["pending_change_json"] != DBNull.Value) changes = JsonSerializer.Deserialize<object>(reader["pending_change_json"].ToString() ?? "[]");
+    return Results.Ok(new { success = true, jobId, changeReviewPending = (bool)reader["change_review_pending"], changes,
+        revision = reader["pending_change_fingerprint"]?.ToString() ?? "", reasons = reader["pending_change_reasons"]?.ToString() ?? "",
+        detectedAt = reader["change_detected_at"] == DBNull.Value ? null : reader["change_detected_at"], approvedVersion = reader["approved_snapshot_version"],
+        xeroReviewRequired = (bool)reader["xero_review_required"], reportReviewRequired = (bool)reader["report_review_required"],
+        sourceMissing = (bool)reader["source_missing"], unscheduled = (bool)reader["unscheduled"] });
+});
+
+app.MapPost("/jobs/{jobId}/confirm-change-review", async (Guid jobId, Guid? tenantId, string? confirmedBy) =>
+{
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
+    await using var tx = await conn.BeginTransactionAsync(); string reasons = "", changes = "[]", fingerprint = "", snapshot = "{}"; int version = 0; Guid rowTenant = Guid.Empty;
+    await using (var select = new NpgsqlCommand(@"SELECT tenant_id,change_review_pending,pending_change_reasons,pending_change_json::text,pending_change_fingerprint,
+current_snapshot_json::text,approved_snapshot_version FROM public.jobs_staging WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant) FOR UPDATE", conn, tx))
+    {
+        select.Parameters.AddWithValue("job", jobId); select.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value;
+        await using var reader = await select.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return Results.NotFound(new { success = false, message = "Job not found for this company." });
+        if (!(bool)reader["change_review_pending"]) return Results.Ok(new { success = true, alreadyConfirmed = true });
+        Guid.TryParse(reader["tenant_id"]?.ToString(), out rowTenant); reasons = reader["pending_change_reasons"]?.ToString() ?? ""; changes = reader["pending_change_json"]?.ToString() ?? "[]";
+        fingerprint = reader["pending_change_fingerprint"]?.ToString() ?? ""; snapshot = reader["current_snapshot_json"]?.ToString() ?? "{}"; version = Convert.ToInt32(reader["approved_snapshot_version"]) + 1;
+    }
+    var categories = reasons.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    bool email = categories.Overlaps(new[] { "address", "services", "scope", "price", "schedule", "customer" });
+    bool terms = categories.Overlaps(new[] { "address", "services", "scope", "customer" });
+    bool calendar = categories.Overlaps(new[] { "address", "services", "scope", "schedule", "customer", "operational" });
+    await using (var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET
+booking_email_sent=CASE WHEN @email AND booking_email_required THEN false ELSE booking_email_sent END,
+booking_email_retry_requested=CASE WHEN @email AND booking_email_required THEN true ELSE booking_email_retry_requested END,
+terms_sent=CASE WHEN @terms AND terms_required THEN false ELSE terms_sent END,terms_signed=CASE WHEN @terms AND terms_required THEN false ELSE terms_signed END,
+terms_retry_requested=CASE WHEN @terms AND terms_required THEN true ELSE terms_retry_requested END,
+signnow_document_status=CASE WHEN @terms AND terms_required THEN 'superseded-change-review' ELSE signnow_document_status END,
+calendar_created=CASE WHEN @calendar AND calendar_required THEN false ELSE calendar_created END,
+calendar_retry_requested=CASE WHEN @calendar AND calendar_required THEN true ELSE calendar_retry_requested END,
+approved_snapshot_json=CAST(@snapshot AS jsonb),approved_snapshot_fingerprint=@fingerprint,approved_snapshot_version=@version,
+change_review_pending=false,pending_change_json=NULL,pending_change_fingerprint=NULL,pending_change_reasons=NULL,
+change_confirmed_at=NOW(),change_confirmed_by=@actor,address_change_pending=false,workflow_updated_at=NOW()
+WHERE job_id=@job", conn, tx))
+    {
+        update.Parameters.AddWithValue("job", jobId); update.Parameters.AddWithValue("email", email); update.Parameters.AddWithValue("terms", terms); update.Parameters.AddWithValue("calendar", calendar);
+        update.Parameters.AddWithValue("snapshot", snapshot); update.Parameters.AddWithValue("fingerprint", fingerprint); update.Parameters.AddWithValue("version", version); update.Parameters.AddWithValue("actor", confirmedBy ?? "Connector user");
+        await update.ExecuteNonQueryAsync();
+    }
+    await tx.CommitAsync();
+    await JobChangeSupport.AuditAsync(conn, jobId, rowTenant, version, "confirmed", fingerprint, changes, reasons, confirmedBy ?? "Connector user");
+    return Results.Ok(new { success = true, reasons, queued = new { email, terms, calendar }, xeroUnchanged = true });
+});
+
+app.MapPost("/jobs/{jobId}/manual-review/{reviewType}/complete", async (Guid jobId, string reviewType, Guid? tenantId, string? completedBy) =>
+{
+    string column = reviewType.Trim().ToLowerInvariant() switch { "xero" => "xero_review_required", "report" => "report_review_required", _ => "" };
+    if (column.Length == 0) return Results.BadRequest(new { success = false, message = "reviewType must be xero or report." });
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
+    await using var cmd = new NpgsqlCommand($"UPDATE public.jobs_staging SET {column}=false WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn);
+    cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value;
+    int rows = await cmd.ExecuteNonQueryAsync(); return rows == 0 ? Results.NotFound() : Results.Ok(new { success = true, reviewType, completedBy });
+});
+
+app.MapPost("/jobs/{jobId}/cancel-unschedule", async (Guid jobId, Guid? tenantId, string? cancelledBy, bool sourceMissing) =>
+{
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
+    await using (var owner = new NpgsqlCommand("SELECT 1 FROM public.jobs_staging WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn))
+    { owner.Parameters.AddWithValue("job", jobId); owner.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value; if (await owner.ExecuteScalarAsync() == null) return Results.NotFound(new { success = false, message = "Job not found for this company." }); }
+    var job = await LoadScheduleJobAsync(conn, jobId); if (job == null) return Results.NotFound();
+    var calendar = await CancelGoogleCalendarEventForJobAsync(conn, job, builder.Configuration);
+    await using (var cmd = new NpgsqlCommand(@"UPDATE public.jobs_staging SET unscheduled=true,source_missing=@missing,source_missing_at=CASE WHEN @missing THEN NOW() ELSE source_missing_at END,
+change_review_pending=false,booking_email_retry_requested=false,terms_retry_requested=false,invoice_retry_requested=false,calendar_retry_requested=false,report_retry_requested=false,
+xero_review_required=(xero_review_required OR invoice_sent),pending_change_reasons='cancellation_email_setup',workflow_updated_at=NOW() WHERE job_id=@job", conn))
+    { cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.AddWithValue("missing", sourceMissing); await cmd.ExecuteNonQueryAsync(); }
+    await using (var actions = new NpgsqlCommand("UPDATE public.job_workflow_actions SET status='superseded',retry_requested=false,updated_at=NOW() WHERE job_id=@job AND status <> 'sent'", conn))
+    { actions.Parameters.AddWithValue("job", jobId); await actions.ExecuteNonQueryAsync(); }
+    return Results.Ok(new { success = calendar.Success, jobId, unscheduled = true, sourceMissing, calendar, cancellationEmail = "setup_required", xeroUnchanged = true, cancelledBy });
+});
+
 app.MapPost("/jobs/{jobId}/confirm-address-change", async (Guid jobId, Guid? tenantId, string? confirmedBy) =>
 {
     await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
@@ -2760,6 +2841,7 @@ app.MapPost("/integrations/signnow/jobs/{jobId}/send-terms", async (Guid jobId) 
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
+        await JobChangeSupport.EnsureAsync(conn);
         await EnsureSignNowTemplateMappingsTableAsync(conn);
         await EnsureInspectorIntegrationsTableAsync(conn);
 
@@ -3562,6 +3644,15 @@ app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
         await EnsureSignNowTemplateMappingsTableAsync(conn);
         await EnsureJobInvoiceLinesTableAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
+        await JobChangeSupport.EnsureAsync(conn);
+
+        await using (var gate = new NpgsqlCommand("SELECT change_review_pending,unscheduled FROM public.jobs_staging WHERE job_id=@job", conn))
+        {
+            gate.Parameters.AddWithValue("job", jobId);
+            await using var gateReader = await gate.ExecuteReaderAsync();
+            if (await gateReader.ReadAsync() && (gateReader.GetBoolean(0) || gateReader.GetBoolean(1)))
+                return Results.Conflict(new { success = false, status = "change_review_required", message = "Review the detected 3D job changes before running customer workflows." });
+        }
 
         var job = await LoadScheduleJobAsync(conn, jobId);
         if (job == null)
@@ -3800,6 +3891,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) s ON TRUE
 WHERE
+NOT j.change_review_pending AND NOT j.unscheduled AND
 (
     (j.booking_email_required = true AND (j.booking_email_sent = false OR j.booking_email_retry_requested = true))
     OR (j.terms_required = true AND (j.terms_sent = false OR j.terms_retry_requested = true))
@@ -4003,6 +4095,7 @@ app.MapGet("/jobs/workflow-status", async () =>
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
+        await JobChangeSupport.EnsureAsync(conn);
 
         const string sql = @"
 SELECT
@@ -4011,6 +4104,7 @@ SELECT
     j.site_address,
     j.job_date,
     j.date_added,
+    j.source_updated_at,
     j.status,
     j.inspector_name,
     j.job_total,
@@ -4043,6 +4137,20 @@ SELECT
     j.contact1_email,
     j.weathertightness,
     j.workflow_updated_at,
+    j.change_review_pending,
+    j.address_change_pending,
+    j.previous_site_address,
+    j.address_change_detected_at,
+    j.pending_change_json,
+    j.pending_change_fingerprint,
+    j.pending_change_reasons,
+    j.change_detected_at,
+    j.approved_snapshot_version,
+    j.current_snapshot_fingerprint,
+    j.xero_review_required,
+    j.report_review_required,
+    j.source_missing,
+    j.unscheduled,
     COALESCE(a.pending_action_count, 0) AS pending_action_count,
     COALESCE(a.sent_action_count, 0) AS sent_action_count,
     COALESCE(a.failed_action_count, 0) AS failed_action_count,
@@ -4076,6 +4184,7 @@ LIMIT 500;";
                 site_address = reader["site_address"]?.ToString(),
                 job_date = reader["job_date"]?.ToString(),
                 date_added = reader["date_added"]?.ToString(),
+                source_updated_at = reader["source_updated_at"]?.ToString(),
                 status = reader["status"]?.ToString(),
                 inspector_name = reader["inspector_name"]?.ToString(),
                 job_total = reader["job_total"]?.ToString(),
@@ -4110,6 +4219,20 @@ LIMIT 500;";
                 weathertightness = reader["weathertightness"]?.ToString(),
                 weathertightness_scope_label = ToScopeLabel(reader["weathertightness"]?.ToString()),
                 workflow_updated_at = reader["workflow_updated_at"]?.ToString(),
+                change_review_pending = reader["change_review_pending"]?.ToString(),
+                address_change_pending = reader["address_change_pending"]?.ToString(),
+                previous_site_address = reader["previous_site_address"]?.ToString(),
+                address_change_detected_at = reader["address_change_detected_at"]?.ToString(),
+                pending_change_json = reader["pending_change_json"]?.ToString(),
+                pending_change_fingerprint = reader["pending_change_fingerprint"]?.ToString(),
+                pending_change_reasons = reader["pending_change_reasons"]?.ToString(),
+                change_detected_at = reader["change_detected_at"]?.ToString(),
+                approved_snapshot_version = reader["approved_snapshot_version"]?.ToString(),
+                current_snapshot_fingerprint = reader["current_snapshot_fingerprint"]?.ToString(),
+                xero_review_required = reader["xero_review_required"]?.ToString(),
+                report_review_required = reader["report_review_required"]?.ToString(),
+                source_missing = reader["source_missing"]?.ToString(),
+                unscheduled = reader["unscheduled"]?.ToString(),
                 pending_action_count = reader["pending_action_count"]?.ToString(),
                 sent_action_count = reader["sent_action_count"]?.ToString(),
                 failed_action_count = reader["failed_action_count"]?.ToString(),
@@ -4260,6 +4383,7 @@ LEFT JOIN LATERAL (
 ) s ON TRUE
 WHERE a.action_type = 'booking_email'
   AND (a.status = 'pending' OR a.retry_requested = true)
+  AND NOT j.change_review_pending AND NOT j.unscheduled
   AND (@inspector_id IS NULL OR a.inspector_id = @inspector_id)
 ORDER BY a.updated_at ASC
 LIMIT 100;";
@@ -5955,6 +6079,8 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
 
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureOnlinePropertyTablesAsync(conn);
+        await JobChangeSupport.EnsureAsync(conn);
+        var changePreparation = await JobChangeSupport.PrepareAsync(conn, jobId, payload);
 
         string previousAddress = "";
         bool workflowStartedBeforeAddressChange = false;
@@ -6294,6 +6420,7 @@ WHERE job_id=@job_id", conn);
 
         await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
         await RefreshJobInvoiceLinesAsync(conn, payload, jobId);
+        await JobChangeSupport.ApplyAsync(conn, jobId, tenantId, changePreparation);
 
         return Results.Ok(new
         {
@@ -6301,7 +6428,10 @@ WHERE job_id=@job_id", conn);
             message = "Job staged successfully",
             jobId = payload.Job.JobId,
             tenantId = payload.TenantId,
-            inspectorId = payload.Job.InspectorId
+            inspectorId = payload.Job.InspectorId,
+            changeReviewPending = changePreparation.Pending,
+            changeReasons = changePreparation.Reasons,
+            currentSnapshotFingerprint = changePreparation.Fingerprint
         });
     }
     catch (PostgresException pgEx)
@@ -6544,6 +6674,8 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
 {
     await startupMigrationConnection.OpenAsync();
     await EnsureOnlinePropertyTablesAsync(startupMigrationConnection);
+    await JobChangeSupport.EnsureAsync(startupMigrationConnection);
+    await JobChangeSupport.BackfillApprovedSnapshotsAsync(startupMigrationConnection);
 }
 
 app.Run();
@@ -8329,6 +8461,35 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
         eventId = GetJsonString(created, "id"),
         htmlLink = GetJsonString(created, "htmlLink")
     });
+}
+
+static async Task<ScheduleActionResult> CancelGoogleCalendarEventForJobAsync(
+    NpgsqlConnection conn,
+    ScheduleJobInput job,
+    IConfiguration configuration)
+{
+    if (!job.CalendarCreated) return ScheduleActionResult.Skip("calendar", "No active Calendar event was recorded.");
+    var account = await GetGoogleCalendarAccountAsync(conn, job.InspectorId, configuration);
+    if (!account.Success) return ScheduleActionResult.Failed("calendar", account.ErrorMessage ?? "Google Calendar is not connected.");
+    using var httpClient = new HttpClient(); httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+    var calendarId = string.IsNullOrWhiteSpace(account.CalendarId) ? "primary" : account.CalendarId;
+    var privateProperty = Uri.EscapeDataString("automateJobId=" + job.JobId);
+    var lookupUrl = $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events?privateExtendedProperty={privateProperty}&singleEvents=true&maxResults=10";
+    var lookupResponse = await httpClient.GetAsync(lookupUrl); var lookupJson = await lookupResponse.Content.ReadAsStringAsync();
+    if (!lookupResponse.IsSuccessStatusCode) return ScheduleActionResult.Failed("calendar", "Calendar lookup failed: " + lookupJson);
+    var root = JsonDocument.Parse(lookupJson).RootElement;
+    if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array || items.GetArrayLength() == 0)
+        return ScheduleActionResult.Skip("calendar", "Calendar event was already absent.");
+    foreach (var item in items.EnumerateArray())
+    {
+        var id = GetJsonString(item, "id"); if (id.Length == 0) continue;
+        var response = await httpClient.DeleteAsync($"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events/{Uri.EscapeDataString(id)}");
+        if (!response.IsSuccessStatusCode && response.StatusCode != System.Net.HttpStatusCode.Gone && response.StatusCode != System.Net.HttpStatusCode.NotFound)
+            return ScheduleActionResult.Failed("calendar", "Calendar cancellation failed: " + await response.Content.ReadAsStringAsync());
+    }
+    await using var cmd = new NpgsqlCommand("UPDATE public.jobs_staging SET calendar_created=false,calendar_created_at=NULL WHERE job_id=@job", conn);
+    cmd.Parameters.AddWithValue("job", job.JobId); await cmd.ExecuteNonQueryAsync();
+    return ScheduleActionResult.Ok("calendar", "Calendar event cancelled.");
 }
 
 static string BuildGoogleCalendarDescription(ScheduleJobInput job, List<XeroInvoiceLineInput> invoiceLines)
