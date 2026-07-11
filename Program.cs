@@ -779,6 +779,70 @@ app.MapGet("/mappings/v1-template", () => Results.Ok(new
     fields = V1MappingFields
 }));
 
+app.MapGet("/integrations/branz/lookup", async (string address, Guid? jobId, double? latitude, double? longitude, bool refresh) =>
+{
+    var result = await BranzLookupService.LookupAsync(address, latitude, longitude, refresh);
+    if (jobId.HasValue)
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        const string sql = @"
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_wind_zone text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_exposure_zone text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_lookup_status text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_latitude double precision NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_longitude double precision NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_address_fingerprint text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_retrieved_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_lookup_error text NULL;
+UPDATE public.jobs_staging SET
+ branz_wind_zone = CASE WHEN @status = 'available' THEN @wind ELSE branz_wind_zone END,
+ branz_exposure_zone = CASE WHEN @status = 'available' THEN @exposure ELSE branz_exposure_zone END,
+ branz_lookup_status = @status, branz_latitude = @latitude, branz_longitude = @longitude,
+ branz_address_fingerprint = @fingerprint, branz_retrieved_at = @retrieved, branz_lookup_error = @error,
+ updated_at = NOW()
+WHERE job_id = @job_id;";
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId.Value);
+        cmd.Parameters.AddWithValue("status", result.Status);
+        cmd.Parameters.AddWithValue("wind", result.WindZone);
+        cmd.Parameters.AddWithValue("exposure", result.ExposureZone);
+        cmd.Parameters.AddWithValue("latitude", result.Latitude.HasValue ? result.Latitude.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("longitude", result.Longitude.HasValue ? result.Longitude.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint);
+        cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt);
+        cmd.Parameters.AddWithValue("error", result.Error);
+        await cmd.ExecuteNonQueryAsync();
+    }
+    return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
+});
+
+app.MapGet("/integrations/property-features/lookup", async (string address, Guid? jobId, bool refresh) =>
+{
+    var result = await PropertyFeaturesLookupService.LookupAsync(address, refresh);
+    if (jobId.HasValue)
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        const string sql = @"
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_json jsonb NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_status text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_address_fingerprint text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_retrieved_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_error text NULL;
+UPDATE public.jobs_staging SET
+ property_features_json = CASE WHEN @status = 'available' THEN CAST(@json AS jsonb) ELSE property_features_json END,
+ property_features_status = @status, property_features_address_fingerprint = @fingerprint,
+ property_features_retrieved_at = @retrieved, property_features_error = @error, updated_at = NOW()
+WHERE job_id = @job_id;";
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("job_id", jobId.Value); cmd.Parameters.AddWithValue("status", result.Status);
+        cmd.Parameters.AddWithValue("json", JsonSerializer.Serialize(result)); cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint);
+        cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt); cmd.Parameters.AddWithValue("error", result.Error);
+        await cmd.ExecuteNonQueryAsync();
+    }
+    return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
+});
+
 // =============================
 // CONNECTOR DISCOVERY SYNC
 // =============================
