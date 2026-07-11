@@ -91,7 +91,14 @@ WHERE change_review_pending=true AND approved_snapshot_json IS NOT NULL AND curr
             while (await reader.ReadAsync()) rows.Add((reader.GetGuid(0), reader.GetString(1), reader.GetString(2)));
         foreach (var row in rows)
         {
-            var changes = Diff(row.Approved, row.Current); if (changes.Count == 0) continue;
+            var changes = Diff(row.Approved, row.Current);
+            if (changes.Count == 0)
+            {
+                await using var clear = new NpgsqlCommand(@"UPDATE public.jobs_staging SET change_review_pending=false,pending_change_json=NULL,
+pending_change_reasons=NULL,pending_change_fingerprint=NULL WHERE job_id=@job AND change_review_pending=true", conn);
+                clear.Parameters.AddWithValue("job", row.JobId); await clear.ExecuteNonQueryAsync();
+                continue;
+            }
             string json = JsonSerializer.Serialize(changes); string reasons = string.Join(",", changes.Select(change => change.category).Distinct()); string fingerprint = Fingerprint(row.Current);
             await using var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET pending_change_json=CAST(@changes AS jsonb),pending_change_reasons=@reasons,
 pending_change_fingerprint=@fingerprint WHERE job_id=@job AND change_review_pending=true", conn);
