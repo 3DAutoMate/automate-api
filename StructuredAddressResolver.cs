@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+using System.Text;
 
 public sealed record StructuredAddressMatch(int? PropertyId, string PageUrl, string MatchedAddress);
 
@@ -56,6 +58,14 @@ public static class StructuredAddressResolver
         .Select(match => match.Value).Where(token => token.Length > 1).ToHashSet(StringComparer.OrdinalIgnoreCase);
     private static string Text(JsonElement value, string name) => value.TryGetProperty(name, out var child) && child.ValueKind == JsonValueKind.String ? child.GetString() ?? "" : "";
     private static int? Integer(JsonElement value, string name) => value.TryGetProperty(name, out var child) && child.TryGetInt32(out var result) ? result : null;
+    public static string Fingerprint(string address)
+    {
+        var value = (address ?? "").Trim().ToUpperInvariant();
+        value = Regex.Replace(value, @"(?:,?\s*)\b\d{4}\b\s*$", "");
+        value = Regex.Replace(value, @"[^A-Z0-9]", "");
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+    }
+
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };

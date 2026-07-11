@@ -67,7 +67,7 @@ public static class PropertyFeaturesLookupService
 
     private static PropertyFeaturesResult Failed(string fingerprint, string error) => new("unavailable", fingerprint, DateTimeOffset.UtcNow, error,
         null, "", null, null, "", "", null, null, null, null, null, "", "", "", "", "", "", "", "");
-    private static string Fingerprint(string address) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Regex.Replace((address ?? "").Trim().ToUpperInvariant(), "\\s+", " ")))).ToLowerInvariant();
+    private static string Fingerprint(string address) => StructuredAddressResolver.Fingerprint(address);
     private static JsonElement Child(JsonElement value, string name) => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(name, out var child) ? child : default;
     private static string Text(JsonElement value, string name) { var child = Child(value, name); return child.ValueKind == JsonValueKind.String ? child.GetString() ?? "" : child.ValueKind == JsonValueKind.Number ? child.ToString() : ""; }
     private static int? Integer(JsonElement value, string name) { var child = Child(value, name); return child.ValueKind == JsonValueKind.Number && child.TryGetInt32(out var result) ? result : null; }

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using static OnlinePropertySupport;
 using System.Text.RegularExpressions;
 using System.Text;
 using System.Net;
@@ -779,68 +780,97 @@ app.MapGet("/mappings/v1-template", () => Results.Ok(new
     fields = V1MappingFields
 }));
 
-app.MapGet("/integrations/branz/lookup", async (string address, Guid? jobId, double? latitude, double? longitude, bool refresh) =>
+app.MapGet("/integrations/branz/lookup", () => Results.Json(new { success = false, message = "Address-based lookup is disabled. Use the owned job refresh endpoint." }, statusCode: 410));
+app.MapGet("/integrations/property-features/lookup", () => Results.Json(new { success = false, message = "Address-based lookup is disabled. Use the owned job refresh endpoint." }, statusCode: 410));
+
+app.MapGet("/jobs/{jobId}/online-property-data", async (Guid jobId, Guid? tenantId) =>
 {
-    var result = await BranzLookupService.LookupAsync(address, latitude, longitude, refresh);
-    if (jobId.HasValue)
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        const string sql = @"
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_wind_zone text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_exposure_zone text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_lookup_status text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_latitude double precision NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_longitude double precision NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_address_fingerprint text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_retrieved_at timestamptz NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_lookup_error text NULL;
-UPDATE public.jobs_staging SET
- branz_wind_zone = CASE WHEN @status = 'available' THEN @wind ELSE branz_wind_zone END,
- branz_exposure_zone = CASE WHEN @status = 'available' THEN @exposure ELSE branz_exposure_zone END,
- branz_lookup_status = @status, branz_latitude = @latitude, branz_longitude = @longitude,
- branz_address_fingerprint = @fingerprint, branz_retrieved_at = @retrieved, branz_lookup_error = @error,
- updated_at = NOW()
-WHERE job_id = @job_id;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("job_id", jobId.Value);
-        cmd.Parameters.AddWithValue("status", result.Status);
-        cmd.Parameters.AddWithValue("wind", result.WindZone);
-        cmd.Parameters.AddWithValue("exposure", result.ExposureZone);
-        cmd.Parameters.AddWithValue("latitude", result.Latitude.HasValue ? result.Latitude.Value : DBNull.Value);
-        cmd.Parameters.AddWithValue("longitude", result.Longitude.HasValue ? result.Longitude.Value : DBNull.Value);
-        cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint);
-        cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt);
-        cmd.Parameters.AddWithValue("error", result.Error);
-        await cmd.ExecuteNonQueryAsync();
-    }
-    return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+    await EnsureOnlinePropertyTablesAsync(conn);
+    var current = await LoadOnlinePropertyDataAsync(conn, jobId, tenantId);
+    return current == null ? Results.NotFound(new { success = false, message = "Job not found for this company." }) : Results.Ok(current);
 });
 
-app.MapGet("/integrations/property-features/lookup", async (string address, Guid? jobId, bool refresh) =>
+app.MapPost("/jobs/{jobId}/online-property/refresh", async (Guid jobId, string source, bool force, Guid? tenantId) =>
 {
-    var result = await PropertyFeaturesLookupService.LookupAsync(address, refresh);
-    if (jobId.HasValue)
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+    await EnsureOnlinePropertyTablesAsync(conn);
+    var job = await LoadOnlinePropertyJobAsync(conn, jobId, tenantId);
+    if (job == null) return Results.NotFound(new { success = false, message = "Job not found for this company." });
+    if (!await HasOnlinePropertyEntitlementAsync(conn, job.Value.InspectorId))
+        return Results.Json(new { success = false, status = "subscription_required", message = "An active AutoMate subscription is required." }, statusCode: 403);
+
+    var normalizedSource = (source ?? "").Trim().ToLowerInvariant();
+    if (normalizedSource != "branz" && normalizedSource != "property-features")
+        return Results.BadRequest(new { success = false, message = "source must be branz or property-features." });
+
+    var fingerprint = StructuredAddressResolver.Fingerprint(job.Value.Address);
+    var allowance = await RegisterOnlinePropertyAddressAsync(conn, jobId, job.Value.TenantId, fingerprint, job.Value.Address);
+    if (!allowance.Allowed)
+        return Results.Json(new { success = false, status = "limit_reached", message = "This inspection has already used its original address and two corrections." }, statusCode: 429);
+
+    var cooldown = await GetOnlinePropertyCooldownAsync(conn, jobId, normalizedSource, fingerprint, force);
+    if (cooldown.HasValue)
+        return Results.Json(new { success = false, status = "cooldown", retryAfterSeconds = cooldown.Value, message = "This address was refreshed recently." }, statusCode: 429);
+
+    if (normalizedSource == "property-features")
     {
-        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
-        const string sql = @"
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_json jsonb NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_status text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_address_fingerprint text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_retrieved_at timestamptz NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_error text NULL;
-UPDATE public.jobs_staging SET
- property_features_json = CASE WHEN @status = 'available' THEN CAST(@json AS jsonb) ELSE property_features_json END,
- property_features_status = @status, property_features_address_fingerprint = @fingerprint,
- property_features_retrieved_at = @retrieved, property_features_error = @error, updated_at = NOW()
-WHERE job_id = @job_id;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("job_id", jobId.Value); cmd.Parameters.AddWithValue("status", result.Status);
-        cmd.Parameters.AddWithValue("json", JsonSerializer.Serialize(result)); cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint);
-        cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt); cmd.Parameters.AddWithValue("error", result.Error);
-        await cmd.ExecuteNonQueryAsync();
+        var result = await PropertyFeaturesLookupService.LookupAsync(job.Value.Address, force);
+        await StorePropertyFeaturesResultAsync(conn, jobId, result);
+        await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, force ? "manual_refresh" : "sync", result.Status, result.Error);
+        return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
     }
-    return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
+
+    var branz = await BranzLookupService.LookupAsync(job.Value.Address, null, null, force);
+    await StoreBranzResultAsync(conn, jobId, branz);
+    await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, force ? "manual_refresh" : "sync", branz.Status, branz.Error);
+    return branz.Status == "available" ? Results.Ok(branz) : Results.Json(branz, statusCode: 422);
+});
+
+app.MapPost("/jobs/{jobId}/confirm-address-change", async (Guid jobId, Guid? tenantId, string? confirmedBy) =>
+{
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+    await EnsureOnlinePropertyTablesAsync(conn); await EnsureSignNowJobColumnsAsync(conn);
+    await using var tx = await conn.BeginTransactionAsync();
+    const string selectSql = @"SELECT tenant_id,site_address,previous_site_address,address_change_pending,
+booking_email_required,booking_email_sent,terms_required,terms_sent,terms_signed,signnow_document_id,
+invoice_sent,paid,calendar_required,calendar_created,report_workflow_sent,report_sent
+FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) FOR UPDATE";
+    var snapshot = new Dictionary<string, object?>();
+    await using (var select = new NpgsqlCommand(selectSql, conn, tx))
+    {
+        select.Parameters.AddWithValue("job_id", jobId); select.Parameters.AddWithValue("tenant_id", tenantId.HasValue ? tenantId.Value : DBNull.Value);
+        await using var reader = await select.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) return Results.NotFound(new { success = false, message = "Job not found for this company." });
+        if (!(reader["address_change_pending"] != DBNull.Value && (bool)reader["address_change_pending"]))
+            return Results.Ok(new { success = true, alreadyConfirmed = true, message = "This address change is already confirmed." });
+        foreach (var name in new[] { "booking_email_sent", "terms_sent", "terms_signed", "signnow_document_id", "invoice_sent", "paid", "calendar_created", "report_workflow_sent", "report_sent" }) snapshot[name] = reader[name] == DBNull.Value ? null : reader[name];
+        snapshot["tenant_id"] = reader["tenant_id"] == DBNull.Value ? null : reader["tenant_id"];
+        snapshot["site_address"] = reader["site_address"]?.ToString() ?? ""; snapshot["previous_site_address"] = reader["previous_site_address"]?.ToString() ?? "";
+        snapshot["booking_required"] = reader["booking_email_required"]; snapshot["terms_required"] = reader["terms_required"]; snapshot["calendar_required"] = reader["calendar_required"];
+    }
+    await using (var audit = new NpgsqlCommand(@"INSERT INTO public.address_change_audit(job_id,tenant_id,previous_address,new_address,confirmed_by,prior_workflow_json)
+VALUES(@job_id,@tenant_id,@previous,@new,@confirmed_by,CAST(@json AS jsonb))", conn, tx))
+    {
+        audit.Parameters.AddWithValue("job_id", jobId); audit.Parameters.AddWithValue("tenant_id", snapshot["tenant_id"] ?? DBNull.Value); audit.Parameters.AddWithValue("previous", snapshot["previous_site_address"] ?? ""); audit.Parameters.AddWithValue("new", snapshot["site_address"] ?? ""); audit.Parameters.AddWithValue("confirmed_by", confirmedBy ?? "Connector user"); audit.Parameters.AddWithValue("json", JsonSerializer.Serialize(snapshot)); await audit.ExecuteNonQueryAsync();
+    }
+    const string updateSql = @"UPDATE public.jobs_staging SET
+booking_email_sent=CASE WHEN booking_email_required THEN false ELSE booking_email_sent END,
+booking_email_sent_at=CASE WHEN booking_email_required THEN NULL ELSE booking_email_sent_at END,
+booking_email_retry_requested=booking_email_required,booking_email_retry_requested_at=CASE WHEN booking_email_required THEN NOW() ELSE NULL END,
+terms_sent=CASE WHEN terms_required THEN false ELSE terms_sent END,terms_sent_at=CASE WHEN terms_required THEN NULL ELSE terms_sent_at END,
+terms_signed=CASE WHEN terms_required THEN false ELSE terms_signed END,terms_signed_at=CASE WHEN terms_required THEN NULL ELSE terms_signed_at END,
+terms_retry_requested=terms_required,terms_retry_requested_at=CASE WHEN terms_required THEN NOW() ELSE NULL END,
+signnow_document_id=CASE WHEN terms_required THEN NULL ELSE signnow_document_id END,
+signnow_invite_id=CASE WHEN terms_required THEN NULL ELSE signnow_invite_id END,
+signnow_document_status=CASE WHEN terms_required THEN 'superseded-address-change' ELSE signnow_document_status END,
+calendar_created=CASE WHEN calendar_required THEN false ELSE calendar_created END,
+calendar_retry_requested=calendar_required,calendar_retry_requested_at=CASE WHEN calendar_required THEN NOW() ELSE NULL END,
+address_change_confirmed_at=NOW(),address_change_confirmed_by=@confirmed_by,workflow_updated_at=NOW()
+WHERE job_id=@job_id";
+    await using (var update = new NpgsqlCommand(updateSql, conn, tx)) { update.Parameters.AddWithValue("job_id", jobId); update.Parameters.AddWithValue("confirmed_by", confirmedBy ?? "Connector user"); await update.ExecuteNonQueryAsync(); }
+    await tx.CommitAsync();
+    return Results.Ok(new { success = true, message = "Corrected booking email, Terms and Calendar update queued. Xero was not changed.", invoiceUnchanged = true, reportNeedsReview = Convert.ToString(snapshot["report_sent"]) is not null and not "" });
 });
 
 // =============================
@@ -5886,6 +5916,24 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
         }
 
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureOnlinePropertyTablesAsync(conn);
+
+        string previousAddress = "";
+        bool workflowStartedBeforeAddressChange = false;
+        await using (var previousCmd = new NpgsqlCommand(@"SELECT site_address,
+(booking_email_sent OR terms_sent OR calendar_created OR invoice_sent) AS workflow_started
+FROM public.jobs_staging WHERE job_id=@job_id LIMIT 1", conn))
+        {
+            previousCmd.Parameters.AddWithValue("job_id", jobId);
+            await using var previousReader = await previousCmd.ExecuteReaderAsync();
+            if (await previousReader.ReadAsync())
+            {
+                previousAddress = previousReader["site_address"]?.ToString() ?? "";
+                workflowStartedBeforeAddressChange = previousReader["workflow_started"] != DBNull.Value && (bool)previousReader["workflow_started"];
+            }
+        }
+        var incomingAddress = payload.Job.SiteAddress ?? "";
+        var addressChanged = previousAddress.Length > 0 && StructuredAddressResolver.Fingerprint(previousAddress) != StructuredAddressResolver.Fingerprint(incomingAddress);
 
         const string upsertSql = @"
 INSERT INTO public.jobs_staging
@@ -6164,6 +6212,44 @@ DO UPDATE SET
             await cmd.ExecuteNonQueryAsync();
         }
 
+        if (addressChanged)
+        {
+            await using var addressCmd = new NpgsqlCommand(@"UPDATE public.jobs_staging SET
+previous_site_address=@previous_address,address_change_pending=@pending,address_change_detected_at=NOW(),address_change_confirmed_at=NULL,address_change_confirmed_by=NULL,
+property_features_status='stale',property_features_error='Address changed in 3D; refresh required.',
+branz_lookup_status='stale',branz_lookup_error='Address changed in 3D; refresh required.'
+WHERE job_id=@job_id", conn);
+            addressCmd.Parameters.AddWithValue("job_id", jobId); addressCmd.Parameters.AddWithValue("previous_address", previousAddress); addressCmd.Parameters.AddWithValue("pending", workflowStartedBeforeAddressChange); await addressCmd.ExecuteNonQueryAsync();
+        }
+
+        var currentFingerprint = StructuredAddressResolver.Fingerprint(incomingAddress);
+        var needsFeatures = addressChanged;
+        var needsBranz = addressChanged;
+        await using (var needsCmd = new NpgsqlCommand("SELECT property_features_address_fingerprint,branz_address_fingerprint FROM public.jobs_staging WHERE job_id=@job_id", conn))
+        {
+            needsCmd.Parameters.AddWithValue("job_id", jobId); await using var needsReader = await needsCmd.ExecuteReaderAsync();
+            if (await needsReader.ReadAsync())
+            {
+                needsFeatures = needsFeatures || !string.Equals(needsReader[0]?.ToString(), currentFingerprint, StringComparison.OrdinalIgnoreCase);
+                needsBranz = needsBranz || !string.Equals(needsReader[1]?.ToString(), currentFingerprint, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        if ((needsFeatures || needsBranz) && await HasOnlinePropertyEntitlementAsync(conn, inspectorId))
+        {
+            var allowance = await RegisterOnlinePropertyAddressAsync(conn, jobId, tenantId, currentFingerprint, incomingAddress);
+            if (allowance.Allowed)
+            {
+                var featuresTask = needsFeatures ? PropertyFeaturesLookupService.LookupAsync(incomingAddress) : null;
+                var branzTask = needsBranz ? BranzLookupService.LookupAsync(incomingAddress) : null;
+                var pendingLookups = new List<Task>();
+                if (featuresTask != null) pendingLookups.Add(featuresTask);
+                if (branzTask != null) pendingLookups.Add(branzTask);
+                await Task.WhenAll(pendingLookups);
+                if (featuresTask != null) { var result = await featuresTask; await StorePropertyFeaturesResultAsync(conn, jobId, result); await AuditOnlinePropertyLookupAsync(conn, jobId, tenantId, "property-features", currentFingerprint, addressChanged ? "address_change" : "initial_sync", result.Status, result.Error); }
+                if (branzTask != null) { var result = await branzTask; await StoreBranzResultAsync(conn, jobId, result); await AuditOnlinePropertyLookupAsync(conn, jobId, tenantId, "branz", currentFingerprint, addressChanged ? "address_change" : "initial_sync", result.Status, result.Error); }
+            }
+        }
+
         await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
         await RefreshJobInvoiceLinesAsync(conn, payload, jobId);
 
@@ -6194,7 +6280,308 @@ DO UPDATE SET
     }
 });
 
+// =============================
+// ADVANCED ACTIONS
+// Review-first rule definitions and side-effect-free preview evaluation.
+// =============================
+app.MapPost("/actions/ensure-tables", async () =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureAdvancedActionsTablesAsync(conn);
+        return Results.Ok(new { success = true, message = "Advanced Actions tables are ready." });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Ensure Advanced Actions tables failed", detail: ex.Message, statusCode: 500);
+    }
+});
+
+app.MapGet("/actions/catalog", () => Results.Ok(new
+{
+    events = new[] { "quote_accepted", "inspection_scheduled", "inspection_rescheduled", "post_scheduling_reached", "report_released" },
+    fields = new[] { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name" },
+    operators = new[] { "includes", "does_not_include" },
+    actions = new[] { "send_email", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" },
+    modes = new[] { "disabled", "review" }
+}));
+
+app.MapGet("/actions/rules", async (Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureAdvancedActionsTablesAsync(conn);
+        const string sql = @"
+SELECT rule_id, tenant_id, name, event_key, mode, enabled, conditions_json, actions_json, created_at, updated_at
+FROM public.automation_rules
+WHERE tenant_id = @tenantId
+ORDER BY updated_at DESC, name;";
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("tenantId", tenantId);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rules = new List<object>();
+        while (await reader.ReadAsync())
+        {
+            rules.Add(new
+            {
+                ruleId = reader.GetGuid(0), tenantId = reader.GetGuid(1), name = reader.GetString(2),
+                eventKey = reader.GetString(3), mode = reader.GetString(4), enabled = reader.GetBoolean(5),
+                conditions = JsonSerializer.Deserialize<List<AutomationCondition>>(reader.GetString(6)) ?? new(),
+                actions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(7)) ?? new(),
+                createdAt = reader.GetDateTime(8), updatedAt = reader.GetDateTime(9)
+            });
+        }
+        return Results.Ok(rules);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Load Advanced Actions rules failed", detail: ex.Message, statusCode: 500);
+    }
+});
+
+app.MapPost("/actions/rules", async (AutomationRuleSaveRequest request) =>
+{
+    var validation = ValidateAutomationRule(request);
+    if (validation.Count > 0)
+        return Results.BadRequest(new { success = false, errors = validation });
+
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureAdvancedActionsTablesAsync(conn);
+        var ruleId = request.RuleId == Guid.Empty ? Guid.NewGuid() : request.RuleId;
+        const string sql = @"
+INSERT INTO public.automation_rules
+    (rule_id, tenant_id, name, event_key, mode, enabled, conditions_json, actions_json, created_at, updated_at)
+VALUES
+    (@ruleId, @tenantId, @name, @eventKey, @mode, @enabled, CAST(@conditions AS jsonb), CAST(@actions AS jsonb), NOW(), NOW())
+ON CONFLICT (rule_id) DO UPDATE SET
+    name = EXCLUDED.name, event_key = EXCLUDED.event_key, mode = EXCLUDED.mode,
+    enabled = EXCLUDED.enabled, conditions_json = EXCLUDED.conditions_json,
+    actions_json = EXCLUDED.actions_json, updated_at = NOW()
+WHERE public.automation_rules.tenant_id = EXCLUDED.tenant_id
+RETURNING rule_id, updated_at;";
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("ruleId", ruleId);
+        cmd.Parameters.AddWithValue("tenantId", request.TenantId);
+        cmd.Parameters.AddWithValue("name", request.Name.Trim());
+        cmd.Parameters.AddWithValue("eventKey", NormalizeAutomationKey(request.EventKey));
+        cmd.Parameters.AddWithValue("mode", request.Enabled ? "review" : "disabled");
+        cmd.Parameters.AddWithValue("enabled", request.Enabled);
+        cmd.Parameters.AddWithValue("conditions", JsonSerializer.Serialize(request.Conditions));
+        cmd.Parameters.AddWithValue("actions", JsonSerializer.Serialize(request.Actions));
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+            return Results.NotFound(new { success = false, message = "Rule was not found for this tenant." });
+        return Results.Ok(new { success = true, ruleId = reader.GetGuid(0), updatedAt = reader.GetDateTime(1), mode = request.Enabled ? "review" : "disabled" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Save Advanced Actions rule failed", detail: ex.Message, statusCode: 500);
+    }
+});
+
+app.MapPost("/actions/rules/preview", (AutomationRulePreviewRequest request) =>
+{
+    var validation = ValidateAutomationRule(request.Rule);
+    if (validation.Count > 0)
+        return Results.BadRequest(new { success = false, errors = validation });
+
+    var evaluations = request.Rule.Conditions.Select(condition =>
+    {
+        request.Fields.TryGetValue(condition.FieldKey ?? "", out var actual);
+        actual ??= "";
+        var expected = condition.Value ?? "";
+        bool contains = actual.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0;
+        bool matched = NormalizeAutomationKey(condition.Operator) == "includes" ? contains : !contains;
+        return new { fieldKey = condition.FieldKey, condition.Operator, expected, actual, matched };
+    }).ToList();
+    bool ruleMatched = evaluations.All(item => item.matched);
+    return Results.Ok(new
+    {
+        success = true,
+        matched = ruleMatched,
+        sideEffectsExecuted = false,
+        conditions = evaluations,
+        proposedActions = ruleMatched ? request.Rule.Actions : new List<AutomationActionDefinition>(),
+        message = ruleMatched ? "Rule matched. Actions require review before execution." : "Rule did not match this job."
+    });
+});
+
+app.MapPost("/actions/events", async (AutomationEventRequest request) =>
+{
+    var eventKey = NormalizeAutomationKey(request.EventKey);
+    var validEvents = new HashSet<string> { "quote_accepted", "inspection_scheduled", "inspection_rescheduled", "post_scheduling_reached", "report_released" };
+    if (request.TenantId == Guid.Empty || !validEvents.Contains(eventKey) || string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        return Results.BadRequest(new { success = false, message = "TenantId, a supported EventKey, and IdempotencyKey are required." });
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureAdvancedActionsTablesAsync(conn);
+        const string loadSql = @"
+SELECT rule_id, name, conditions_json, actions_json
+FROM public.automation_rules
+WHERE tenant_id = @tenantId AND event_key = @eventKey AND enabled = true AND mode = 'review';";
+        await using var load = new NpgsqlCommand(loadSql, conn);
+        load.Parameters.AddWithValue("tenantId", request.TenantId);
+        load.Parameters.AddWithValue("eventKey", eventKey);
+        await using var reader = await load.ExecuteReaderAsync();
+        var matches = new List<AutomationRuleMatch>();
+        while (await reader.ReadAsync())
+        {
+            var conditions = JsonSerializer.Deserialize<List<AutomationCondition>>(reader.GetString(2)) ?? new();
+            var actions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(3)) ?? new();
+            var evaluations = EvaluateAutomationConditions(conditions, request.Fields);
+            if (evaluations.All(item => item.Matched))
+                matches.Add(new AutomationRuleMatch(reader.GetGuid(0), reader.GetString(1), evaluations, actions));
+        }
+        await reader.CloseAsync();
+
+        int queued = 0;
+        foreach (var match in matches)
+        {
+            const string insertSql = @"
+INSERT INTO public.automation_rule_executions
+    (tenant_id, rule_id, job_id, event_key, event_idempotency_key, status, matched_conditions_json, proposed_actions_json, created_at, updated_at)
+VALUES
+    (@tenantId, @ruleId, @jobId, @eventKey, @idempotencyKey, 'awaiting_review', CAST(@conditions AS jsonb), CAST(@actions AS jsonb), NOW(), NOW())
+ON CONFLICT (tenant_id, rule_id, event_idempotency_key) DO NOTHING;";
+            await using var insert = new NpgsqlCommand(insertSql, conn);
+            insert.Parameters.AddWithValue("tenantId", request.TenantId);
+            insert.Parameters.AddWithValue("ruleId", match.RuleId);
+            insert.Parameters.AddWithValue("jobId", request.JobId.HasValue ? request.JobId.Value : DBNull.Value);
+            insert.Parameters.AddWithValue("eventKey", eventKey);
+            insert.Parameters.AddWithValue("idempotencyKey", request.IdempotencyKey.Trim());
+            insert.Parameters.AddWithValue("conditions", JsonSerializer.Serialize(match.Conditions));
+            insert.Parameters.AddWithValue("actions", JsonSerializer.Serialize(match.Actions));
+            queued += await insert.ExecuteNonQueryAsync();
+        }
+        return Results.Ok(new { success = true, matchedRules = matches.Count, queuedForReview = queued, duplicateMatchesSkipped = matches.Count - queued, sideEffectsExecuted = false });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Evaluate Advanced Actions event failed", detail: ex.Message, statusCode: 500);
+    }
+});
+
+app.MapGet("/actions/review-queue", async (Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureAdvancedActionsTablesAsync(conn);
+        const string sql = @"
+SELECT e.execution_id, e.rule_id, r.name, e.job_id, e.event_key, e.status,
+       e.matched_conditions_json, e.proposed_actions_json, e.last_error, e.created_at
+FROM public.automation_rule_executions e
+JOIN public.automation_rules r ON r.rule_id = e.rule_id
+WHERE e.tenant_id = @tenantId AND e.status IN ('awaiting_review', 'failed')
+ORDER BY e.created_at DESC;";
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("tenantId", tenantId);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var items = new List<object>();
+        while (await reader.ReadAsync())
+            items.Add(new { executionId = reader.GetGuid(0), ruleId = reader.GetGuid(1), ruleName = reader.GetString(2), jobId = reader.IsDBNull(3) ? (Guid?)null : reader.GetGuid(3), eventKey = reader.GetString(4), status = reader.GetString(5), conditions = JsonSerializer.Deserialize<object>(reader.GetString(6)), proposedActions = JsonSerializer.Deserialize<object>(reader.GetString(7)), lastError = reader.IsDBNull(8) ? null : reader.GetString(8), createdAt = reader.GetDateTime(9) });
+        return Results.Ok(items);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(title: "Load Advanced Actions review queue failed", detail: ex.Message, statusCode: 500);
+    }
+});
+
 app.Run();
+
+static async Task EnsureAdvancedActionsTablesAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+CREATE TABLE IF NOT EXISTS public.automation_rules
+(
+    rule_id uuid PRIMARY KEY,
+    tenant_id uuid NOT NULL,
+    name text NOT NULL,
+    event_key text NOT NULL,
+    mode text NOT NULL DEFAULT 'disabled',
+    enabled boolean NOT NULL DEFAULT false,
+    conditions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    actions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_automation_rules_tenant_event
+ON public.automation_rules(tenant_id, event_key, enabled);
+
+CREATE TABLE IF NOT EXISTS public.automation_rule_executions
+(
+    execution_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id uuid NOT NULL,
+    rule_id uuid NOT NULL REFERENCES public.automation_rules(rule_id) ON DELETE CASCADE,
+    job_id uuid NULL,
+    event_key text NOT NULL,
+    event_idempotency_key text NOT NULL,
+    status text NOT NULL DEFAULT 'awaiting_review',
+    matched_conditions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    proposed_actions_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    action_results_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    last_error text NULL,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, rule_id, event_idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_automation_rule_executions_review
+ON public.automation_rule_executions(tenant_id, status, created_at DESC);";
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+static string NormalizeAutomationKey(string? value)
+{
+    return (value ?? "").Trim().ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+}
+
+static List<string> ValidateAutomationRule(AutomationRuleSaveRequest request)
+{
+    var errors = new List<string>();
+    var validEvents = new HashSet<string> { "quote_accepted", "inspection_scheduled", "inspection_rescheduled", "post_scheduling_reached", "report_released" };
+    var validFields = new HashSet<string> { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name" };
+    var validOperators = new HashSet<string> { "includes", "does_not_include" };
+    var validActions = new HashSet<string> { "send_email", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" };
+    if (request.TenantId == Guid.Empty) errors.Add("TenantId is required.");
+    if (string.IsNullOrWhiteSpace(request.Name)) errors.Add("Rule name is required.");
+    if (!validEvents.Contains(NormalizeAutomationKey(request.EventKey))) errors.Add("Event is not supported.");
+    if (request.Conditions == null || request.Conditions.Count == 0) errors.Add("At least one condition is required.");
+    else foreach (var condition in request.Conditions)
+    {
+        if (!validFields.Contains(NormalizeAutomationKey(condition.FieldKey))) errors.Add("Condition field is not supported: " + condition.FieldKey);
+        if (!validOperators.Contains(NormalizeAutomationKey(condition.Operator))) errors.Add("Condition operator is not supported: " + condition.Operator);
+        if (string.IsNullOrWhiteSpace(condition.Value)) errors.Add("Condition value is required.");
+    }
+    if (request.Actions == null || request.Actions.Count == 0) errors.Add("At least one action is required.");
+    else foreach (var action in request.Actions)
+        if (!validActions.Contains(NormalizeAutomationKey(action.ActionKey))) errors.Add("Action is not supported: " + action.ActionKey);
+    return errors.Distinct().ToList();
+}
+
+static List<AutomationConditionEvaluation> EvaluateAutomationConditions(List<AutomationCondition> conditions, Dictionary<string, string> fields)
+{
+    return conditions.Select(condition =>
+    {
+        fields.TryGetValue(condition.FieldKey ?? "", out var actual);
+        actual ??= "";
+        var expected = condition.Value ?? "";
+        bool contains = actual.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0;
+        bool matched = NormalizeAutomationKey(condition.Operator) == "includes" ? contains : !contains;
+        return new AutomationConditionEvaluation(condition.FieldKey ?? "", condition.Operator ?? "", expected, actual, matched);
+    }).ToList();
+}
 
 static async Task EnsureWorkflowActionsTableAsync(NpgsqlConnection conn)
 {
@@ -7569,7 +7956,11 @@ static async Task<SignNowWebhookRegistrationResult> CreateSignNowDocumentWebhook
         @event = "document.complete",
         entity_id = documentId,
         action = "callback",
-        attributes = new { callback = callbackUrl, use_tls_12 = true },
+        attributes = new
+        {
+            callback = callbackUrl,
+            use_tls_12 = true
+        },
         secret_key = ""
     };
 
@@ -7579,6 +7970,7 @@ static async Task<SignNowWebhookRegistrationResult> CreateSignNowDocumentWebhook
         var json = await response.Content.ReadAsStringAsync();
         if (!response.IsSuccessStatusCode)
             return new SignNowWebhookRegistrationResult(false, "", json);
+
         var subscriptionId = "";
         if (!string.IsNullOrWhiteSpace(json))
             subscriptionId = FindJsonStringRecursive(JsonDocument.Parse(json).RootElement, "event_subscription_id", "subscription_id", "id");
@@ -7814,10 +8206,23 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
             items.ValueKind == JsonValueKind.Array &&
             items.GetArrayLength() > 0)
         {
-            await MarkCalendarCreatedAsync(conn, job.JobId);
-            return ScheduleActionResult.Skip("calendar", "Google Calendar event already exists.", new
+            var existingEventId = GetJsonString(items[0], "id");
+            var existingInvoiceLines = await LoadXeroInvoiceLinesAsync(conn, job.JobId);
+            var existingSummary = string.IsNullOrWhiteSpace(job.PrimaryService) ? "Inspection" : job.PrimaryService.Trim();
+            if (!string.IsNullOrWhiteSpace(job.SiteAddress)) existingSummary += " - " + job.SiteAddress.Trim();
+            var patchResponse = await httpClient.PatchAsJsonAsync(
+                $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events/{Uri.EscapeDataString(existingEventId)}",
+                new { summary = existingSummary, location = job.SiteAddress, description = BuildGoogleCalendarDescription(job, existingInvoiceLines) });
+            var patchJson = await patchResponse.Content.ReadAsStringAsync();
+            if (!patchResponse.IsSuccessStatusCode)
             {
-                eventId = GetJsonString(items[0], "id"),
+                await MarkCalendarFailedAsync(conn, job.JobId, patchJson);
+                return ScheduleActionResult.Failed("calendar", "Google Calendar event update failed: " + patchJson);
+            }
+            await MarkCalendarCreatedAsync(conn, job.JobId);
+            return ScheduleActionResult.Ok("calendar", "Google Calendar event updated.", new
+            {
+                eventId = existingEventId,
                 htmlLink = GetJsonString(items[0], "htmlLink")
             });
         }
@@ -9246,13 +9651,15 @@ static string BuildDefaultBookingTemplateHtml()
 {
     return
         "<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937;\">" +
-        "<p>Hi {{CLIENT_FIRST_NAME}},</p>" +
-        "<p>Your <strong>{{SERVICES}}</strong> booking has been scheduled.</p>" +
+        "<p>Hi {{CLIENT_NAME}},</p>" +
+        "<p>Your booking has been scheduled. The confirmed details are below.</p>" +
         "<table style=\"border-collapse:collapse;margin:16px 0;\">" +
+        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Service</td><td>{{PRIMARY_SERVICE}}</td></tr>" +
         "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Address</td><td>{{PROPERTY_ADDRESS}}</td></tr>" +
         "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Date/time</td><td>{{INSPECTION_DATE}} {{INSPECTION_TIME}}</td></tr>" +
         "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Inspector</td><td>{{INSPECTOR_NAME}}</td></tr>" +
         "</table>" +
+        "<p>If any of these details need to change, please contact {{COMPANY_NAME}}.</p>" +
         "<p>Regards,<br>{{COMPANY_NAME}}</p>" +
         "</div>";
 }
@@ -11100,7 +11507,6 @@ public record TermsFailureRequest(string ErrorMessage);
 public record InvoiceFailureRequest(string ErrorMessage);
 public record CalendarFailureRequest(string ErrorMessage);
 public record ReportFailureRequest(string ErrorMessage);
-public record SignNowWebhookRegistrationResult(bool Success, string SubscriptionId, string Error);
 public record GoogleCalendarSelectionRequest(string InspectorId, string CalendarId);
 public record EmailSenderModeRequest(string InspectorId, string SenderMode);
 public class EmailTemplateSaveRequest
@@ -11363,6 +11769,141 @@ public record SignNowTemplateLookupResult(
     int LastStatusCode,
     string LastResponse);
 
+public static class OnlinePropertySupport
+{
+public static async Task EnsureOnlinePropertyTablesAsync(NpgsqlConnection conn)
+{
+    const string sql = @"
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_wind_zone text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_exposure_zone text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_lookup_status text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_latitude double precision NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_longitude double precision NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_address_fingerprint text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_retrieved_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS branz_lookup_error text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_json jsonb NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_status text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_address_fingerprint text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_retrieved_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_features_error text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS previous_site_address text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS address_change_pending boolean NOT NULL DEFAULT false;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS address_change_detected_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS address_change_confirmed_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS address_change_confirmed_by text NULL;
+CREATE TABLE IF NOT EXISTS public.online_property_addresses
+(
+ job_id uuid NOT NULL, tenant_id uuid NULL, address_fingerprint text NOT NULL, address_snapshot text NOT NULL,
+ first_seen_at timestamptz NOT NULL DEFAULT NOW(), PRIMARY KEY(job_id, address_fingerprint)
+);
+CREATE TABLE IF NOT EXISTS public.online_property_lookup_audit
+(
+ audit_id bigserial PRIMARY KEY, job_id uuid NOT NULL, tenant_id uuid NULL, source text NOT NULL,
+ address_fingerprint text NOT NULL, reason text NOT NULL, outcome text NOT NULL, error text NULL,
+ created_at timestamptz NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS public.address_change_audit
+(
+ audit_id bigserial PRIMARY KEY, job_id uuid NOT NULL, tenant_id uuid NULL, previous_address text NULL,
+ new_address text NOT NULL, confirmed_by text NULL, prior_workflow_json jsonb NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT NOW()
+);
+CREATE OR REPLACE FUNCTION public.clear_completed_address_change() RETURNS trigger AS $$
+BEGIN
+ IF NEW.address_change_pending
+    AND (NOT NEW.booking_email_required OR NEW.booking_email_sent)
+    AND (NOT NEW.terms_required OR NEW.terms_sent)
+    AND (NOT NEW.calendar_required OR NEW.calendar_created) THEN
+   NEW.address_change_pending := false;
+ END IF;
+ RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_clear_completed_address_change ON public.jobs_staging;
+CREATE TRIGGER trg_clear_completed_address_change BEFORE UPDATE ON public.jobs_staging
+FOR EACH ROW EXECUTE FUNCTION public.clear_completed_address_change();";
+    await using var cmd = new NpgsqlCommand(sql, conn); await cmd.ExecuteNonQueryAsync();
+}
+
+public static async Task<(Guid TenantId, Guid InspectorId, string Address)?> LoadOnlinePropertyJobAsync(NpgsqlConnection conn, Guid jobId, Guid? tenantId)
+{
+    const string sql = "SELECT tenant_id, inspector_id, site_address FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) LIMIT 1";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("tenant_id", tenantId.HasValue ? tenantId.Value : DBNull.Value);
+    await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
+    return (reader["tenant_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["tenant_id"], (Guid)reader["inspector_id"], reader["site_address"]?.ToString() ?? "");
+}
+
+public static async Task<Dictionary<string, object?>?> LoadOnlinePropertyDataAsync(NpgsqlConnection conn, Guid jobId, Guid? tenantId)
+{
+    const string sql = @"SELECT site_address, previous_site_address, address_change_pending, address_change_detected_at,
+property_features_json, property_features_status, property_features_address_fingerprint, property_features_retrieved_at, property_features_error,
+branz_wind_zone, branz_exposure_zone, branz_lookup_status, branz_address_fingerprint, branz_retrieved_at, branz_lookup_error
+FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) LIMIT 1";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("tenant_id", tenantId.HasValue ? tenantId.Value : DBNull.Value);
+    await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
+    object? features = null;
+    if (reader["property_features_json"] != DBNull.Value) features = JsonSerializer.Deserialize<object>(reader["property_features_json"].ToString() ?? "null");
+    return new Dictionary<string, object?>
+    {
+        ["success"] = true, ["siteAddress"] = reader["site_address"]?.ToString() ?? "", ["previousSiteAddress"] = reader["previous_site_address"]?.ToString() ?? "",
+        ["addressChangePending"] = reader["address_change_pending"] != DBNull.Value && (bool)reader["address_change_pending"], ["addressChangeDetectedAt"] = reader["address_change_detected_at"] == DBNull.Value ? null : reader["address_change_detected_at"],
+        ["propertyFeatures"] = features, ["propertyFeaturesStatus"] = reader["property_features_status"]?.ToString() ?? "missing", ["propertyFeaturesFingerprint"] = reader["property_features_address_fingerprint"]?.ToString() ?? "",
+        ["propertyFeaturesRetrievedAt"] = reader["property_features_retrieved_at"] == DBNull.Value ? null : reader["property_features_retrieved_at"], ["propertyFeaturesError"] = reader["property_features_error"]?.ToString() ?? "",
+        ["windZone"] = reader["branz_wind_zone"]?.ToString() ?? "", ["exposureZone"] = reader["branz_exposure_zone"]?.ToString() ?? "", ["branzStatus"] = reader["branz_lookup_status"]?.ToString() ?? "missing",
+        ["branzFingerprint"] = reader["branz_address_fingerprint"]?.ToString() ?? "", ["branzRetrievedAt"] = reader["branz_retrieved_at"] == DBNull.Value ? null : reader["branz_retrieved_at"], ["branzError"] = reader["branz_lookup_error"]?.ToString() ?? ""
+    };
+}
+
+public static async Task<bool> HasOnlinePropertyEntitlementAsync(NpgsqlConnection conn, Guid inspectorId)
+{
+    const string sql = @"SELECT EXISTS(SELECT 1 FROM public.subscriptions WHERE inspector_id=@inspector_id AND (status='active' OR (status='trialing' AND trial_ends_at>NOW())))";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("inspector_id", inspectorId); return (bool)(await cmd.ExecuteScalarAsync() ?? false);
+}
+
+public static async Task<(bool Allowed, int Count)> RegisterOnlinePropertyAddressAsync(NpgsqlConnection conn, Guid jobId, Guid tenantId, string fingerprint, string address)
+{
+    await using var count = new NpgsqlCommand("SELECT COUNT(*) FROM public.online_property_addresses WHERE job_id=@job_id", conn); count.Parameters.AddWithValue("job_id", jobId);
+    var used = Convert.ToInt32(await count.ExecuteScalarAsync());
+    await using var exists = new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.online_property_addresses WHERE job_id=@job_id AND address_fingerprint=@fingerprint)", conn); exists.Parameters.AddWithValue("job_id", jobId); exists.Parameters.AddWithValue("fingerprint", fingerprint);
+    if ((bool)(await exists.ExecuteScalarAsync() ?? false)) return (true, used);
+    if (used >= 3) return (false, used);
+    await using var insert = new NpgsqlCommand("INSERT INTO public.online_property_addresses(job_id,tenant_id,address_fingerprint,address_snapshot) VALUES(@job_id,@tenant_id,@fingerprint,@address) ON CONFLICT DO NOTHING", conn);
+    insert.Parameters.AddWithValue("job_id", jobId); insert.Parameters.AddWithValue("tenant_id", tenantId == Guid.Empty ? DBNull.Value : tenantId); insert.Parameters.AddWithValue("fingerprint", fingerprint); insert.Parameters.AddWithValue("address", address ?? ""); await insert.ExecuteNonQueryAsync();
+    return (true, used + 1);
+}
+
+public static async Task<int?> GetOnlinePropertyCooldownAsync(NpgsqlConnection conn, Guid jobId, string source, string fingerprint, bool force)
+{
+    if (!force) return null;
+    var column = source == "branz" ? "branz_retrieved_at" : "property_features_retrieved_at";
+    var fingerprintColumn = source == "branz" ? "branz_address_fingerprint" : "property_features_address_fingerprint";
+    await using var cmd = new NpgsqlCommand($"SELECT {column} FROM public.jobs_staging WHERE job_id=@job_id AND {fingerprintColumn}=@fingerprint", conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("fingerprint", fingerprint);
+    var value = await cmd.ExecuteScalarAsync(); if (value == null || value == DBNull.Value) return null;
+    var remaining = 900 - (int)(DateTimeOffset.UtcNow - new DateTimeOffset((DateTime)value)).TotalSeconds; return remaining > 0 ? remaining : null;
+}
+
+public static async Task StorePropertyFeaturesResultAsync(NpgsqlConnection conn, Guid jobId, PropertyFeaturesResult result)
+{
+    const string sql = @"UPDATE public.jobs_staging SET property_features_json=CASE WHEN @status='available' THEN CAST(@json AS jsonb) ELSE property_features_json END,
+property_features_status=@status,property_features_address_fingerprint=@fingerprint,property_features_retrieved_at=@retrieved,property_features_error=@error WHERE job_id=@job_id";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("status", result.Status); cmd.Parameters.AddWithValue("json", JsonSerializer.Serialize(result)); cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint); cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt); cmd.Parameters.AddWithValue("error", result.Error); await cmd.ExecuteNonQueryAsync();
+}
+
+public static async Task StoreBranzResultAsync(NpgsqlConnection conn, Guid jobId, BranzLookupResult result)
+{
+    const string sql = @"UPDATE public.jobs_staging SET branz_wind_zone=CASE WHEN @status='available' THEN @wind ELSE branz_wind_zone END,
+branz_exposure_zone=CASE WHEN @status='available' THEN @exposure ELSE branz_exposure_zone END,branz_lookup_status=@status,branz_latitude=@latitude,branz_longitude=@longitude,
+branz_address_fingerprint=@fingerprint,branz_retrieved_at=@retrieved,branz_lookup_error=@error WHERE job_id=@job_id";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("status", result.Status); cmd.Parameters.AddWithValue("wind", result.WindZone); cmd.Parameters.AddWithValue("exposure", result.ExposureZone); cmd.Parameters.AddWithValue("latitude", result.Latitude.HasValue ? result.Latitude.Value : DBNull.Value); cmd.Parameters.AddWithValue("longitude", result.Longitude.HasValue ? result.Longitude.Value : DBNull.Value); cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint); cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt); cmd.Parameters.AddWithValue("error", result.Error); await cmd.ExecuteNonQueryAsync();
+}
+
+public static async Task AuditOnlinePropertyLookupAsync(NpgsqlConnection conn, Guid jobId, Guid tenantId, string source, string fingerprint, string reason, string outcome, string error)
+{
+    await using var cmd = new NpgsqlCommand("INSERT INTO public.online_property_lookup_audit(job_id,tenant_id,source,address_fingerprint,reason,outcome,error) VALUES(@job_id,@tenant_id,@source,@fingerprint,@reason,@outcome,@error)", conn);
+    cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("tenant_id", tenantId == Guid.Empty ? DBNull.Value : tenantId); cmd.Parameters.AddWithValue("source", source); cmd.Parameters.AddWithValue("fingerprint", fingerprint); cmd.Parameters.AddWithValue("reason", reason); cmd.Parameters.AddWithValue("outcome", outcome); cmd.Parameters.AddWithValue("error", error ?? ""); await cmd.ExecuteNonQueryAsync();
+}
+}
+
 public record ScheduleServiceInput(
     string Label,
     string ServiceKey,
@@ -11538,3 +12079,47 @@ public class MetaSection
     public string ConnectorVersion { get; set; } = "";
     public string SourceInstance { get; set; } = "";
 }
+
+public class AutomationRuleSaveRequest
+{
+    public Guid RuleId { get; set; }
+    public Guid TenantId { get; set; }
+    public string Name { get; set; } = "";
+    public string EventKey { get; set; } = "";
+    public bool Enabled { get; set; }
+    public List<AutomationCondition> Conditions { get; set; } = new();
+    public List<AutomationActionDefinition> Actions { get; set; } = new();
+}
+
+public class AutomationCondition
+{
+    public string FieldKey { get; set; } = "";
+    public string Operator { get; set; } = "";
+    public string Value { get; set; } = "";
+}
+
+public class AutomationActionDefinition
+{
+    public string ActionKey { get; set; } = "";
+    public string Timing { get; set; } = "immediate";
+    public Dictionary<string, string> Settings { get; set; } = new();
+}
+
+public class AutomationRulePreviewRequest
+{
+    public AutomationRuleSaveRequest Rule { get; set; } = new();
+    public Dictionary<string, string> Fields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+public class AutomationEventRequest
+{
+    public Guid TenantId { get; set; }
+    public Guid? JobId { get; set; }
+    public string EventKey { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
+    public Dictionary<string, string> Fields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+public record AutomationConditionEvaluation(string FieldKey, string Operator, string Expected, string Actual, bool Matched);
+public record AutomationRuleMatch(Guid RuleId, string RuleName, List<AutomationConditionEvaluation> Conditions, List<AutomationActionDefinition> Actions);
+public record SignNowWebhookRegistrationResult(bool Success, string SubscriptionId, string Error);

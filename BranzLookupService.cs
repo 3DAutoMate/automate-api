@@ -31,10 +31,7 @@ public static class BranzLookupService
     }
 
     public static string Fingerprint(string address)
-    {
-        var normalized = Regex.Replace((address ?? "").Trim().ToUpperInvariant(), "\\s+", " ");
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant();
-    }
+        => StructuredAddressResolver.Fingerprint(address);
 
     public static async Task<BranzLookupResult> LookupAsync(string address, double? latitude = null, double? longitude = null, bool forceRefresh = false)
     {
