@@ -6540,6 +6540,12 @@ ORDER BY e.created_at DESC;";
     }
 });
 
+await using (var startupMigrationConnection = new NpgsqlConnection(connectionString))
+{
+    await startupMigrationConnection.OpenAsync();
+    await EnsureOnlinePropertyTablesAsync(startupMigrationConnection);
+}
+
 app.Run();
 
 static async Task EnsureAdvancedActionsTablesAsync(NpgsqlConnection conn)
