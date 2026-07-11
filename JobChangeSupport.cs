@@ -33,6 +33,7 @@ ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS change_confirmed_at tim
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS change_confirmed_by text NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS xero_review_required boolean NOT NULL DEFAULT false;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS report_review_required boolean NOT NULL DEFAULT false;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS change_template_setup_required boolean NOT NULL DEFAULT false;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS source_missing boolean NOT NULL DEFAULT false;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS source_missing_at timestamptz NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS unscheduled boolean NOT NULL DEFAULT false;
