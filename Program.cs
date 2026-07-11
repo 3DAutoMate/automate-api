@@ -835,11 +835,11 @@ app.MapPost("/jobs/{jobId}/confirm-address-change", async (Guid jobId, Guid? ten
     const string selectSql = @"SELECT tenant_id,site_address,previous_site_address,address_change_pending,
 booking_email_required,booking_email_sent,terms_required,terms_sent,terms_signed,signnow_document_id,
 invoice_sent,paid,calendar_required,calendar_created,report_workflow_sent,report_sent
-FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) FOR UPDATE";
+FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id::text=@tenant_id) FOR UPDATE";
     var snapshot = new Dictionary<string, object?>();
     await using (var select = new NpgsqlCommand(selectSql, conn, tx))
     {
-        select.Parameters.AddWithValue("job_id", jobId); select.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Uuid).Value = tenantId.HasValue ? tenantId.Value : DBNull.Value;
+        select.Parameters.AddWithValue("job_id", jobId); select.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId.HasValue ? tenantId.Value.ToString() : DBNull.Value;
         await using var reader = await select.ExecuteReaderAsync();
         if (!await reader.ReadAsync()) return Results.NotFound(new { success = false, message = "Job not found for this company." });
         if (!(reader["address_change_pending"] != DBNull.Value && (bool)reader["address_change_pending"]))
@@ -849,10 +849,11 @@ FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_
         snapshot["site_address"] = reader["site_address"]?.ToString() ?? ""; snapshot["previous_site_address"] = reader["previous_site_address"]?.ToString() ?? "";
         snapshot["booking_required"] = reader["booking_email_required"]; snapshot["terms_required"] = reader["terms_required"]; snapshot["calendar_required"] = reader["calendar_required"];
     }
+    Guid.TryParse(Convert.ToString(snapshot["tenant_id"]), out var snapshotTenantId);
     await using (var audit = new NpgsqlCommand(@"INSERT INTO public.address_change_audit(job_id,tenant_id,previous_address,new_address,confirmed_by,prior_workflow_json)
 VALUES(@job_id,@tenant_id,@previous,@new,@confirmed_by,CAST(@json AS jsonb))", conn, tx))
     {
-        audit.Parameters.AddWithValue("job_id", jobId); audit.Parameters.AddWithValue("tenant_id", snapshot["tenant_id"] ?? DBNull.Value); audit.Parameters.AddWithValue("previous", snapshot["previous_site_address"] ?? ""); audit.Parameters.AddWithValue("new", snapshot["site_address"] ?? ""); audit.Parameters.AddWithValue("confirmed_by", confirmedBy ?? "Connector user"); audit.Parameters.AddWithValue("json", JsonSerializer.Serialize(snapshot)); await audit.ExecuteNonQueryAsync();
+        audit.Parameters.AddWithValue("job_id", jobId); audit.Parameters.AddWithValue("tenant_id", snapshotTenantId == Guid.Empty ? DBNull.Value : snapshotTenantId); audit.Parameters.AddWithValue("previous", snapshot["previous_site_address"] ?? ""); audit.Parameters.AddWithValue("new", snapshot["site_address"] ?? ""); audit.Parameters.AddWithValue("confirmed_by", confirmedBy ?? "Connector user"); audit.Parameters.AddWithValue("json", JsonSerializer.Serialize(snapshot)); await audit.ExecuteNonQueryAsync();
     }
     const string updateSql = @"UPDATE public.jobs_staging SET
 booking_email_sent=CASE WHEN booking_email_required THEN false ELSE booking_email_sent END,
@@ -11827,10 +11828,11 @@ FOR EACH ROW EXECUTE FUNCTION public.clear_completed_address_change();";
 
 public static async Task<(Guid TenantId, Guid InspectorId, string Address)?> LoadOnlinePropertyJobAsync(NpgsqlConnection conn, Guid jobId, Guid? tenantId)
 {
-    const string sql = "SELECT tenant_id, inspector_id, site_address FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) LIMIT 1";
-    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Uuid).Value = tenantId.HasValue ? tenantId.Value : DBNull.Value;
+    const string sql = "SELECT tenant_id, inspector_id, site_address FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id::text=@tenant_id) LIMIT 1";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId.HasValue ? tenantId.Value.ToString() : DBNull.Value;
     await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
-    return (reader["tenant_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["tenant_id"], (Guid)reader["inspector_id"], reader["site_address"]?.ToString() ?? "");
+    Guid.TryParse(reader["tenant_id"]?.ToString(), out var parsedTenantId);
+    return (parsedTenantId, (Guid)reader["inspector_id"], reader["site_address"]?.ToString() ?? "");
 }
 
 public static async Task<Dictionary<string, object?>?> LoadOnlinePropertyDataAsync(NpgsqlConnection conn, Guid jobId, Guid? tenantId)
@@ -11838,8 +11840,8 @@ public static async Task<Dictionary<string, object?>?> LoadOnlinePropertyDataAsy
     const string sql = @"SELECT site_address, previous_site_address, address_change_pending, address_change_detected_at,
 property_features_json, property_features_status, property_features_address_fingerprint, property_features_retrieved_at, property_features_error,
 branz_wind_zone, branz_exposure_zone, branz_lookup_status, branz_address_fingerprint, branz_retrieved_at, branz_lookup_error
-FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) LIMIT 1";
-    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Uuid).Value = tenantId.HasValue ? tenantId.Value : DBNull.Value;
+FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id::text=@tenant_id) LIMIT 1";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId.HasValue ? tenantId.Value.ToString() : DBNull.Value;
     await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
     object? features = null;
     if (reader["property_features_json"] != DBNull.Value) features = JsonSerializer.Deserialize<object>(reader["property_features_json"].ToString() ?? "null");
