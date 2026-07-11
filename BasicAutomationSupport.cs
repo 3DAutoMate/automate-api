@@ -241,7 +241,8 @@ public static class BasicAutomationSupport
         const string sql = """
             SELECT t.subject,t.html_body
             FROM public.email_templates t
-            WHERE t.tenant_id=@tenant AND t.is_active=true AND t.archived_at IS NULL
+            WHERE (t.tenant_id=@tenant OR (t.tenant_id IS NULL AND t.inspector_id=@inspector))
+              AND t.is_active=true AND t.archived_at IS NULL
               AND t.template_type='booking-email'
               AND NOT EXISTS (
                   SELECT 1 FROM public.basic_automation_settings s
@@ -253,6 +254,7 @@ public static class BasicAutomationSupport
             """;
         await using var command = new NpgsqlCommand(sql, connection);
         command.Parameters.AddWithValue("tenant", tenantId);
+        command.Parameters.AddWithValue("inspector", inspectorId);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) return null;
         var subject = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
