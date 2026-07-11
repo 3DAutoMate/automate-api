@@ -4627,7 +4627,7 @@ WHERE a.action_type = 'booking_email'
   AND NOT j.change_review_pending AND NOT j.unscheduled
   AND NOT EXISTS (SELECT 1 FROM public.automation_tenant_settings ats WHERE ats.tenant_id::text=j.tenant_id::text AND ats.activation_mode='all_jobs')
   AND NOT EXISTS (SELECT 1 FROM public.automation_job_selections ajs WHERE ajs.tenant_id::text=j.tenant_id::text AND ajs.job_id=j.job_id AND ajs.use_advanced_workflows=true)
-  AND NOT EXISTS (SELECT 1 FROM public.basic_automation_settings bas WHERE bas.tenant_id=j.tenant_id AND bas.event_key='scheduling')
+  AND NOT EXISTS (SELECT 1 FROM public.basic_automation_settings bas WHERE bas.tenant_id::text=j.tenant_id::text AND bas.event_key='scheduling')
   AND (@inspector_id IS NULL OR a.inspector_id = @inspector_id)
 ORDER BY a.updated_at ASC
 LIMIT 100;";
@@ -8162,7 +8162,7 @@ SELECT
         SELECT i2.company_name
         FROM public.inspectors i2
         LEFT JOIN public.subscriptions s2 ON s2.inspector_id=i2.inspector_id
-        WHERE i2.tenant_id=j.tenant_id
+        WHERE i2.tenant_id::text=j.tenant_id::text
         ORDER BY CASE WHEN s2.status='active' THEN 0 WHEN s2.status='trialing' AND s2.trial_ends_at>NOW() THEN 1 ELSE 2 END,
                  i2.created_at
         LIMIT 1
@@ -10373,9 +10373,9 @@ static string BuildDefaultBookingTemplateHtml()
 static async Task<(string Contact1, string Contact2)> LoadBasicContactLabelsAsync(NpgsqlConnection conn, Guid tenantId)
 {
     const string sql = @"SELECT COALESCE(NULLIF(contact1_role_label,''),'Client'),COALESCE(NULLIF(contact2_role_label,''),'Buyers Agent')
-FROM public.jobs_staging WHERE tenant_id=@tenant
+FROM public.jobs_staging WHERE tenant_id::text=@tenant
 ORDER BY updated_at DESC LIMIT 1";
-    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId);
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId.ToString());
     await using var reader = await cmd.ExecuteReaderAsync();
     if (!await reader.ReadAsync()) return ("Client", "Buyers Agent");
     return (reader.GetString(0), reader.GetString(1));
