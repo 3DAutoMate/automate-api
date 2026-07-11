@@ -839,7 +839,7 @@ FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_
     var snapshot = new Dictionary<string, object?>();
     await using (var select = new NpgsqlCommand(selectSql, conn, tx))
     {
-        select.Parameters.AddWithValue("job_id", jobId); select.Parameters.AddWithValue("tenant_id", tenantId.HasValue ? tenantId.Value : DBNull.Value);
+        select.Parameters.AddWithValue("job_id", jobId); select.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Uuid).Value = tenantId.HasValue ? tenantId.Value : DBNull.Value;
         await using var reader = await select.ExecuteReaderAsync();
         if (!await reader.ReadAsync()) return Results.NotFound(new { success = false, message = "Job not found for this company." });
         if (!(reader["address_change_pending"] != DBNull.Value && (bool)reader["address_change_pending"]))
@@ -11828,7 +11828,7 @@ FOR EACH ROW EXECUTE FUNCTION public.clear_completed_address_change();";
 public static async Task<(Guid TenantId, Guid InspectorId, string Address)?> LoadOnlinePropertyJobAsync(NpgsqlConnection conn, Guid jobId, Guid? tenantId)
 {
     const string sql = "SELECT tenant_id, inspector_id, site_address FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) LIMIT 1";
-    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("tenant_id", tenantId.HasValue ? tenantId.Value : DBNull.Value);
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Uuid).Value = tenantId.HasValue ? tenantId.Value : DBNull.Value;
     await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
     return (reader["tenant_id"] == DBNull.Value ? Guid.Empty : (Guid)reader["tenant_id"], (Guid)reader["inspector_id"], reader["site_address"]?.ToString() ?? "");
 }
@@ -11839,7 +11839,7 @@ public static async Task<Dictionary<string, object?>?> LoadOnlinePropertyDataAsy
 property_features_json, property_features_status, property_features_address_fingerprint, property_features_retrieved_at, property_features_error,
 branz_wind_zone, branz_exposure_zone, branz_lookup_status, branz_address_fingerprint, branz_retrieved_at, branz_lookup_error
 FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_id=@tenant_id) LIMIT 1";
-    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("tenant_id", tenantId.HasValue ? tenantId.Value : DBNull.Value);
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.Add("tenant_id", NpgsqlTypes.NpgsqlDbType.Uuid).Value = tenantId.HasValue ? tenantId.Value : DBNull.Value;
     await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
     object? features = null;
     if (reader["property_features_json"] != DBNull.Value) features = JsonSerializer.Deserialize<object>(reader["property_features_json"].ToString() ?? "null");
