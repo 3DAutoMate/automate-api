@@ -11864,7 +11864,19 @@ BEGIN
 END; $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_clear_completed_address_change ON public.jobs_staging;
 CREATE TRIGGER trg_clear_completed_address_change BEFORE UPDATE ON public.jobs_staging
-FOR EACH ROW EXECUTE FUNCTION public.clear_completed_address_change();";
+FOR EACH ROW EXECUTE FUNCTION public.clear_completed_address_change();
+UPDATE public.jobs_staging
+SET address_change_pending = true
+WHERE address_change_pending = false
+  AND address_change_detected_at IS NOT NULL
+  AND address_change_confirmed_at IS NULL
+  AND COALESCE(previous_site_address, '') <> ''
+  AND (
+       (booking_email_sent AND booking_email_sent_at IS NOT NULL AND booking_email_sent_at <= address_change_detected_at)
+    OR (terms_sent AND terms_sent_at IS NOT NULL AND terms_sent_at <= address_change_detected_at)
+    OR (calendar_created AND calendar_created_at IS NOT NULL AND calendar_created_at <= address_change_detected_at)
+    OR (invoice_sent AND invoice_sent_at IS NOT NULL AND invoice_sent_at <= address_change_detected_at)
+  );";
     await using var cmd = new NpgsqlCommand(sql, conn); await cmd.ExecuteNonQueryAsync();
 }
 
