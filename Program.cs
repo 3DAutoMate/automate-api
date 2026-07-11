@@ -11869,13 +11869,14 @@ UPDATE public.jobs_staging
 SET address_change_pending = true
 WHERE address_change_pending = false
   AND address_change_detected_at IS NOT NULL
+  AND address_change_detected_at >= TIMESTAMPTZ '2026-07-11 00:00:00+00'
   AND address_change_confirmed_at IS NULL
   AND COALESCE(previous_site_address, '') <> ''
   AND (
-       (booking_email_sent AND booking_email_sent_at IS NOT NULL AND booking_email_sent_at <= address_change_detected_at)
-    OR (terms_sent AND terms_sent_at IS NOT NULL AND terms_sent_at <= address_change_detected_at)
-    OR (calendar_created AND calendar_created_at IS NOT NULL AND calendar_created_at <= address_change_detected_at)
-    OR (invoice_sent AND invoice_sent_at IS NOT NULL AND invoice_sent_at <= address_change_detected_at)
+       booking_email_sent
+    OR terms_sent
+    OR calendar_created
+    OR invoice_sent
   );";
     await using var cmd = new NpgsqlCommand(sql, conn); await cmd.ExecuteNonQueryAsync();
 }
