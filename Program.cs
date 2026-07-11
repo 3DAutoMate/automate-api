@@ -6673,9 +6673,11 @@ app.MapGet("/automation/service-catalog", async (HttpContext context, Guid tenan
         var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
         const string sql = @"SELECT DISTINCT ON (c.catalog_item_key)
 c.catalog_item_key,c.list_item_id,c.list_item_name,c.list_name,c.invoice_item_id,c.invoice_item_name,c.is_active,c.canonical_service_type,c.booking_template_key,c.last_synced_at
-FROM public.inspector_service_catalog c JOIN public.inspectors i ON i.inspector_id=c.inspector_id
-WHERE i.tenant_id=@tenant ORDER BY c.catalog_item_key,c.last_synced_at DESC;";
-        await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId); await using var reader = await cmd.ExecuteReaderAsync(); var serviceCatalog = new List<object>();
+FROM public.inspector_service_catalog c LEFT JOIN public.inspectors i ON i.inspector_id=c.inspector_id
+WHERE i.tenant_id=@tenant
+   OR EXISTS(SELECT 1 FROM public.jobs_staging j WHERE j.tenant_id::text=@tenant_text AND j.inspector_id=c.inspector_id)
+ORDER BY c.catalog_item_key,c.last_synced_at DESC;";
+        await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId); cmd.Parameters.Add("tenant_text", NpgsqlTypes.NpgsqlDbType.Text).Value=tenantId.ToString(); await using var reader = await cmd.ExecuteReaderAsync(); var serviceCatalog = new List<object>();
         while (await reader.ReadAsync()) serviceCatalog.Add(new { catalog_item_key=reader["catalog_item_key"]?.ToString(),list_item_id=reader["list_item_id"]?.ToString(),list_item_name=reader["list_item_name"]?.ToString(),list_name=reader["list_name"]?.ToString(),invoice_item_id=reader["invoice_item_id"]?.ToString(),invoice_item_name=reader["invoice_item_name"]?.ToString(),is_active=reader["is_active"]?.ToString(),canonical_service_type=reader["canonical_service_type"]?.ToString(),booking_template_key=reader["booking_template_key"]?.ToString(),last_synced_at=reader["last_synced_at"]?.ToString() });
         return Results.Ok(new { success=true, tenantId, service_catalog=serviceCatalog });
     }

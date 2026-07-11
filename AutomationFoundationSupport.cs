@@ -83,9 +83,13 @@ LIMIT 1;";
     public static async Task<bool> InspectorBelongsToTenantAsync(NpgsqlConnection conn, Guid tenantId, Guid inspectorId)
     {
         if (tenantId == Guid.Empty || inspectorId == Guid.Empty) return false;
-        const string sql = @"SELECT EXISTS(SELECT 1 FROM public.inspectors WHERE tenant_id=@tenant AND inspector_id=@inspector);";
+        const string sql = @"SELECT (
+EXISTS(SELECT 1 FROM public.inspectors WHERE tenant_id=@tenant AND inspector_id=@inspector)
+OR EXISTS(SELECT 1 FROM public.jobs_staging WHERE tenant_id::text=@tenant_text AND inspector_id=@inspector)
+);";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("tenant", tenantId);
+        cmd.Parameters.Add("tenant_text", NpgsqlDbType.Text).Value = tenantId.ToString();
         cmd.Parameters.AddWithValue("inspector", inspectorId);
         return Convert.ToBoolean(await cmd.ExecuteScalarAsync());
     }
@@ -95,7 +99,8 @@ LIMIT 1;";
         const string sql = @"SELECT activation_mode FROM public.automation_tenant_settings WHERE tenant_id=@tenant;";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("tenant", tenantId);
-        return Convert.ToString(await cmd.ExecuteScalarAsync()) ?? "selected_jobs";
+        var value = Convert.ToString(await cmd.ExecuteScalarAsync());
+        return string.IsNullOrWhiteSpace(value) ? "selected_jobs" : value;
     }
 
     public static async Task<bool> JobUsesAdvancedAsync(NpgsqlConnection conn, Guid tenantId, Guid jobId, string mode)
