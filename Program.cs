@@ -915,9 +915,8 @@ current_snapshot_json::text,approved_snapshot_version FROM public.jobs_staging W
         fingerprint = reader["pending_change_fingerprint"]?.ToString() ?? ""; snapshot = reader["current_snapshot_json"]?.ToString() ?? "{}"; version = Convert.ToInt32(reader["approved_snapshot_version"]) + 1;
     }
     var categories = reasons.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToHashSet(StringComparer.OrdinalIgnoreCase);
-    bool email = categories.Overlaps(new[] { "address", "services", "scope", "price", "schedule", "customer" });
-    bool priceOnly = categories.Count == 1 && categories.Contains("price");
-    if (priceOnly) email = false;
+    bool email = categories.Overlaps(new[] { "services", "scope", "schedule" });
+    bool unsupportedBasicEmailChange = categories.Overlaps(new[] { "address", "customer", "price" });
     bool terms = categories.Overlaps(new[] { "address", "services", "scope", "customer" });
     bool calendar = categories.Overlaps(new[] { "address", "services", "scope", "schedule", "customer", "operational" });
     await using (var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET
@@ -934,7 +933,7 @@ change_template_setup_required=(change_template_setup_required OR @template_setu
 change_confirmed_at=NOW(),change_confirmed_by=@actor,address_change_pending=false,workflow_updated_at=NOW()
 WHERE job_id=@job", conn, tx))
     {
-        update.Parameters.AddWithValue("job", jobId); update.Parameters.AddWithValue("email", email); update.Parameters.AddWithValue("terms", terms); update.Parameters.AddWithValue("calendar", calendar); update.Parameters.AddWithValue("template_setup", priceOnly);
+        update.Parameters.AddWithValue("job", jobId); update.Parameters.AddWithValue("email", email); update.Parameters.AddWithValue("terms", terms); update.Parameters.AddWithValue("calendar", calendar); update.Parameters.AddWithValue("template_setup", unsupportedBasicEmailChange);
         update.Parameters.AddWithValue("snapshot", snapshot); update.Parameters.AddWithValue("fingerprint", fingerprint); update.Parameters.AddWithValue("version", version); update.Parameters.AddWithValue("actor", confirmedBy ?? "Connector user");
         await update.ExecuteNonQueryAsync();
     }
@@ -946,7 +945,13 @@ WHERE job_id=@job AND action_type='booking_email' AND status <> 'superseded'", c
     }
     await tx.CommitAsync();
     await JobChangeSupport.AuditAsync(conn, jobId, rowTenant, version, "confirmed", fingerprint, changes, reasons, confirmedBy ?? "Connector user");
-    return Results.Ok(new { success = true, reasons, queued = new { email, terms, calendar }, xeroUnchanged = true });
+    var basicResults=new List<object>();var changedJob=await LoadScheduleJobAsync(conn,jobId);
+    if(changedJob!=null)
+    {
+        if(categories.Contains("schedule"))basicResults.Add(await ExecuteBasicEmailEventAsync(conn,changedJob,"rescheduling",fingerprint,builder.Configuration));
+        if(categories.Contains("services")||categories.Contains("scope"))basicResults.Add(await ExecuteBasicEmailEventAsync(conn,changedJob,"service_change",fingerprint,builder.Configuration));
+    }
+    return Results.Ok(new { success = true, reasons, queued = new { email, terms, calendar }, basicEmails=basicResults, xeroUnchanged = true });
 });
 
 app.MapPost("/jobs/{jobId}/manual-review/{reviewType}/complete", async (Guid jobId, string reviewType, Guid? tenantId, string? completedBy) =>
@@ -968,11 +973,12 @@ app.MapPost("/jobs/{jobId}/cancel-unschedule", async (Guid jobId, Guid? tenantId
     var calendar = await CancelGoogleCalendarEventForJobAsync(conn, job, builder.Configuration);
     await using (var cmd = new NpgsqlCommand(@"UPDATE public.jobs_staging SET unscheduled=true,source_missing=@missing,source_missing_at=CASE WHEN @missing THEN NOW() ELSE source_missing_at END,
 change_review_pending=false,booking_email_retry_requested=false,terms_retry_requested=false,invoice_retry_requested=false,calendar_retry_requested=false,report_retry_requested=false,
-xero_review_required=(xero_review_required OR invoice_sent),change_template_setup_required=true,pending_change_reasons='cancellation_email_setup',workflow_updated_at=NOW() WHERE job_id=@job", conn))
+xero_review_required=(xero_review_required OR invoice_sent),workflow_updated_at=NOW() WHERE job_id=@job", conn))
     { cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.AddWithValue("missing", sourceMissing); await cmd.ExecuteNonQueryAsync(); }
     await using (var actions = new NpgsqlCommand("UPDATE public.job_workflow_actions SET status='superseded',retry_requested=false,updated_at=NOW() WHERE job_id=@job AND status <> 'sent'", conn))
     { actions.Parameters.AddWithValue("job", jobId); await actions.ExecuteNonQueryAsync(); }
-    return Results.Ok(new { success = calendar.Success, jobId, unscheduled = true, sourceMissing, calendar, cancellationEmail = "setup_required", xeroUnchanged = true, cancelledBy });
+    var cancellation=await ExecuteBasicEmailEventAsync(conn,job,"cancellation",sourceMissing?"source-missing":"manual-cancel",builder.Configuration);
+    return Results.Ok(new { success = calendar.Success, jobId, unscheduled = true, sourceMissing, calendar, cancellationEmail = cancellation, xeroUnchanged = true, cancelledBy });
 });
 
 app.MapPost("/jobs/{jobId}/confirm-address-change", async (Guid jobId, Guid? tenantId, string? confirmedBy) =>
@@ -3096,8 +3102,8 @@ app.MapPost("/integrations/xero/test-connection", async (XeroTestConnectionReque
 app.MapGet("/email-templates/placeholders", () => Results.Ok(new
 {
     success = true,
-    placeholders = GetEmailTemplatePlaceholders(),
-    categories = GetEmailTemplatePlaceholderCategories()
+    placeholders = GetBasicEmailTemplatePlaceholders(),
+    categories = GetBasicEmailTemplatePlaceholderCategories()
 }));
 
 // =============================
@@ -3359,6 +3365,127 @@ SELECT @newid,tenant_id,@inspector,'advanced-workflow','advanced_'||replace(@new
         await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("newid",newId);cmd.Parameters.AddWithValue("inspector",inspectorId);cmd.Parameters.AddWithValue("id",templateId);cmd.Parameters.AddWithValue("tenant",request.TenantId);var result=await cmd.ExecuteScalarAsync();return result==null?Results.NotFound(new{success=false,message="Template was not found for this company."}):Results.Ok(new{success=true,templateId=newId});
     }
     catch(Exception ex){return Results.Problem(title:"Duplicate company template failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/automation/basic", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureBasicJobProfileColumnsAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        var labels = await LoadBasicContactLabelsAsync(conn, tenantId);
+        await AutoMateApi.BasicAutomationSupport.SeedSchedulingContactOneAsync(conn, tenantId, inspectorId, labels.Contact1, context.RequestAborted);
+        var slots = await AutoMateApi.BasicAutomationSupport.LoadAsync(conn, tenantId, context.RequestAborted);
+        return Results.Ok(new
+        {
+            success = true,
+            contactLabels = new { contact1Name = labels.Contact1, contact2Name = labels.Contact2 },
+            settings = slots.Select(slot => new { slot.EventKey, slot.RecipientKey, slot.Enabled, hasTemplate = slot.TemplateId.HasValue, slot.TemplateName, slot.UpdatedAt })
+        });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Load Basic Automations failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapPut("/automation/basic/settings", async (HttpContext context, BasicAutomationSettingRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        await AutoMateApi.BasicAutomationSupport.SetEnabledAsync(conn, request.TenantId, request.EventKey, request.RecipientKey, request.Enabled, context.RequestAborted);
+        await AutomationFoundationSupport.AuditAsync(conn, request.TenantId, null, "basic_automation_setting_changed", "", $"{request.EventKey}:{request.RecipientKey}:{request.Enabled}", context.Request.Headers["X-AutoMate-Inspector-ID"].FirstOrDefault() ?? "Connector user");
+        return Results.Ok(new { success = true });
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
+    catch (Exception ex) { return Results.Problem(title: "Save Basic Automation setting failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpContext context, string eventKey, string recipientKey, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        var labels = await LoadBasicContactLabelsAsync(conn, tenantId);
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        await AutoMateApi.BasicAutomationSupport.SeedSchedulingContactOneAsync(conn, tenantId, inspectorId, labels.Contact1, context.RequestAborted);
+        var slot = (await AutoMateApi.BasicAutomationSupport.LoadAsync(conn, tenantId, context.RequestAborted)).FirstOrDefault(item => item.EventKey == eventKey && item.RecipientKey == recipientKey);
+        if (slot == null) return Results.BadRequest(new { success = false, message = "Unsupported Basic template slot." });
+        var recipientLabel = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
+        var defaults = BuildDefaultBasicTemplate(eventKey, recipientKey, recipientLabel);
+        return Results.Ok(new { success = true, eventKey, recipientKey, recipientLabel, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, recipientLabel), subject = string.IsNullOrWhiteSpace(slot.Subject) ? defaults.Subject : slot.Subject, htmlBody = string.IsNullOrWhiteSpace(slot.HtmlBody) ? defaults.HtmlBody : slot.HtmlBody, hasTemplate = slot.TemplateId.HasValue, defaultSubject = defaults.Subject, defaultHtmlBody = defaults.HtmlBody });
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
+    catch (Exception ex) { return Results.Problem(title: "Load Basic template failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapPut("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpContext context, string eventKey, string recipientKey, BasicAutomationTemplateRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        if (string.IsNullOrWhiteSpace(request.Subject) || string.IsNullOrWhiteSpace(request.HtmlBody)) return Results.BadRequest(new { success = false, message = "Subject and email body are required." });
+        var labels = await LoadBasicContactLabelsAsync(conn, request.TenantId); var label = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        var id = await AutoMateApi.BasicAutomationSupport.SaveTemplateAsync(conn, request.TenantId, inspectorId, eventKey, recipientKey, label, request.Subject.Trim(), CleanEditorHtml(request.HtmlBody), context.RequestAborted);
+        return Results.Ok(new { success = true, templateId = id, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, label) });
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
+    catch (Exception ex) { return Results.Problem(title: "Save Basic template failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapGet("/automation/basic/pending", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        const string sql = @"SELECT e.job_id,e.revision_key,e.event_key,e.recipient_key
+FROM public.basic_automation_executions e JOIN public.jobs_staging j ON j.job_id=e.job_id
+WHERE e.tenant_id=@tenant AND e.state='claimed' AND NOT j.change_review_pending AND (NOT j.unscheduled OR e.event_key='cancellation')
+ORDER BY e.claimed_at LIMIT 100";
+        var rows = new List<object>(); await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId);
+        await using var reader = await cmd.ExecuteReaderAsync(); while (await reader.ReadAsync()) rows.Add(new { jobId=reader.GetGuid(0), revisionKey=reader.GetString(1), eventKey=reader.GetString(2), recipientKey=reader.GetString(3) });
+        return Results.Ok(rows);
+    }
+    catch (Exception ex) { return Results.Problem(title:"Load pending Basic emails failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic-render", async (HttpContext context, Guid jobId, BasicAutomationRenderRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureJobInvoiceLinesTableAsync(conn); await EnsureEmailTemplatesTableAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var job = await LoadScheduleJobAsync(conn, jobId); if (job == null || job.TenantId != request.TenantId) return Results.NotFound(new { success=false,message="Job not found for this company." });
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var rendered = await RenderBasicEmailAsync(conn, job, request.EventKey, request.RecipientKey, request.Subject, request.HtmlBody);
+        return Results.Ok(new { success=true, rendered.ToEmail, rendered.Subject, rendered.HtmlBody, rendered.RecipientLabel });
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
+    catch (Exception ex) { return Results.Problem(title:"Render Basic email failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic-complete", async (HttpContext context, Guid jobId, BasicAutomationCompleteRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var state = request.Success ? AutoMateApi.BasicExecutionState.Sent : AutoMateApi.BasicExecutionState.Failed;
+        await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,request.TenantId,jobId,request.RevisionKey,request.EventKey,request.RecipientKey,state,"",request.Error,context.RequestAborted);
+        if (!request.Success) await SetBasicEmailAttentionAsync(conn,jobId,request.EventKey,request.RecipientKey,request.Error);
+        if (request.Success && request.EventKey=="scheduling" && !await HasIncompleteBasicEventAsync(conn,request.TenantId,jobId,request.RevisionKey,"scheduling")) await MarkBookingEmailSentAsync(conn,jobId);
+        return Results.Ok(new { success=true });
+    }
+    catch (Exception ex) { return Results.Problem(title:"Complete Basic email failed",detail:ex.Message,statusCode:500); }
 });
 
 app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
@@ -4196,6 +4323,7 @@ app.MapGet("/jobs/workflow-status", async () =>
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
+        await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
         await EnsureEmailTemplatesTableAsync(conn);
         await EnsureAdvancedActionsTablesAsync(conn);
         await AutomationFoundationSupport.EnsureAsync(conn);
@@ -4238,6 +4366,9 @@ SELECT
     j.paid,
     j.contact1_first_name,
     j.contact1_last_name,
+    j.contact1_display_name,
+    j.contact1_salutation,
+    j.contact1_role_label,
     j.contact1_email,
     j.weathertightness,
     j.workflow_updated_at,
@@ -4371,6 +4502,7 @@ app.MapGet("/workflow-actions/pending", async (Guid? inspectorId) =>
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
+        await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
 
         const string sql = @"
 SELECT
@@ -4434,6 +4566,9 @@ SELECT
     j.contact2_salutation,
     j.contact2_first_name,
     j.contact2_last_name,
+    j.contact2_display_name,
+    j.contact2_salutation,
+    j.contact2_role_label,
     j.contact2_email,
     j.contact2_cellular,
     j.extracted_at_utc,
@@ -4446,8 +4581,8 @@ SELECT
     i.company_name,
     i.contact_name,
     i.email_from_name,
-    i.email_from_address,
-    i.phone,
+    COALESCE(NULLIF(j.inspector_email,''),i.email_from_address) AS email_from_address,
+    COALESCE(NULLIF(j.inspector_phone,''),i.phone) AS phone,
     i.timezone,
     COALESCE(i.email_sender_mode, 'microsoft') AS email_sender_mode,
     i.allow_report_release_before_payment,
@@ -4492,6 +4627,7 @@ WHERE a.action_type = 'booking_email'
   AND NOT j.change_review_pending AND NOT j.unscheduled
   AND NOT EXISTS (SELECT 1 FROM public.automation_tenant_settings ats WHERE ats.tenant_id::text=j.tenant_id::text AND ats.activation_mode='all_jobs')
   AND NOT EXISTS (SELECT 1 FROM public.automation_job_selections ajs WHERE ajs.tenant_id::text=j.tenant_id::text AND ajs.job_id=j.job_id AND ajs.use_advanced_workflows=true)
+  AND NOT EXISTS (SELECT 1 FROM public.basic_automation_settings bas WHERE bas.tenant_id=j.tenant_id AND bas.event_key='scheduling')
   AND (@inspector_id IS NULL OR a.inspector_id = @inspector_id)
 ORDER BY a.updated_at ASC
 LIMIT 100;";
@@ -6072,6 +6208,8 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     tenant_id uuid NULL,
     inspector_id uuid NOT NULL,
     inspector_name text NULL,
+    inspector_email text NULL,
+    inspector_phone text NULL,
     source_system text,
     job_name text,
     site_address text,
@@ -6150,11 +6288,15 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     directions text,
     instructions text,
     contact1_salutation text,
+    contact1_display_name text,
+    contact1_role_label text,
     contact1_first_name text,
     contact1_last_name text,
     contact1_email text,
     contact1_cellular text,
     contact2_salutation text,
+    contact2_display_name text,
+    contact2_role_label text,
     contact2_first_name text,
     contact2_last_name text,
     contact2_email text,
@@ -6183,6 +6325,17 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
         await using (var createCmd = new NpgsqlCommand(createTableSql, conn))
         {
             await createCmd.ExecuteNonQueryAsync();
+        }
+
+        await using (var profileColumns = new NpgsqlCommand(@"
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS inspector_email text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS inspector_phone text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact1_display_name text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact1_role_label text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_display_name text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_role_label text NULL;", conn))
+        {
+            await profileColumns.ExecuteNonQueryAsync();
         }
 
         await EnsureJobPaymentColumnsAsync(conn);
@@ -6214,6 +6367,8 @@ INSERT INTO public.jobs_staging
     job_id,
     inspector_id,
     inspector_name,
+    inspector_email,
+    inspector_phone,
     source_system,
     job_name,
     site_address,
@@ -6260,11 +6415,15 @@ INSERT INTO public.jobs_staging
     directions,
     instructions,
     contact1_salutation,
+    contact1_display_name,
+    contact1_role_label,
     contact1_first_name,
     contact1_last_name,
     contact1_email,
     contact1_cellular,
     contact2_salutation,
+    contact2_display_name,
+    contact2_role_label,
     contact2_first_name,
     contact2_last_name,
     contact2_email,
@@ -6281,6 +6440,8 @@ VALUES
     @job_id,
     @inspector_id,
     @inspector_name,
+    @inspector_email,
+    @inspector_phone,
     @source_system,
     @job_name,
     @site_address,
@@ -6327,11 +6488,15 @@ VALUES
     @directions,
     @instructions,
     @contact1_salutation,
+    @contact1_display_name,
+    @contact1_role_label,
     @contact1_first_name,
     @contact1_last_name,
     @contact1_email,
     @contact1_cellular,
     @contact2_salutation,
+    @contact2_display_name,
+    @contact2_role_label,
     @contact2_first_name,
     @contact2_last_name,
     @contact2_email,
@@ -6347,6 +6512,8 @@ DO UPDATE SET
     tenant_id                    = EXCLUDED.tenant_id,
     inspector_id                 = EXCLUDED.inspector_id,
     inspector_name               = EXCLUDED.inspector_name,
+    inspector_email              = EXCLUDED.inspector_email,
+    inspector_phone              = EXCLUDED.inspector_phone,
     source_system                = EXCLUDED.source_system,
     job_name                     = EXCLUDED.job_name,
     site_address                 = EXCLUDED.site_address,
@@ -6393,11 +6560,15 @@ DO UPDATE SET
     directions                   = EXCLUDED.directions,
     instructions                 = EXCLUDED.instructions,
     contact1_salutation          = EXCLUDED.contact1_salutation,
+    contact1_display_name        = EXCLUDED.contact1_display_name,
+    contact1_role_label          = EXCLUDED.contact1_role_label,
     contact1_first_name          = EXCLUDED.contact1_first_name,
     contact1_last_name           = EXCLUDED.contact1_last_name,
     contact1_email               = EXCLUDED.contact1_email,
     contact1_cellular            = EXCLUDED.contact1_cellular,
     contact2_salutation          = EXCLUDED.contact2_salutation,
+    contact2_display_name        = EXCLUDED.contact2_display_name,
+    contact2_role_label          = EXCLUDED.contact2_role_label,
     contact2_first_name          = EXCLUDED.contact2_first_name,
     contact2_last_name           = EXCLUDED.contact2_last_name,
     contact2_email               = EXCLUDED.contact2_email,
@@ -6414,6 +6585,8 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("job_id", jobId);
             cmd.Parameters.AddWithValue("inspector_id", inspectorId);
             cmd.Parameters.AddWithValue("inspector_name", payload.Job.InspectorName ?? "");
+            cmd.Parameters.AddWithValue("inspector_email", payload.Job.InspectorEmail ?? "");
+            cmd.Parameters.AddWithValue("inspector_phone", payload.Job.InspectorPhone ?? "");
             cmd.Parameters.AddWithValue("source_system", payload.SourceSystem ?? "");
             cmd.Parameters.AddWithValue("job_name", payload.Job.JobName ?? "");
             cmd.Parameters.AddWithValue("site_address", payload.Job.SiteAddress ?? "");
@@ -6467,11 +6640,15 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("directions", payload.Job.Directions ?? "");
             cmd.Parameters.AddWithValue("instructions", payload.Job.Instructions ?? "");
             cmd.Parameters.AddWithValue("contact1_salutation", payload.Contact1?.Salutation ?? "");
+            cmd.Parameters.AddWithValue("contact1_display_name", payload.Contact1?.DisplayName ?? "");
+            cmd.Parameters.AddWithValue("contact1_role_label", payload.Contact1?.RoleLabel ?? "");
             cmd.Parameters.AddWithValue("contact1_first_name", payload.Contact1?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact1_last_name", payload.Contact1?.LastName ?? "");
             cmd.Parameters.AddWithValue("contact1_email", payload.Contact1?.Email ?? "");
             cmd.Parameters.AddWithValue("contact1_cellular", payload.Contact1?.Cellular ?? "");
             cmd.Parameters.AddWithValue("contact2_salutation", payload.Contact2?.Salutation ?? "");
+            cmd.Parameters.AddWithValue("contact2_display_name", payload.Contact2?.DisplayName ?? "");
+            cmd.Parameters.AddWithValue("contact2_role_label", payload.Contact2?.RoleLabel ?? "");
             cmd.Parameters.AddWithValue("contact2_first_name", payload.Contact2?.FirstName ?? "");
             cmd.Parameters.AddWithValue("contact2_last_name", payload.Contact2?.LastName ?? "");
             cmd.Parameters.AddWithValue("contact2_email", payload.Contact2?.Email ?? "");
@@ -6948,6 +7125,8 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await EnsureEmailTemplatesTableAsync(startupMigrationConnection);
     await EnsureAdvancedActionsTablesAsync(startupMigrationConnection);
     await AutomationFoundationSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.BasicAutomationSupport.EnsureAsync(startupMigrationConnection);
+    await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
 
 app.Run();
@@ -7926,6 +8105,7 @@ WHERE job_id = @job_id;";
 
 static async Task<ScheduleJobInput?> LoadScheduleJobAsync(NpgsqlConnection conn, Guid jobId)
 {
+    await EnsureBasicJobProfileColumnsAsync(conn);
     const string sql = @"
 SELECT
     j.job_id,
@@ -7965,17 +8145,31 @@ SELECT
     j.access_by,
     j.contact1_first_name,
     j.contact1_last_name,
+    j.contact1_display_name,
+    j.contact1_salutation,
+    j.contact1_role_label,
     j.contact1_email,
     j.contact1_cellular,
     j.contact2_first_name,
     j.contact2_last_name,
+    j.contact2_display_name,
+    j.contact2_salutation,
+    j.contact2_role_label,
     j.contact2_email,
     j.contact2_cellular,
     COALESCE(i.timezone, 'Pacific/Auckland') AS timezone,
-    i.company_name,
+    COALESCE((
+        SELECT i2.company_name
+        FROM public.inspectors i2
+        LEFT JOIN public.subscriptions s2 ON s2.inspector_id=i2.inspector_id
+        WHERE i2.tenant_id=j.tenant_id
+        ORDER BY CASE WHEN s2.status='active' THEN 0 WHEN s2.status='trialing' AND s2.trial_ends_at>NOW() THEN 1 ELSE 2 END,
+                 i2.created_at
+        LIMIT 1
+    ), '') AS company_name,
     i.email_from_name,
-    i.email_from_address,
-    i.phone,
+    COALESCE(NULLIF(j.inspector_email,''),i.email_from_address) AS email_from_address,
+    COALESCE(NULLIF(j.inspector_phone,''),i.phone) AS phone,
     COALESCE(i.email_sender_mode, 'microsoft') AS email_sender_mode
 FROM public.jobs_staging j
 LEFT JOIN public.inspectors i
@@ -8027,9 +8221,19 @@ LIMIT 1;";
         reader["foundation_space"]?.ToString() ?? "",
         reader["access_by"]?.ToString() ?? "",
         BuildPersonName(reader["contact1_first_name"]?.ToString(), reader["contact1_last_name"]?.ToString()),
+        reader["contact1_first_name"]?.ToString() ?? "",
+        reader["contact1_last_name"]?.ToString() ?? "",
+        reader["contact1_display_name"]?.ToString() ?? "",
+        reader["contact1_salutation"]?.ToString() ?? "",
+        reader["contact1_role_label"]?.ToString() ?? "Client",
         reader["contact1_email"]?.ToString() ?? "",
         reader["contact1_cellular"]?.ToString() ?? "",
         BuildPersonName(reader["contact2_first_name"]?.ToString(), reader["contact2_last_name"]?.ToString()),
+        reader["contact2_first_name"]?.ToString() ?? "",
+        reader["contact2_last_name"]?.ToString() ?? "",
+        reader["contact2_display_name"]?.ToString() ?? "",
+        reader["contact2_salutation"]?.ToString() ?? "",
+        reader["contact2_role_label"]?.ToString() ?? "Buyers Agent",
         reader["contact2_email"]?.ToString() ?? "",
         reader["contact2_cellular"]?.ToString() ?? "",
         reader["timezone"]?.ToString() ?? "Pacific/Auckland",
@@ -8038,6 +8242,17 @@ LIMIT 1;";
         reader["email_from_address"]?.ToString() ?? "",
         reader["phone"]?.ToString() ?? "",
         NormalizeEmailSenderMode(reader["email_sender_mode"]?.ToString()));
+}
+
+static async Task EnsureBasicJobProfileColumnsAsync(NpgsqlConnection conn)
+{
+    const string sql=@"ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS inspector_email text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS inspector_phone text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact1_display_name text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact1_role_label text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_display_name text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_role_label text NULL;";
+    await using var cmd=new NpgsqlCommand(sql,conn);await cmd.ExecuteNonQueryAsync();
 }
 
 static Guid ReadDatabaseGuid(object? value)
@@ -8056,58 +8271,42 @@ static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
 {
     if (job.BookingEmailSent)
         return ScheduleActionResult.Skip("booking-email", "Booking email was already marked sent.");
+    return await ExecuteBasicEmailEventAsync(conn,job,"scheduling","initial",configuration);
+}
 
-    if (string.IsNullOrWhiteSpace(job.ClientEmail))
+static async Task<ScheduleActionResult> ExecuteBasicEmailEventAsync(NpgsqlConnection conn,ScheduleJobInput job,string eventKey,string revisionKey,IConfiguration configuration)
+{
+    await EnsureEmailTemplatesTableAsync(conn);await AutomationFoundationSupport.EnsureAsync(conn);await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+    var activationMode=await AutomationFoundationSupport.GetActivationModeAsync(conn,job.TenantId);
+    if(await AutomationFoundationSupport.JobUsesAdvancedAsync(conn,job.TenantId,job.JobId,activationMode))return ScheduleActionResult.Skip("booking-email","This job is assigned to Advanced Workflows; Basic email execution was skipped.");
+    var labels=await LoadBasicContactLabelsAsync(conn,job.TenantId);await AutoMateApi.BasicAutomationSupport.SeedSchedulingContactOneAsync(conn,job.TenantId,job.InspectorId,labels.Contact1);
+    var enabled=(await AutoMateApi.BasicAutomationSupport.LoadAsync(conn,job.TenantId)).Where(slot=>slot.EventKey==eventKey&&slot.Enabled).ToArray();
+    if(enabled.Length==0)return ScheduleActionResult.Skip("booking-email",$"No {eventKey} Basic emails are enabled.");
+    IntegrationAccountResult? account=null;HttpClient? http=null;var sent=new List<string>();var queued=new List<string>();var skipped=new List<string>();
+    try
     {
-        await MarkBookingEmailFailedAsync(conn, job.JobId, "Client email is missing.");
-        return ScheduleActionResult.Failed("booking-email", "Client email is missing.");
-    }
-
-    var services = GetSchedulableServices(job).ToArray();
-    if (services.Length == 0)
-        return ScheduleActionResult.Skip("booking-email", "No schedulable services were found.");
-
-    if (IsSmtpEmailSenderMode(job.EmailSenderMode))
-    {
-        return ScheduleActionResult.Skip(
-            "booking-email",
-            "Booking email is pending for local SMTP sending in the desktop connector.",
-            new
-            {
-                senderMode = job.EmailSenderMode,
-                provider = GetEmailSenderModeLabel(job.EmailSenderMode),
-                pending = services.Select(service => service.Label).ToArray()
-            });
-    }
-
-    var account = await GetMicrosoftMailAccountAsync(conn, job.InspectorId, configuration);
-    if (!account.Success)
-    {
-        await MarkBookingEmailFailedAsync(conn, job.JobId, account.ErrorMessage ?? "Microsoft email is not connected.");
-        return ScheduleActionResult.Failed("booking-email", account.ErrorMessage ?? "Microsoft email is not connected.");
-    }
-
-    using var httpClient = new HttpClient();
-    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
-
-    var sent = new List<string>();
-    foreach (var service in services)
-    {
-        var subject = $"Booking confirmation - {service.Label}";
-        var body = BuildScheduleBookingEmailHtml(job, service);
-        var response = await SendMicrosoftMailAsync(httpClient, job.ClientEmail, subject, body);
-        if (!response.Success)
+        if(!IsSmtpEmailSenderMode(job.EmailSenderMode))
         {
-            await MarkBookingEmailFailedAsync(conn, job.JobId, response.Message);
-            return ScheduleActionResult.Failed("booking-email", response.Message, new { sent });
+            account=await GetMicrosoftMailAccountAsync(conn,job.InspectorId,configuration);if(!account.Success)return ScheduleActionResult.Failed("booking-email",account.ErrorMessage??"Microsoft email is not connected.");
+            http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);
         }
-
-        await MarkWorkflowActionSentAsync(conn, job.JobId, BuildBookingActionKey(service.ServiceKey, service.Label));
-        sent.Add(service.Label);
+        foreach(var slot in enabled)
+        {
+            if(!await AutoMateApi.BasicAutomationSupport.TryClaimExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey))continue;
+            var rendered=await RenderBasicEmailAsync(conn,job,eventKey,slot.RecipientKey);
+            if(string.IsNullOrWhiteSpace(rendered.ToEmail))
+            {
+                var error=$"{rendered.RecipientLabel} is missing or has no email address.";await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey,AutoMateApi.BasicExecutionState.Skipped,"",error);await SetBasicEmailAttentionAsync(conn,job.JobId,eventKey,slot.RecipientKey,error);skipped.Add(rendered.RecipientLabel);continue;
+            }
+            if(IsSmtpEmailSenderMode(job.EmailSenderMode)){queued.Add(rendered.RecipientLabel);continue;}
+            var response=await SendMicrosoftMailAsync(http!,rendered.ToEmail,rendered.Subject,rendered.HtmlBody);
+            if(!response.Success){await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey,AutoMateApi.BasicExecutionState.Failed,"",response.Message);await SetBasicEmailAttentionAsync(conn,job.JobId,eventKey,slot.RecipientKey,response.Message);continue;}
+            await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey,AutoMateApi.BasicExecutionState.Sent);sent.Add(rendered.RecipientLabel);
+        }
+        if(eventKey=="scheduling"&&queued.Count==0)await MarkBookingEmailSentAsync(conn,job.JobId);
+        return ScheduleActionResult.Ok("booking-email",$"Basic {eventKey}: {sent.Count} sent, {queued.Count} queued, {skipped.Count} skipped.",new{sent,queued,skipped});
     }
-
-    await MarkBookingEmailSentAsync(conn, job.JobId);
-    return ScheduleActionResult.Ok("booking-email", $"Sent {sent.Count} booking email(s).", new { sent });
+    finally{http?.Dispose();}
 }
 
 static IEnumerable<ScheduleServiceInput> GetSchedulableServices(ScheduleJobInput job)
@@ -8129,9 +8328,10 @@ static IEnumerable<ScheduleServiceInput> GetSchedulableServices(ScheduleJobInput
     }
 }
 
+#pragma warning disable CS8321
 static string BuildScheduleBookingEmailHtml(ScheduleJobInput job, ScheduleServiceInput service)
 {
-    var company = string.IsNullOrWhiteSpace(job.CompanyName) ? "3D AutoMate" : job.CompanyName.Trim();
+    var company = job.CompanyName?.Trim() ?? "";
     var inspector = !string.IsNullOrWhiteSpace(job.EmailFromName) ? job.EmailFromName.Trim() : job.InspectorName;
     var start = job.JobDate.HasValue ? job.JobDate.Value.ToLocalTime().ToString("f") : "To be confirmed";
 
@@ -8148,6 +8348,7 @@ static string BuildScheduleBookingEmailHtml(ScheduleJobInput job, ScheduleServic
         $"<p>Regards,<br>{WebUtility.HtmlEncode(company)}</p>" +
         "</div>";
 }
+#pragma warning restore CS8321
 
 static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
     NpgsqlConnection conn,
@@ -10169,6 +10370,41 @@ static string BuildDefaultBookingTemplateHtml()
         "</div>";
 }
 
+static async Task<(string Contact1, string Contact2)> LoadBasicContactLabelsAsync(NpgsqlConnection conn, Guid tenantId)
+{
+    const string sql = @"SELECT COALESCE(NULLIF(contact1_role_label,''),'Client'),COALESCE(NULLIF(contact2_role_label,''),'Buyers Agent')
+FROM public.jobs_staging WHERE tenant_id=@tenant
+ORDER BY updated_at DESC LIMIT 1";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (!await reader.ReadAsync()) return ("Client", "Buyers Agent");
+    return (reader.GetString(0), reader.GetString(1));
+}
+
+static (string Subject, string HtmlBody) BuildDefaultBasicTemplate(string eventKey, string recipientKey, string recipientLabel)
+{
+    if (!AutoMateApi.BasicAutomationSupport.IsValidEvent(eventKey) || !AutoMateApi.BasicAutomationSupport.IsValidRecipient(recipientKey))
+        throw new ArgumentException("Unsupported Basic template slot.");
+    var greeting = recipientKey == "contact_2" ? "{{AGENT_FIRST_NAME}}" : "{{CLIENT_FIRST_NAME}}";
+    var eventText = eventKey switch
+    {
+        "scheduling" => "has been scheduled",
+        "rescheduling" => "has been rescheduled",
+        "cancellation" => "has been cancelled",
+        "service_change" => "has updated services",
+        _ => "has been updated"
+    };
+    var subject = eventKey switch
+    {
+        "scheduling" => "Inspection scheduled - {{PROPERTY_ADDRESS}}",
+        "rescheduling" => "Inspection rescheduled - {{PROPERTY_ADDRESS}}",
+        "cancellation" => "Inspection cancelled - {{PROPERTY_ADDRESS}}",
+        _ => "Inspection services updated - {{PROPERTY_ADDRESS}}"
+    };
+    var html = $"<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937\"><p>Hi {greeting},</p><p>The inspection at <strong>{{{{PROPERTY_ADDRESS}}}}</strong> {eventText}.</p><p><strong>Date:</strong> {{{{INSPECTION_DATE}}}} {{{{INSPECTION_TIME}}}}<br><strong>Services:</strong> {{{{SERVICES}}}}</p><p>Regards,<br>{{{{COMPANY_NAME}}}}</p></div>";
+    return (subject, html);
+}
+
 static async Task<RenderedEmailTemplate?> RenderBookingEmailTemplateAsync(
     NpgsqlConnection conn,
     Guid jobId,
@@ -10227,6 +10463,31 @@ static async Task<RenderedEmailTemplate?> RenderBookingEmailTemplateAsync(
         fields);
 }
 
+static async Task<RenderedBasicEmail> RenderBasicEmailAsync(NpgsqlConnection conn, ScheduleJobInput job, string eventKey, string recipientKey, string? draftSubject=null, string? draftHtml=null)
+{
+    if (!AutoMateApi.BasicAutomationSupport.IsValidEvent(eventKey) || !AutoMateApi.BasicAutomationSupport.IsValidRecipient(recipientKey)) throw new ArgumentException("Unsupported Basic template slot.");
+    await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+    var slot=(await AutoMateApi.BasicAutomationSupport.LoadAsync(conn,job.TenantId)).First(item=>item.EventKey==eventKey&&item.RecipientKey==recipientKey);
+    var label=recipientKey=="contact_2" ? (string.IsNullOrWhiteSpace(job.AgentRoleLabel)?"Buyers Agent":job.AgentRoleLabel) : (string.IsNullOrWhiteSpace(job.ClientRoleLabel)?"Client":job.ClientRoleLabel);
+    var defaults=BuildDefaultBasicTemplate(eventKey,recipientKey,label);
+    var subjectTemplate=!string.IsNullOrWhiteSpace(draftSubject)?draftSubject:(!string.IsNullOrWhiteSpace(slot.Subject)?slot.Subject:defaults.Subject);
+    var htmlTemplate=!string.IsNullOrWhiteSpace(draftHtml)?draftHtml:(!string.IsNullOrWhiteSpace(slot.HtmlBody)?slot.HtmlBody:defaults.HtmlBody);
+    var fields=BuildEmailTemplateFields(job,null); var invoice=await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn,job.JobId); if(invoice!=null) MergeEmailTemplateFields(fields,invoice.Tokens);
+    return new RenderedBasicEmail(recipientKey=="contact_2"?job.AgentEmail:job.ClientEmail,RenderTemplateTokens(subjectTemplate,fields,false),RenderTemplateTokens(CleanEditorHtml(htmlTemplate),fields,true),label);
+}
+
+static async Task SetBasicEmailAttentionAsync(NpgsqlConnection conn,Guid jobId,string eventKey,string recipientKey,string? error)
+{
+    var message=$"{eventKey} / {recipientKey}: {error}";
+    await using var cmd=new NpgsqlCommand("UPDATE public.jobs_staging SET booking_email_last_error=@error,workflow_updated_at=NOW() WHERE job_id=@job",conn);cmd.Parameters.AddWithValue("job",jobId);cmd.Parameters.AddWithValue("error",message);await cmd.ExecuteNonQueryAsync();
+}
+
+static async Task<bool> HasIncompleteBasicEventAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,string revisionKey,string eventKey)
+{
+    await using var cmd=new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.basic_automation_executions WHERE tenant_id=@tenant AND job_id=@job AND revision_key=@revision AND event_key=@event AND state IN ('claimed','failed'))",conn);
+    cmd.Parameters.AddWithValue("tenant",tenantId);cmd.Parameters.AddWithValue("job",jobId);cmd.Parameters.AddWithValue("revision",revisionKey);cmd.Parameters.AddWithValue("event",eventKey);return Convert.ToBoolean(await cmd.ExecuteScalarAsync());
+}
+
 static ScheduleServiceInput ResolveTemplateService(ScheduleJobInput job, string serviceTypeKey)
 {
     var services = GetSchedulableServices(job).ToArray();
@@ -10266,7 +10527,7 @@ static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job,
         .Select(item => NormalizeServiceTypeKey(item.ServiceKey))
         .Where(value => !string.IsNullOrWhiteSpace(value))
         .ToArray();
-    var company = string.IsNullOrWhiteSpace(job.CompanyName) ? "3D AutoMate" : job.CompanyName.Trim();
+    var company = job.CompanyName?.Trim() ?? "";
     var inspector = !string.IsNullOrWhiteSpace(job.EmailFromName) ? job.EmailFromName.Trim() : job.InspectorName;
 
     var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -10292,13 +10553,19 @@ static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job,
         ["INSPECTION_DATE"] = start.HasValue ? start.Value.ToString("dd MMM yyyy") : "To be confirmed",
         ["INSPECTION_TIME"] = start.HasValue ? start.Value.ToString("h:mm tt") : "",
         ["INSPECTION_END_TIME"] = end.HasValue ? end.Value.ToString("h:mm tt") : "",
-        ["CLIENT_NAME"] = job.ClientName,
-        ["CLIENT_FIRST_NAME"] = FirstWord(job.ClientName),
+        ["CLIENT_NAME"] = string.IsNullOrWhiteSpace(job.ClientDisplayName) ? job.ClientName : job.ClientDisplayName,
+        ["CLIENT_DISPLAY_NAME"] = string.IsNullOrWhiteSpace(job.ClientDisplayName) ? job.ClientName : job.ClientDisplayName,
+        ["CLIENT_FIRST_NAME"] = job.ClientFirstName,
+        ["CLIENT_LAST_NAME"] = job.ClientLastName,
+        ["CLIENT_SALUTATION"] = job.ClientSalutation,
         ["CLIENT_ADDRESS"] = "",
         ["CLIENT_EMAIL"] = job.ClientEmail,
         ["CLIENT_PHONE"] = job.ClientPhone,
-        ["AGENT_NAME"] = job.AgentName,
-        ["AGENT_FIRST_NAME"] = FirstWord(job.AgentName),
+        ["AGENT_NAME"] = string.IsNullOrWhiteSpace(job.AgentDisplayName) ? job.AgentName : job.AgentDisplayName,
+        ["AGENT_DISPLAY_NAME"] = string.IsNullOrWhiteSpace(job.AgentDisplayName) ? job.AgentName : job.AgentDisplayName,
+        ["AGENT_FIRST_NAME"] = job.AgentFirstName,
+        ["AGENT_LAST_NAME"] = job.AgentLastName,
+        ["AGENT_SALUTATION"] = job.AgentSalutation,
         ["AGENT_FULL_ADDRESS"] = "",
         ["AGENT_ADDRESS"] = "",
         ["AGENT_CITY"] = "",
@@ -10411,6 +10678,29 @@ static object BuildAddOnPlaceholder(EmailTemplateServiceType serviceType)
     return new { key, token = "{{" + key + "}}", label = "Has " + serviceType.Label };
 }
 
+static object P(string key, string label) => new { key, token = "{{" + key + "}}", label };
+
+static object[] GetBasicEmailTemplatePlaceholders() => new[]
+{
+    P("PROPERTY_ADDRESS","Property Address"), P("INSPECTION_DATE","Inspection Date"), P("INSPECTION_TIME","Inspection Time"), P("INSPECTION_END_TIME","Inspection End Time"),
+    P("SERVICES","Services"), P("PRIMARY_SERVICE","Primary Service"), P("ADDITIONAL_SERVICES","Additional Services"),
+    P("CLIENT_FIRST_NAME","Client First Name"), P("CLIENT_LAST_NAME","Client Last Name"), P("CLIENT_DISPLAY_NAME","Client Display Name"), P("CLIENT_SALUTATION","Client Salutation"), P("CLIENT_EMAIL","Client Email"), P("CLIENT_PHONE","Client Phone"),
+    P("AGENT_FIRST_NAME","Agent First Name"), P("AGENT_LAST_NAME","Agent Last Name"), P("AGENT_DISPLAY_NAME","Agent Display Name"), P("AGENT_SALUTATION","Agent Salutation"), P("AGENT_EMAIL","Agent Email"), P("AGENT_PHONE","Agent Phone"),
+    P("INSPECTOR_NAME","Inspector Name"), P("INSPECTOR_FIRST_NAME","Inspector First Name"), P("INSPECTOR_EMAIL","Inspector Email"), P("INSPECTOR_PHONE","Inspector Phone"), P("COMPANY_NAME","Company Name"), P("COMPANY_LOGO_URL","Company Logo"),
+    P("INVOICE_TOTAL","Invoice Total"), P("AMOUNT_PAID","Amount Paid"), P("BALANCE_DUE","Balance Due"), P("INVOICE_LINE_ITEMS","Invoice Line Items")
+};
+
+static object[] GetBasicEmailTemplatePlaceholderCategories() => new object[]
+{
+    new { category="Job Details", placeholders=new[]{ P("PROPERTY_ADDRESS","Property Address"),P("INSPECTION_DATE","Inspection Date"),P("INSPECTION_TIME","Inspection Time"),P("INSPECTION_END_TIME","Inspection End Time") } },
+    new { category="Services", placeholders=new[]{ P("SERVICES","Services"),P("PRIMARY_SERVICE","Primary Service"),P("ADDITIONAL_SERVICES","Additional Services") } },
+    new { category="Client Contact", placeholders=new[]{ P("CLIENT_FIRST_NAME","First Name"),P("CLIENT_LAST_NAME","Last Name"),P("CLIENT_DISPLAY_NAME","Display Name"),P("CLIENT_SALUTATION","Salutation"),P("CLIENT_EMAIL","Email"),P("CLIENT_PHONE","Phone") } },
+    new { category="Agent Contact", placeholders=new[]{ P("AGENT_FIRST_NAME","First Name"),P("AGENT_LAST_NAME","Last Name"),P("AGENT_DISPLAY_NAME","Display Name"),P("AGENT_SALUTATION","Salutation"),P("AGENT_EMAIL","Email"),P("AGENT_PHONE","Phone") } },
+    new { category="Inspector and Company", placeholders=new[]{ P("INSPECTOR_NAME","Inspector Name"),P("INSPECTOR_FIRST_NAME","Inspector First Name"),P("INSPECTOR_EMAIL","Inspector Email"),P("INSPECTOR_PHONE","Inspector Phone"),P("COMPANY_NAME","Company Name"),P("COMPANY_LOGO_URL","Company Logo") } },
+    new { category="Invoice Details", placeholders=new[]{ P("INVOICE_TOTAL","Invoice Total"),P("AMOUNT_PAID","Amount Paid"),P("BALANCE_DUE","Balance Due"),P("INVOICE_LINE_ITEMS","Invoice Line Items") } }
+};
+
+#pragma warning disable CS8321
 static object[] GetEmailTemplatePlaceholders()
 {
     var basePlaceholders = new object[]
@@ -10476,6 +10766,7 @@ static object[] GetEmailTemplatePlaceholders()
         .Concat(GetInvoiceEmailTemplatePlaceholders())
         .ToArray();
 }
+#pragma warning restore CS8321
 
 static object[] GetInvoiceEmailTemplatePlaceholders()
 {
@@ -10498,6 +10789,7 @@ static object[] GetInvoiceEmailTemplatePlaceholders()
     return placeholders.ToArray();
 }
 
+#pragma warning disable CS8321
 static object[] GetEmailTemplatePlaceholderCategories()
 {
     return new object[]
@@ -10589,6 +10881,7 @@ static object[] GetEmailTemplatePlaceholderCategories()
         }
     };
 }
+#pragma warning restore CS8321
 
 static object[] GetEmailTemplateServiceTypes()
 {
@@ -10689,7 +10982,7 @@ static string GetEmailTemplateMakerHtml()
       padding: 18px 20px 28px;
     }
     .field-grid {
-      display: grid;
+      display: none;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
       margin-bottom: 14px;
@@ -10830,7 +11123,7 @@ static string GetEmailTemplateMakerHtml()
 </head>
 <body>
   <header>
-    <h1>AutoMate Email Templates</h1>
+    <h1 id="pageTitle">AutoMate Basic Email Template</h1>
     <div id="status" class="status">Ready</div>
   </header>
 
@@ -10942,10 +11235,9 @@ static string GetEmailTemplateMakerHtml()
 </html></textarea>
 
       <div class="toolbar">
-        <button id="loadBtn">Load Saved</button>
         <button id="saveBtn" class="primary">Save Template</button>
         <button id="previewBtn">Preview With Job</button>
-        <button id="jobInspectorBtn">Use Job Inspector</button>
+        <button id="restoreBtn">Restore Default</button>
       </div>
 
       <div class="send-grid">
@@ -10958,7 +11250,6 @@ static string GetEmailTemplateMakerHtml()
           <input id="toEmail" autocomplete="off" placeholder="Optional">
         </div>
         <button id="sendTestBtn">Send Test Email</button>
-        <button id="sendBtn" class="primary">Send</button>
       </div>
 
       <div class="preview-wrap">
@@ -10974,7 +11265,11 @@ static string GetEmailTemplateMakerHtml()
   </main>
 
   <script>
-    const state = { lastTarget: null, placeholders: [], editorReady: false, previewTimer: null, previewRevision: 0 };
+    const query = new URLSearchParams(window.location.search);
+    const state = { lastTarget: null, placeholders: [], editorReady: false, previewTimer: null, previewRevision: 0, defaultSubject: "", defaultHtmlBody: "" };
+    const eventKey = query.get("eventKey") || "scheduling";
+    const recipientKey = query.get("recipientKey") || "contact_1";
+    const tenantId = query.get("tenantId") || "";
     const DEFAULT_TEST_INSPECTOR_ID = "dea3f71c-b8ca-4cbb-bbe3-3de48d380ec5";
     const $ = id => document.getElementById(id);
 
@@ -10987,8 +11282,6 @@ static string GetEmailTemplateMakerHtml()
     function updateJobActionState() {
       const hasJob = $("jobId").value.trim() !== "";
       $("previewBtn").disabled = !hasJob;
-      $("sendBtn").disabled = !hasJob;
-      $("jobInspectorBtn").disabled = !hasJob;
     }
 
     function getInspectorIdForTest() {
@@ -11011,21 +11304,15 @@ static string GetEmailTemplateMakerHtml()
     }
 
     function templateUrl() {
-      const inspectorId = $("inspectorId").value.trim();
-      const type = "booking-email";
-      const serviceTypeKey = $("serviceType").value || "general_booking";
-      if (!inspectorId) throw new Error("Inspector ID is required.");
-      return `/inspectors/${encodeURIComponent(inspectorId)}/email-templates/${encodeURIComponent(type)}?serviceTypeKey=${encodeURIComponent(serviceTypeKey)}`;
+      if (!tenantId) throw new Error("Company tenant is required.");
+      return `/automation/basic/templates/${encodeURIComponent(eventKey)}/${encodeURIComponent(recipientKey)}?tenantId=${encodeURIComponent(tenantId)}`;
     }
 
     function bodyPayload() {
       return {
-        emailType: "transactional",
-        serviceTypeKey: $("serviceType").value || "general_booking",
-        name: $("templateName").value.trim(),
+        tenantId,
         subject: $("subject").value,
-        htmlBody: getEditorHtml(),
-        isActive: $("active").value === "true"
+        htmlBody: getEditorHtml()
       };
     }
 
@@ -11130,7 +11417,7 @@ static string GetEmailTemplateMakerHtml()
 
     async function api(url, options) {
       const response = await fetch(url, {
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-AutoMate-Inspector-ID": getInspectorIdForTest() },
         ...options
       });
       const text = await response.text();
@@ -11214,16 +11501,12 @@ static string GetEmailTemplateMakerHtml()
       await resolveInspectorFromJob(false);
       setStatus("Loading...");
       const data = await api(templateUrl());
-      const t = data.template;
-      const serviceTypeKey = t.serviceTypeKey || t.service_type_key;
-      if (serviceTypeKey) {
-        ensureServiceTypeOption(serviceTypeKey);
-        $("serviceType").value = serviceTypeKey;
-      }
-      $("templateName").value = t.name || "";
-      $("subject").value = t.subject || "";
-      setEditorHtml(t.htmlBody || t.html_body || "");
-      $("active").value = String(t.isActive ?? t.is_active ?? true);
+      $("templateName").value = data.templateName || "";
+      $("pageTitle").textContent = data.templateName || "Basic Email Template";
+      $("subject").value = data.subject || "";
+      setEditorHtml(data.htmlBody || "");
+      state.defaultSubject = data.defaultSubject || "";
+      state.defaultHtmlBody = data.defaultHtmlBody || "";
       setStatus("Template loaded.", "good");
     }
 
@@ -11235,6 +11518,14 @@ static string GetEmailTemplateMakerHtml()
         body: JSON.stringify(bodyPayload())
       });
       setStatus("Template saved.", data.success ? "good" : "");
+    }
+
+    function restoreDefault() {
+      if (!state.defaultSubject && !state.defaultHtmlBody) throw new Error("Default template is unavailable.");
+      $("subject").value = state.defaultSubject;
+      setEditorHtml(state.defaultHtmlBody);
+      scheduleLivePreview();
+      setStatus("Default loaded as an unsaved draft. Click Save Template to keep it.", "");
     }
 
     function scheduleLivePreview() {
@@ -11251,11 +11542,12 @@ static string GetEmailTemplateMakerHtml()
       await resolveInspectorFromJob(false);
       const revision = ++state.previewRevision;
       if (!isAutomatic) setStatus("Rendering preview...");
-      const data = await api(`/jobs/${encodeURIComponent(jobId)}/email-templates/booking-email/preview`, {
+      const data = await api(`/jobs/${encodeURIComponent(jobId)}/automation/basic-render`, {
         method: "POST",
         body: JSON.stringify({
-          emailType: "transactional",
-          serviceTypeKey: $("serviceType").value || null,
+          tenantId,
+          eventKey,
+          recipientKey,
           subject: $("subject").value,
           htmlBody: getEditorHtml()
         })
@@ -11264,22 +11556,6 @@ static string GetEmailTemplateMakerHtml()
       $("previewSubject").textContent = data.subject || "";
       $("preview").srcdoc = data.htmlBody || "";
       setStatus(isAutomatic ? "Live preview updated." : "Preview rendered.", "good");
-    }
-
-    async function sendTemplate() {
-      const jobId = $("jobId").value.trim();
-      if (!jobId) throw new Error("No test job is loaded yet. Refresh the local database connection or paste a Job ID.");
-      await resolveInspectorFromJob(false);
-      setStatus("Sending...");
-      const data = await api(`/jobs/${encodeURIComponent(jobId)}/email-templates/booking-email/send`, {
-        method: "POST",
-        body: JSON.stringify({
-          toEmail: $("toEmail").value.trim() || null,
-          serviceTypeKey: $("serviceType").value || null,
-          markWorkflowComplete: true
-        })
-      });
-      setStatus(data.message || "Sent.", "good");
     }
 
     async function sendTestEmail() {
@@ -11293,6 +11569,9 @@ static string GetEmailTemplateMakerHtml()
         method: "POST",
         body: JSON.stringify({
           jobId,
+          tenantId,
+          eventKey,
+          recipientKey,
           toEmail,
           serviceTypeKey: $("serviceType").value || null,
           subject: $("subject").value || "Booking email",
@@ -11355,14 +11634,12 @@ static string GetEmailTemplateMakerHtml()
       btn.addEventListener("click", () => runEditorCommand(btn.dataset.command));
     }
 
-    $("loadBtn").addEventListener("click", () => loadTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
     $("saveBtn").addEventListener("click", () => saveTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("restoreBtn").addEventListener("click", () => { try { restoreDefault(); } catch (err) { setStatus(friendlyError(err.message), "bad"); } });
     $("previewBtn").addEventListener("click", () => previewTemplate(false).catch(err => setStatus(friendlyError(err.message), "bad")));
     $("sendTestBtn").addEventListener("click", () => sendTestEmail().catch(err => setStatus(friendlyError(err.message), "bad")));
-    $("sendBtn").addEventListener("click", () => sendTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
-    $("jobInspectorBtn").addEventListener("click", () => resolveInspectorFromJob(true).catch(err => setStatus(friendlyError(err.message), "bad")));
 
-    Promise.all([loadServiceTypes(), loadPlaceholders()])
+    Promise.all([loadServiceTypes(), loadPlaceholders(), loadTemplate()])
       .then(() => loadTopJobForTesting())
       .catch(err => setStatus(friendlyError(err.message), "bad"));
   </script>
@@ -12624,9 +12901,19 @@ public record ScheduleJobInput(
     string FoundationSpace,
     string AccessBy,
     string ClientName,
+    string ClientFirstName,
+    string ClientLastName,
+    string ClientDisplayName,
+    string ClientSalutation,
+    string ClientRoleLabel,
     string ClientEmail,
     string ClientPhone,
     string AgentName,
+    string AgentFirstName,
+    string AgentLastName,
+    string AgentDisplayName,
+    string AgentSalutation,
+    string AgentRoleLabel,
     string AgentEmail,
     string AgentPhone,
     string Timezone,
@@ -12649,11 +12936,46 @@ public class JobUploadRequest
     public MetaSection Meta { get; set; } = new MetaSection();
 }
 
+public sealed class BasicAutomationSettingRequest
+{
+    public Guid TenantId { get; set; }
+    public string EventKey { get; set; } = "";
+    public string RecipientKey { get; set; } = "";
+    public bool Enabled { get; set; }
+}
+
+public class BasicAutomationTemplateRequest
+{
+    public Guid TenantId { get; set; }
+    public string Subject { get; set; } = "";
+    public string HtmlBody { get; set; } = "";
+}
+
+public sealed class BasicAutomationRenderRequest : BasicAutomationTemplateRequest
+{
+    public string EventKey { get; set; } = "";
+    public string RecipientKey { get; set; } = "";
+}
+
+public sealed class BasicAutomationCompleteRequest
+{
+    public Guid TenantId { get; set; }
+    public string RevisionKey { get; set; } = "";
+    public string EventKey { get; set; } = "";
+    public string RecipientKey { get; set; } = "";
+    public bool Success { get; set; }
+    public string Error { get; set; } = "";
+}
+
+public sealed record RenderedBasicEmail(string ToEmail,string Subject,string HtmlBody,string RecipientLabel);
+
 public class JobSection
 {
     public string JobId { get; set; } = "";
     public string InspectorId { get; set; } = "";
     public string InspectorName { get; set; } = "";
+    public string InspectorEmail { get; set; } = "";
+    public string InspectorPhone { get; set; } = "";
     public string JobName { get; set; } = "";
     public string SiteAddress { get; set; } = "";
     public string AgeOfBuilding { get; set; } = "";
@@ -12736,6 +13058,9 @@ public class JobDetailsSection
 public class ContactFlat
 {
     public string ContactId { get; set; } = "";
+    public int ContactIndex { get; set; } = -1;
+    public string RoleLabel { get; set; } = "";
+    public string DisplayName { get; set; } = "";
     public string Salutation { get; set; } = "";
     public string FirstName { get; set; } = "";
     public string LastName { get; set; } = "";

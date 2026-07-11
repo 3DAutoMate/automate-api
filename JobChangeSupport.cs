@@ -125,8 +125,10 @@ pending_change_fingerprint=@fingerprint WHERE job_id=@job AND change_review_pend
             ["hhsReinspectDate"] = T(payload.JobDetails?.HhsReinspectDate), ["accessBy"] = T(payload.JobDetails?.AccessBy),
             ["hhsCompliance"] = T(payload.JobDetails?.HhsCompliance),
             ["clientName"] = T(string.Join(" ", new[] { payload.Contact1?.FirstName, payload.Contact1?.LastName }.Where(v => !string.IsNullOrWhiteSpace(v)))),
+            ["clientDisplayName"] = T(payload.Contact1?.DisplayName), ["clientSalutation"] = T(payload.Contact1?.Salutation),
             ["clientEmail"] = T(payload.Contact1?.Email).ToLowerInvariant(), ["clientPhone"] = T(payload.Contact1?.Cellular),
             ["agentName"] = T(string.Join(" ", new[] { payload.Contact2?.FirstName, payload.Contact2?.LastName }.Where(v => !string.IsNullOrWhiteSpace(v)))),
+            ["agentDisplayName"] = T(payload.Contact2?.DisplayName), ["agentSalutation"] = T(payload.Contact2?.Salutation),
             ["agentEmail"] = T(payload.Contact2?.Email).ToLowerInvariant(), ["agentPhone"] = T(payload.Contact2?.Cellular),
             ["invoiceLines"] = (payload.InvoiceLines ?? new()).OrderBy(line => line.LineIndex).Select(line => new
             {
@@ -204,7 +206,7 @@ VALUES(@job,@tenant,@version,@event,@fingerprint,CAST(@changes AS jsonb),@reason
     {
         "address" => "address", "primaryService" or "additionalService1" or "additionalService2" => "services",
         "invoiceTotal" or "invoiceLines" => "price", "jobDate" or "durationMinutes" => "schedule",
-        "clientName" or "clientEmail" or "clientPhone" => "customer", "agentName" or "agentEmail" or "agentPhone" or "notes" or "directions" or "instructions" or "accessBy" => "operational",
+        "clientName" or "clientDisplayName" or "clientSalutation" or "clientEmail" or "clientPhone" => "customer", "agentName" or "agentDisplayName" or "agentSalutation" or "agentEmail" or "agentPhone" or "notes" or "directions" or "instructions" or "accessBy" => "operational",
         _ => "scope"
     };
 }
