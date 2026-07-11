@@ -360,7 +360,14 @@ app.MapGet("/accounts/trial-status", async (Guid inspectorId, Guid? tenantId) =>
             companyName = account.CompanyName,
             email = account.Email,
             tenantId = account.TenantId,
-            registeredInspectorId = account.InspectorId
+            registeredInspectorId = account.InspectorId,
+            planName = string.IsNullOrWhiteSpace(account.PlanName) ? "advanced" : account.PlanName,
+            capabilities = new
+            {
+                basicAutomation = allowed,
+                advancedWorkflows = allowed && !string.Equals(account.PlanName, "basic", StringComparison.OrdinalIgnoreCase),
+                outgoingWebhooks = allowed && !string.Equals(account.PlanName, "basic", StringComparison.OrdinalIgnoreCase)
+            }
         });
     }
     catch (Exception ex)
@@ -3287,6 +3294,73 @@ app.MapPut("/inspectors/{inspectorId}/email-templates/{templateType}", async (Gu
     }
 });
 
+app.MapGet("/automation/templates", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        const string sql = @"SELECT template_id,inspector_id,template_type,service_type_key,name,subject,html_body,is_active,archived_at,created_at,updated_at
+FROM public.email_templates WHERE tenant_id=@tenant ORDER BY archived_at NULLS FIRST,updated_at DESC,name;";
+        await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId);
+        await using var reader = await cmd.ExecuteReaderAsync(); var templates = new List<object>();
+        while (await reader.ReadAsync()) templates.Add(new { templateId=reader.GetGuid(0), inspectorId=reader.GetGuid(1), templateType=reader.GetString(2), serviceTypeKey=reader.GetString(3), name=reader.GetString(4), subject=reader.GetString(5), htmlBody=reader.GetString(6), isActive=reader.GetBoolean(7), archived= !reader.IsDBNull(8), createdAt=reader.GetDateTime(9), updatedAt=reader.GetDateTime(10) });
+        return Results.Ok(new { success = true, templates });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Load company templates failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapPost("/automation/templates", async (HttpContext context, AutomationTemplateSaveRequest request) =>
+{
+    if (request.TenantId == Guid.Empty || string.IsNullOrWhiteSpace(request.Name)) return Results.BadRequest(new { success=false, message="TenantId and template name are required." });
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        var templateId = request.TemplateId == Guid.Empty ? Guid.NewGuid() : request.TemplateId;
+        var type = NormalizeTemplateType(string.IsNullOrWhiteSpace(request.TemplateType) ? "advanced-workflow" : request.TemplateType);
+        var serviceKey = string.IsNullOrWhiteSpace(request.ServiceTypeKey) ? "advanced_" + templateId.ToString("N") : NormalizeServiceTypeKey(request.ServiceTypeKey);
+        const string sql = @"INSERT INTO public.email_templates(template_id,tenant_id,inspector_id,template_type,service_type_key,email_type,name,subject,html_body,is_active,archived_at,created_at,updated_at)
+VALUES(@id,@tenant,@inspector,@type,@service,'transactional',@name,@subject,@html,@active,NULL,NOW(),NOW())
+ON CONFLICT(template_id) DO UPDATE SET name=EXCLUDED.name,subject=EXCLUDED.subject,html_body=EXCLUDED.html_body,is_active=EXCLUDED.is_active,updated_at=NOW()
+WHERE public.email_templates.tenant_id=EXCLUDED.tenant_id RETURNING template_id,updated_at;";
+        await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("id",templateId); cmd.Parameters.AddWithValue("tenant",request.TenantId); cmd.Parameters.AddWithValue("inspector",inspectorId); cmd.Parameters.AddWithValue("type",type); cmd.Parameters.AddWithValue("service",serviceKey); cmd.Parameters.AddWithValue("name",request.Name.Trim()); cmd.Parameters.AddWithValue("subject",request.Subject??""); cmd.Parameters.AddWithValue("html",CleanEditorHtml(request.HtmlBody??"")); cmd.Parameters.AddWithValue("active",request.IsActive);
+        await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return Results.NotFound(new { success=false,message="Template was not found for this company." });
+        return Results.Ok(new { success=true,templateId=reader.GetGuid(0),updatedAt=reader.GetDateTime(1),serviceTypeKey=serviceKey });
+    }
+    catch (Exception ex) { return Results.Problem(title:"Save company template failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapPost("/automation/templates/{templateId}/archive", async (HttpContext context, Guid templateId, AutomationTemplateArchiveRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId); if(!owner.Allowed)return owner.Error!;
+        const string referenceSql=@"SELECT EXISTS(SELECT 1 FROM public.automation_rules WHERE tenant_id=@tenant AND (template_id=@id OR actions_json::text LIKE '%' || @idtext || '%'));";
+        await using(var reference=new NpgsqlCommand(referenceSql,conn)){reference.Parameters.AddWithValue("tenant",request.TenantId);reference.Parameters.AddWithValue("id",templateId);reference.Parameters.AddWithValue("idtext",templateId.ToString());if(Convert.ToBoolean(await reference.ExecuteScalarAsync()))return Results.Conflict(new {success=false,message="This template is referenced by a workflow and cannot be archived."});}
+        const string sql=@"UPDATE public.email_templates SET archived_at=NOW(),is_active=false,updated_at=NOW() WHERE template_id=@id AND tenant_id=@tenant AND archived_at IS NULL;";
+        await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("id",templateId);cmd.Parameters.AddWithValue("tenant",request.TenantId);var rows=await cmd.ExecuteNonQueryAsync();return rows==0?Results.NotFound(new{success=false,message="Template was not found or is already archived."}):Results.Ok(new{success=true});
+    }
+    catch(Exception ex){return Results.Problem(title:"Archive company template failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/automation/templates/{templateId}/duplicate", async (HttpContext context, Guid templateId, AutomationTemplateArchiveRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();await EnsureEmailTemplatesTableAsync(conn);await EnsureAdvancedActionsTablesAsync(conn);await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var inspectorId=Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);var newId=Guid.NewGuid();
+        const string sql=@"INSERT INTO public.email_templates(template_id,tenant_id,inspector_id,template_type,service_type_key,email_type,name,subject,html_body,is_active,created_at,updated_at)
+SELECT @newid,tenant_id,@inspector,'advanced-workflow','advanced_'||replace(@newid::text,'-',''),email_type,name||' Copy',subject,html_body,false,NOW(),NOW() FROM public.email_templates WHERE template_id=@id AND tenant_id=@tenant RETURNING template_id;";
+        await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("newid",newId);cmd.Parameters.AddWithValue("inspector",inspectorId);cmd.Parameters.AddWithValue("id",templateId);cmd.Parameters.AddWithValue("tenant",request.TenantId);var result=await cmd.ExecuteScalarAsync();return result==null?Results.NotFound(new{success=false,message="Template was not found for this company."}):Results.Ok(new{success=true,templateId=newId});
+    }
+    catch(Exception ex){return Results.Problem(title:"Duplicate company template failed",detail:ex.Message,statusCode:500);}
+});
+
 app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
 {
     try
@@ -4118,6 +4192,9 @@ app.MapGet("/jobs/workflow-status", async () =>
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn);
+        await EnsureAdvancedActionsTablesAsync(conn);
+        await AutomationFoundationSupport.EnsureAsync(conn);
         await JobChangeSupport.EnsureAsync(conn);
 
         const string sql = @"
@@ -4409,6 +4486,8 @@ LEFT JOIN LATERAL (
 WHERE a.action_type = 'booking_email'
   AND (a.status = 'pending' OR a.retry_requested = true)
   AND NOT j.change_review_pending AND NOT j.unscheduled
+  AND NOT EXISTS (SELECT 1 FROM public.automation_tenant_settings ats WHERE ats.tenant_id::text=j.tenant_id::text AND ats.activation_mode='all_jobs')
+  AND NOT EXISTS (SELECT 1 FROM public.automation_job_selections ajs WHERE ajs.tenant_id::text=j.tenant_id::text AND ajs.job_id=j.job_id AND ajs.use_advanced_workflows=true)
   AND (@inspector_id IS NULL OR a.inspector_id = @inspector_id)
 ORDER BY a.updated_at ASC
 LIMIT 100;";
@@ -6481,6 +6560,128 @@ WHERE job_id=@job_id", conn);
 // ADVANCED ACTIONS
 // Review-first rule definitions and side-effect-free preview evaluation.
 // =============================
+app.MapGet("/automation/foundation", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn);
+        await EnsureAdvancedActionsTablesAsync(conn);
+        await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId);
+        if (!owner.Allowed) return owner.Error!;
+        var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, tenantId);
+        var mode = await AutomationFoundationSupport.GetActivationModeAsync(conn, tenantId);
+        return Results.Ok(new
+        {
+            success = true,
+            tenantId,
+            entitlement.Status,
+            entitlement.PlanName,
+            capabilities = new
+            {
+                basicAutomation = entitlement.BasicAutomation,
+                advancedWorkflows = entitlement.AdvancedWorkflows,
+                outgoingWebhooks = entitlement.OutgoingWebhooks
+            },
+            activationMode = mode,
+            basicExecutionActive = mode != "all_jobs",
+            customerFacingExecutionEnabled = false
+        });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Load automation foundation failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapPut("/automation/foundation/activation", async (HttpContext context, AutomationActivationRequest request) =>
+{
+    var mode = NormalizeAutomationKey(request.ActivationMode);
+    if (request.TenantId == Guid.Empty || (mode != "selected_jobs" && mode != "all_jobs"))
+        return Results.BadRequest(new { success = false, message = "TenantId and a valid activation mode are required." });
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, request.TenantId);
+        if (!entitlement.AdvancedWorkflows) return Results.Json(new { success = false, message = "Advanced Workflows are not available for this company." }, statusCode: 403);
+        var previous = await AutomationFoundationSupport.GetActivationModeAsync(conn, request.TenantId);
+        const string sql = @"INSERT INTO public.automation_tenant_settings(tenant_id,activation_mode,updated_by) VALUES(@tenant,@mode,@by)
+ON CONFLICT(tenant_id) DO UPDATE SET activation_mode=EXCLUDED.activation_mode,updated_by=EXCLUDED.updated_by,updated_at=NOW();";
+        await using (var cmd = new NpgsqlCommand(sql, conn)) { cmd.Parameters.AddWithValue("tenant", request.TenantId); cmd.Parameters.AddWithValue("mode", mode); cmd.Parameters.AddWithValue("by", request.ChangedBy ?? "Connector user"); await cmd.ExecuteNonQueryAsync(); }
+        if (previous != mode) await AutomationFoundationSupport.AuditAsync(conn, request.TenantId, null, "activation_mode_changed", previous, mode, request.ChangedBy ?? "Connector user");
+        return Results.Ok(new { success = true, activationMode = mode, basicExecutionActive = mode != "all_jobs", customerFacingExecutionEnabled = false });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Save automation activation failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapPut("/automation/jobs/{jobId}/selection", async (HttpContext context, Guid jobId, AutomationJobSelectionRequest request) =>
+{
+    if (request.TenantId == Guid.Empty) return Results.BadRequest(new { success = false, message = "TenantId is required." });
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        if (!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn, request.TenantId, jobId)) return Results.NotFound(new { success = false, message = "Job was not found for this company." });
+        var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, request.TenantId);
+        if (!entitlement.AdvancedWorkflows) return Results.Json(new { success = false, message = "Advanced Workflows are not available for this company." }, statusCode: 403);
+        var mode = await AutomationFoundationSupport.GetActivationModeAsync(conn, request.TenantId);
+        if (mode == "all_jobs") return Results.BadRequest(new { success = false, message = "All Jobs mode already uses Advanced Workflows for every job." });
+        var previous = await AutomationFoundationSupport.JobUsesAdvancedAsync(conn, request.TenantId, jobId, mode);
+        const string sql = @"INSERT INTO public.automation_job_selections(tenant_id,job_id,use_advanced_workflows,updated_by) VALUES(@tenant,@job,@enabled,@by)
+ON CONFLICT(tenant_id,job_id) DO UPDATE SET use_advanced_workflows=EXCLUDED.use_advanced_workflows,updated_by=EXCLUDED.updated_by,updated_at=NOW();";
+        await using (var cmd = new NpgsqlCommand(sql, conn)) { cmd.Parameters.AddWithValue("tenant", request.TenantId); cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.AddWithValue("enabled", request.UseAdvancedWorkflows); cmd.Parameters.AddWithValue("by", request.ChangedBy ?? "Connector user"); await cmd.ExecuteNonQueryAsync(); }
+        if (previous != request.UseAdvancedWorkflows) await AutomationFoundationSupport.AuditAsync(conn, request.TenantId, jobId, "job_workflow_engine_changed", previous ? "advanced" : "basic", request.UseAdvancedWorkflows ? "advanced" : "basic", request.ChangedBy ?? "Connector user");
+        return Results.Ok(new { success = true, jobId, useAdvancedWorkflows = request.UseAdvancedWorkflows, basicAutomationApplies = !request.UseAdvancedWorkflows, customerFacingExecutionEnabled = false });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Save job workflow selection failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapGet("/automation/jobs/{jobId}/selection", async (HttpContext context, Guid jobId, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        if (!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn, tenantId, jobId)) return Results.NotFound(new { success = false, message = "Job was not found for this company." });
+        var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, tenantId); var mode = await AutomationFoundationSupport.GetActivationModeAsync(conn, tenantId);
+        var advanced = entitlement.AdvancedWorkflows && await AutomationFoundationSupport.JobUsesAdvancedAsync(conn, tenantId, jobId, mode);
+        return Results.Ok(new { success = true, jobId, activationMode = mode, advancedEntitled = entitlement.AdvancedWorkflows, useAdvancedWorkflows = advanced, basicAutomationApplies = !advanced, customerFacingExecutionEnabled = false });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Load job workflow selection failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapGet("/automation/health", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        return Results.Ok(new { success = true, database = "available", rules = "available", templates = "available", activation = "available" });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Automation health check failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapGet("/automation/service-catalog", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureMappingTablesAsync(conn); await EnsureEmailTemplatesTableAsync(conn); await EnsureAdvancedActionsTablesAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        const string sql = @"SELECT DISTINCT ON (c.catalog_item_key)
+c.catalog_item_key,c.list_item_id,c.list_item_name,c.list_name,c.invoice_item_id,c.invoice_item_name,c.is_active,c.canonical_service_type,c.booking_template_key,c.last_synced_at
+FROM public.inspector_service_catalog c JOIN public.inspectors i ON i.inspector_id=c.inspector_id
+WHERE i.tenant_id=@tenant ORDER BY c.catalog_item_key,c.last_synced_at DESC;";
+        await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId); await using var reader = await cmd.ExecuteReaderAsync(); var serviceCatalog = new List<object>();
+        while (await reader.ReadAsync()) serviceCatalog.Add(new { catalog_item_key=reader["catalog_item_key"]?.ToString(),list_item_id=reader["list_item_id"]?.ToString(),list_item_name=reader["list_item_name"]?.ToString(),list_name=reader["list_name"]?.ToString(),invoice_item_id=reader["invoice_item_id"]?.ToString(),invoice_item_name=reader["invoice_item_name"]?.ToString(),is_active=reader["is_active"]?.ToString(),canonical_service_type=reader["canonical_service_type"]?.ToString(),booking_template_key=reader["booking_template_key"]?.ToString(),last_synced_at=reader["last_synced_at"]?.ToString() });
+        return Results.Ok(new { success=true, tenantId, service_catalog=serviceCatalog });
+    }
+    catch(Exception ex){return Results.Problem(title:"Load tenant service catalogue failed",detail:ex.Message,statusCode:500);}
+});
+
 app.MapPost("/actions/ensure-tables", async () =>
 {
     try
@@ -6501,17 +6702,21 @@ app.MapGet("/actions/catalog", () => Results.Ok(new
     events = new[] { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" },
     fields = new[] { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories" },
     operators = new[] { "includes", "does_not_include" },
-    actions = new[] { "send_email", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" },
+    actions = new[] { "send_email", "send_webhook", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" },
     modes = new[] { "disabled", "review" }
 }));
 
-app.MapGet("/actions/rules", async (Guid tenantId) =>
+app.MapGet("/actions/rules", async (HttpContext context, Guid tenantId) =>
 {
     try
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureAdvancedActionsTablesAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn);
+        await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId);
+        if (!owner.Allowed) return owner.Error!;
         const string sql = @"
 SELECT rule_id, tenant_id, name, event_key, mode, enabled, conditions_json, actions_json, created_at, updated_at
 FROM public.automation_rules
@@ -6523,13 +6728,21 @@ ORDER BY updated_at DESC, name;";
         var rules = new List<object>();
         while (await reader.ReadAsync())
         {
+            var loadWarning = ""; List<AutomationCondition> loadedConditions; List<AutomationActionDefinition> loadedActions;
+            try { loadedConditions = JsonSerializer.Deserialize<List<AutomationCondition>>(reader.GetString(6)) ?? new(); }
+            catch (Exception ex) { loadedConditions = new(); loadWarning = "Conditions could not be read: " + ex.Message; }
+            try { loadedActions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(7)) ?? new(); }
+            catch (Exception ex) { loadedActions = new(); loadWarning = (loadWarning + " Actions could not be read: " + ex.Message).Trim(); }
+            foreach (var loadedAction in loadedActions)
+                if (NormalizeAutomationKey(loadedAction.ActionKey) == "send_webhook" && loadedAction.Settings.TryGetValue("headers", out var protectedHeaders))
+                    loadedAction.Settings["headers"] = AutomationSecretProtector.Unprotect(protectedHeaders, builder.Configuration["AUTOMATE_AUTOMATION_SECRET_KEY"]);
             rules.Add(new
             {
                 ruleId = reader.GetGuid(0), tenantId = reader.GetGuid(1), name = reader.GetString(2),
                 eventKey = reader.GetString(3), mode = reader.GetString(4), enabled = reader.GetBoolean(5),
-                conditions = JsonSerializer.Deserialize<List<AutomationCondition>>(reader.GetString(6)) ?? new(),
-                actions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(7)) ?? new(),
-                createdAt = reader.GetDateTime(8), updatedAt = reader.GetDateTime(9)
+                conditions = loadedConditions,
+                actions = loadedActions,
+                createdAt = reader.GetDateTime(8), updatedAt = reader.GetDateTime(9), loadWarning
             });
         }
         return Results.Ok(rules);
@@ -6540,7 +6753,7 @@ ORDER BY updated_at DESC, name;";
     }
 });
 
-app.MapPost("/actions/rules", async (AutomationRuleSaveRequest request) =>
+app.MapPost("/actions/rules", async (HttpContext context, AutomationRuleSaveRequest request) =>
 {
     var validation = ValidateAutomationRule(request);
     if (validation.Count > 0)
@@ -6551,7 +6764,17 @@ app.MapPost("/actions/rules", async (AutomationRuleSaveRequest request) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureAdvancedActionsTablesAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn);
+        await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId);
+        if (!owner.Allowed) return owner.Error!;
+        var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, request.TenantId);
+        if (!entitlement.AdvancedWorkflows)
+            return Results.Json(new { success = false, message = "Advanced Workflows are not available for this company." }, statusCode: 403);
         var ruleId = request.RuleId == Guid.Empty ? Guid.NewGuid() : request.RuleId;
+        foreach (var action in request.Actions)
+            if (NormalizeAutomationKey(action.ActionKey) == "send_webhook" && action.Settings.TryGetValue("headers", out var webhookHeaders) && !string.IsNullOrWhiteSpace(webhookHeaders))
+                action.Settings["headers"] = AutomationSecretProtector.Protect(webhookHeaders, builder.Configuration["AUTOMATE_AUTOMATION_SECRET_KEY"]);
         const string sql = @"
 INSERT INTO public.automation_rules
     (rule_id, tenant_id, name, event_key, mode, enabled, conditions_json, actions_json, created_at, updated_at)
@@ -6583,11 +6806,12 @@ RETURNING rule_id, updated_at;";
     }
 });
 
-app.MapDelete("/actions/rules/{ruleId}", async (Guid ruleId, Guid tenantId) =>
+app.MapDelete("/actions/rules/{ruleId}", async (HttpContext context, Guid ruleId, Guid tenantId) =>
 {
     try
     {
-        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureAdvancedActionsTablesAsync(conn);
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureAdvancedActionsTablesAsync(conn); await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
         await using var cmd = new NpgsqlCommand("DELETE FROM public.automation_rules WHERE rule_id=@rule AND tenant_id=@tenant", conn);
         cmd.Parameters.AddWithValue("rule", ruleId); cmd.Parameters.AddWithValue("tenant", tenantId);
         int rows = await cmd.ExecuteNonQueryAsync();
@@ -6715,9 +6939,27 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await JobChangeSupport.EnsureAsync(startupMigrationConnection);
     await JobChangeSupport.BackfillApprovedSnapshotsAsync(startupMigrationConnection);
     await JobChangeSupport.RepairPendingChangesAsync(startupMigrationConnection);
+    await EnsureEmailTemplatesTableAsync(startupMigrationConnection);
+    await EnsureAdvancedActionsTablesAsync(startupMigrationConnection);
+    await AutomationFoundationSupport.EnsureAsync(startupMigrationConnection);
 }
 
 app.Run();
+
+static async Task<(bool Allowed, IResult? Error)> RequireAutomationOwnerAsync(HttpContext context, NpgsqlConnection conn, Guid tenantId)
+{
+    if (tenantId == Guid.Empty)
+        return (false, Results.BadRequest(new { success = false, message = "TenantId is required." }));
+    var inspectorHeader = context.Request.Headers["X-AutoMate-Inspector-ID"].FirstOrDefault();
+    if (!Guid.TryParse(inspectorHeader, out var inspectorId))
+        return (false, Results.Json(new { success = false, message = "Registered AutoMate company identity is required." }, statusCode: 401));
+    if (!await AutomationFoundationSupport.InspectorBelongsToTenantAsync(conn, tenantId, inspectorId))
+        return (false, Results.Json(new { success = false, message = "This inspector does not belong to the requested company." }, statusCode: 403));
+    var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, tenantId);
+    if (!entitlement.Allowed)
+        return (false, Results.Json(new { success = false, message = "An active AutoMate subscription or trial is required." }, statusCode: 403));
+    return (true, null);
+}
 
 static async Task EnsureAdvancedActionsTablesAsync(NpgsqlConnection conn)
 {
@@ -6772,7 +7014,7 @@ static List<string> ValidateAutomationRule(AutomationRuleSaveRequest request)
     var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" };
     var validFields = new HashSet<string> { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories" };
     var validOperators = new HashSet<string> { "includes", "does_not_include" };
-    var validActions = new HashSet<string> { "send_email", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" };
+    var validActions = new HashSet<string> { "send_email", "send_webhook", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" };
     if (request.TenantId == Guid.Empty) errors.Add("TenantId is required.");
     if (string.IsNullOrWhiteSpace(request.Name)) errors.Add("Rule name is required.");
     if (!validEvents.Contains(NormalizeAutomationKey(request.EventKey))) errors.Add("Event is not supported.");
@@ -6784,7 +7026,17 @@ static List<string> ValidateAutomationRule(AutomationRuleSaveRequest request)
     }
     if (request.Actions == null || request.Actions.Count == 0) errors.Add("At least one action is required.");
     else foreach (var action in request.Actions)
-        if (!validActions.Contains(NormalizeAutomationKey(action.ActionKey))) errors.Add("Action is not supported: " + action.ActionKey);
+    {
+        var actionKey = NormalizeAutomationKey(action.ActionKey);
+        if (!validActions.Contains(actionKey)) errors.Add("Action is not supported: " + action.ActionKey);
+        if (actionKey == "send_webhook")
+        {
+            action.Settings.TryGetValue("url", out var endpoint);
+            if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) || (uri.Scheme != "https" && uri.Scheme != "http")) errors.Add("Webhook URL is required in the URL field.");
+            action.Settings.TryGetValue("method", out var method);
+            if (!new[] { "POST", "PUT", "PATCH" }.Contains((method ?? "POST").Trim().ToUpperInvariant())) errors.Add("Webhook method must be POST, PUT, or PATCH.");
+        }
+    }
     return errors.Distinct().ToList();
 }
 
@@ -11589,7 +11841,8 @@ SELECT
     i.email_from_address,
     i.created_at AS company_start_at,
     COALESCE(s.status, 'not_registered') AS status,
-    s.trial_ends_at
+    s.trial_ends_at,
+    COALESCE(s.plan_name, '') AS plan_name
 FROM public.inspectors i
 LEFT JOIN public.subscriptions s
     ON s.inspector_id = i.inspector_id
@@ -11621,7 +11874,8 @@ SELECT
     i.email_from_address,
     i.created_at AS company_start_at,
     COALESCE(s.status, 'not_registered') AS status,
-    s.trial_ends_at
+    s.trial_ends_at,
+    COALESCE(s.plan_name, '') AS plan_name
 FROM public.inspectors i
 LEFT JOIN public.subscriptions s
     ON s.inspector_id = i.inspector_id
@@ -11647,6 +11901,7 @@ static async Task<CompanyAccountStatus?> ReadCompanyAccountStatusAsync(NpgsqlCom
         CompanyName = reader["company_name"]?.ToString() ?? "",
         Email = reader["email_from_address"]?.ToString() ?? "",
         Status = reader["status"]?.ToString() ?? "not_registered",
+        PlanName = reader["plan_name"]?.ToString() ?? "",
         TrialEndsAt = reader["trial_ends_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["trial_ends_at"]),
         CompanyStartAt = reader["company_start_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["company_start_at"])
     };
@@ -11745,8 +12000,40 @@ public class CompanyAccountStatus
     public string CompanyName { get; set; } = "";
     public string Email { get; set; } = "";
     public string Status { get; set; } = "";
+    public string PlanName { get; set; } = "";
     public DateTime? TrialEndsAt { get; set; }
     public DateTime? CompanyStartAt { get; set; }
+}
+
+public class AutomationActivationRequest
+{
+    public Guid TenantId { get; set; }
+    public string ActivationMode { get; set; } = "selected_jobs";
+    public string? ChangedBy { get; set; }
+}
+
+public class AutomationJobSelectionRequest
+{
+    public Guid TenantId { get; set; }
+    public bool UseAdvancedWorkflows { get; set; }
+    public string? ChangedBy { get; set; }
+}
+
+public class AutomationTemplateSaveRequest
+{
+    public Guid TenantId { get; set; }
+    public Guid TemplateId { get; set; }
+    public string? TemplateType { get; set; }
+    public string? ServiceTypeKey { get; set; }
+    public string Name { get; set; } = "";
+    public string? Subject { get; set; }
+    public string? HtmlBody { get; set; }
+    public bool IsActive { get; set; } = true;
+}
+
+public class AutomationTemplateArchiveRequest
+{
+    public Guid TenantId { get; set; }
 }
 
 public record WorkflowActionFailureRequest(string ErrorMessage);
