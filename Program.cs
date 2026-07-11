@@ -794,7 +794,6 @@ app.MapGet("/jobs/{jobId}/online-property-data", async (Guid jobId, Guid? tenant
 app.MapPost("/jobs/{jobId}/online-property/refresh", async (Guid jobId, string source, bool force, Guid? tenantId) =>
 {
     await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
-    await EnsureOnlinePropertyTablesAsync(conn);
     var job = await LoadOnlinePropertyJobAsync(conn, jobId, tenantId);
     if (job == null) return Results.NotFound(new { success = false, message = "Job not found for this company." });
     if (!await HasOnlinePropertyEntitlementAsync(conn, job.Value.TenantId, job.Value.InspectorId))
