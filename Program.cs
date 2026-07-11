@@ -869,10 +869,17 @@ app.MapGet("/jobs/{jobId}/change-review", async (Guid jobId, Guid? tenantId) =>
     await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
     await using var cmd = new NpgsqlCommand(@"SELECT tenant_id,change_review_pending,pending_change_json,pending_change_fingerprint,pending_change_reasons,
 change_detected_at,approved_snapshot_version,xero_review_required,report_review_required,change_template_setup_required,source_missing,unscheduled
+ ,approved_snapshot_json::text AS approved_snapshot_text,current_snapshot_json::text AS current_snapshot_text
 FROM public.jobs_staging WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn);
     cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value;
     await using var reader = await cmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return Results.NotFound(new { success = false, message = "Job not found for this company." });
-    object? changes = null; if (reader["pending_change_json"] != DBNull.Value) changes = JsonSerializer.Deserialize<object>(reader["pending_change_json"].ToString() ?? "[]");
+    object? changes = null;
+    if (reader["approved_snapshot_text"] != DBNull.Value && reader["current_snapshot_text"] != DBNull.Value)
+    {
+        var reconstructed = JobChangeSupport.Diff(reader["approved_snapshot_text"].ToString() ?? "{}", reader["current_snapshot_text"].ToString() ?? "{}");
+        if (reconstructed.Count > 0) changes = reconstructed;
+    }
+    if (changes == null && reader["pending_change_json"] != DBNull.Value) changes = JsonSerializer.Deserialize<object>(reader["pending_change_json"].ToString() ?? "[]");
     return Results.Ok(new { success = true, jobId, changeReviewPending = (bool)reader["change_review_pending"], changes,
         revision = reader["pending_change_fingerprint"]?.ToString() ?? "", reasons = reader["pending_change_reasons"]?.ToString() ?? "",
         detectedAt = reader["change_detected_at"] == DBNull.Value ? null : reader["change_detected_at"], approvedVersion = reader["approved_snapshot_version"],
