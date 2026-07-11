@@ -796,7 +796,7 @@ app.MapPost("/jobs/{jobId}/online-property/refresh", async (Guid jobId, string s
     await EnsureOnlinePropertyTablesAsync(conn);
     var job = await LoadOnlinePropertyJobAsync(conn, jobId, tenantId);
     if (job == null) return Results.NotFound(new { success = false, message = "Job not found for this company." });
-    if (!await HasOnlinePropertyEntitlementAsync(conn, job.Value.InspectorId))
+    if (!await HasOnlinePropertyEntitlementAsync(conn, job.Value.TenantId, job.Value.InspectorId))
         return Results.Json(new { success = false, status = "subscription_required", message = "An active AutoMate subscription is required." }, statusCode: 403);
 
     var normalizedSource = (source ?? "").Trim().ToLowerInvariant();
@@ -6234,7 +6234,7 @@ WHERE job_id=@job_id", conn);
                 needsBranz = needsBranz || !string.Equals(needsReader[1]?.ToString(), currentFingerprint, StringComparison.OrdinalIgnoreCase);
             }
         }
-        if ((needsFeatures || needsBranz) && await HasOnlinePropertyEntitlementAsync(conn, inspectorId))
+        if ((needsFeatures || needsBranz) && await HasOnlinePropertyEntitlementAsync(conn, tenantId, inspectorId))
         {
             var allowance = await RegisterOnlinePropertyAddressAsync(conn, jobId, tenantId, currentFingerprint, incomingAddress);
             if (allowance.Allowed)
@@ -11855,10 +11855,32 @@ FROM public.jobs_staging WHERE job_id=@job_id AND (@tenant_id IS NULL OR tenant_
     };
 }
 
-public static async Task<bool> HasOnlinePropertyEntitlementAsync(NpgsqlConnection conn, Guid inspectorId)
+public static async Task<bool> HasOnlinePropertyEntitlementAsync(NpgsqlConnection conn, Guid tenantId, Guid inspectorId)
 {
-    const string sql = @"SELECT EXISTS(SELECT 1 FROM public.subscriptions WHERE inspector_id=@inspector_id AND (status='active' OR (status='trialing' AND trial_ends_at>NOW())))";
-    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("inspector_id", inspectorId); return (bool)(await cmd.ExecuteScalarAsync() ?? false);
+    const string tenantSql = @"
+SELECT s.status, s.trial_ends_at
+FROM public.inspectors i
+LEFT JOIN public.subscriptions s ON s.inspector_id=i.inspector_id
+WHERE i.tenant_id=@tenant_id
+ORDER BY CASE WHEN s.status='active' THEN 0 WHEN s.status='trialing' AND s.trial_ends_at>NOW() THEN 1 ELSE 2 END,
+         s.trial_ends_at DESC NULLS LAST, i.created_at ASC
+LIMIT 1";
+    if (tenantId != Guid.Empty)
+    {
+        await using var tenantCmd = new NpgsqlCommand(tenantSql, conn); tenantCmd.Parameters.AddWithValue("tenant_id", tenantId);
+        await using var reader = await tenantCmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            var status = reader["status"]?.ToString() ?? "";
+            var trialEndsAt = reader["trial_ends_at"] == DBNull.Value ? (DateTime?)null : Convert.ToDateTime(reader["trial_ends_at"]);
+            return status.Equals("active", StringComparison.OrdinalIgnoreCase)
+                || (status.Equals("trialing", StringComparison.OrdinalIgnoreCase) && trialEndsAt.HasValue && trialEndsAt.Value.ToUniversalTime() > DateTime.UtcNow);
+        }
+    }
+
+    const string inspectorSql = @"SELECT EXISTS(SELECT 1 FROM public.subscriptions WHERE inspector_id=@inspector_id AND (status='active' OR (status='trialing' AND trial_ends_at>NOW())))";
+    await using var inspectorCmd = new NpgsqlCommand(inspectorSql, conn); inspectorCmd.Parameters.AddWithValue("inspector_id", inspectorId);
+    return (bool)(await inspectorCmd.ExecuteScalarAsync() ?? false);
 }
 
 public static async Task<(bool Allowed, int Count)> RegisterOnlinePropertyAddressAsync(NpgsqlConnection conn, Guid jobId, Guid tenantId, string fingerprint, string address)
