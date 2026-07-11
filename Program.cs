@@ -877,7 +877,13 @@ FROM public.jobs_staging WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::te
     if (reader["approved_snapshot_text"] != DBNull.Value && reader["current_snapshot_text"] != DBNull.Value)
     {
         var reconstructed = JobChangeSupport.Diff(reader["approved_snapshot_text"].ToString() ?? "{}", reader["current_snapshot_text"].ToString() ?? "{}");
-        if (reconstructed.Count > 0) changes = reconstructed;
+        if (reconstructed.Count > 0) changes = reconstructed.Select(change => new
+        {
+            field = change.field,
+            oldValue = change.oldValue,
+            newValue = change.newValue,
+            category = change.category
+        }).ToArray();
     }
     if (changes == null && reader["pending_change_json"] != DBNull.Value) changes = JsonSerializer.Deserialize<object>(reader["pending_change_json"].ToString() ?? "[]");
     return Results.Ok(new { success = true, jobId, changeReviewPending = (bool)reader["change_review_pending"], changes,
