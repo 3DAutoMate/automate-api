@@ -6,6 +6,7 @@ using System.Text;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -808,21 +809,59 @@ app.MapPost("/jobs/{jobId}/online-property/refresh", async (Guid jobId, string s
     if (!allowance.Allowed)
         return Results.Json(new { success = false, status = "limit_reached", message = "This inspection has already used its original address and two corrections." }, statusCode: 429);
 
-    var cooldown = await GetOnlinePropertyCooldownAsync(conn, jobId, normalizedSource, fingerprint, force);
-    if (cooldown.HasValue)
-        return Results.Json(new { success = false, status = "cooldown", retryAfterSeconds = cooldown.Value, message = "This address was refreshed recently." }, statusCode: 429);
+    var cached = await LoadSuccessfulOnlinePropertyResultAsync(conn, jobId, normalizedSource, fingerprint);
+    if (cached != null) return Results.Ok(cached);
+
+    var retryGate = await GetOnlinePropertyFailureRetryGateAsync(conn, jobId, normalizedSource, fingerprint);
+    if (!retryGate.Allowed)
+        return Results.Json(new
+        {
+            success = false,
+            status = retryGate.DailyLimitReached ? "failed_attempt_limit" : "retry_wait",
+            retryAfterSeconds = retryGate.RetryAfterSeconds,
+            failedAttemptsToday = retryGate.FailedAttemptsToday,
+            message = retryGate.DailyLimitReached ? "This source has reached five failed attempts for this address today." : "The previous failed lookup can be retried after 60 seconds."
+        }, statusCode: 429);
 
     if (normalizedSource == "property-features")
     {
-        var result = await PropertyFeaturesLookupService.LookupAsync(job.Value.Address, force);
+        var result = await PropertyFeaturesLookupService.LookupAsync(job.Value.Address, false);
         await StorePropertyFeaturesResultAsync(conn, jobId, result);
-        await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, force ? "manual_refresh" : "sync", result.Status, result.Error);
+        await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, "manual_retry", result.Status, result.Error);
         return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
     }
 
-    var branz = await BranzLookupService.LookupAsync(job.Value.Address, null, null, force);
+    var branz = await BranzLookupService.LookupAsync(job.Value.Address, null, null, false);
     await StoreBranzResultAsync(conn, jobId, branz);
-    await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, force ? "manual_refresh" : "sync", branz.Status, branz.Error);
+    await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, "manual_retry", branz.Status, branz.Error);
+    return branz.Status == "available" ? Results.Ok(branz) : Results.Json(branz, statusCode: 422);
+});
+
+app.MapPost("/admin/jobs/{jobId}/online-property/force-refresh", async (HttpContext context, Guid jobId, string source, Guid? tenantId) =>
+{
+    var configuredKey = builder.Configuration["AUTOMATE_ADMIN_API_KEY"] ?? Environment.GetEnvironmentVariable("AUTOMATE_ADMIN_API_KEY") ?? "";
+    var suppliedKey = context.Request.Headers["X-AutoMate-Admin-Key"].ToString();
+    if (configuredKey.Length == 0) return Results.Json(new { success = false, message = "Administrator refresh is not configured." }, statusCode: 503);
+    if (configuredKey.Length != suppliedKey.Length || !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(configuredKey), Encoding.UTF8.GetBytes(suppliedKey)))
+        return Results.Json(new { success = false, message = "Administrator authorization failed." }, statusCode: 403);
+
+    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureOnlinePropertyTablesAsync(conn);
+    var job = await LoadOnlinePropertyJobAsync(conn, jobId, tenantId);
+    if (job == null) return Results.NotFound(new { success = false, message = "Job not found for this company." });
+    var normalizedSource = (source ?? "").Trim().ToLowerInvariant();
+    if (normalizedSource != "branz" && normalizedSource != "property-features") return Results.BadRequest(new { success = false, message = "source must be branz or property-features." });
+    var fingerprint = StructuredAddressResolver.Fingerprint(job.Value.Address);
+    if (!await IsRegisteredOnlinePropertyAddressAsync(conn, jobId, fingerprint))
+        return Results.BadRequest(new { success = false, message = "Administrator refresh is limited to an already accepted job address." });
+
+    if (normalizedSource == "property-features")
+    {
+        var result = await PropertyFeaturesLookupService.LookupAsync(job.Value.Address, true); await StorePropertyFeaturesResultAsync(conn, jobId, result);
+        await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, "administrator_force", result.Status, result.Error);
+        return result.Status == "available" ? Results.Ok(result) : Results.Json(result, statusCode: 422);
+    }
+    var branz = await BranzLookupService.LookupAsync(job.Value.Address, null, null, true); await StoreBranzResultAsync(conn, jobId, branz);
+    await AuditOnlinePropertyLookupAsync(conn, jobId, job.Value.TenantId, normalizedSource, fingerprint, "administrator_force", branz.Status, branz.Error);
     return branz.Status == "available" ? Results.Ok(branz) : Results.Json(branz, statusCode: 422);
 });
 
@@ -6225,13 +6264,15 @@ WHERE job_id=@job_id", conn);
         var currentFingerprint = StructuredAddressResolver.Fingerprint(incomingAddress);
         var needsFeatures = addressChanged;
         var needsBranz = addressChanged;
-        await using (var needsCmd = new NpgsqlCommand("SELECT property_features_address_fingerprint,branz_address_fingerprint FROM public.jobs_staging WHERE job_id=@job_id", conn))
+        await using (var needsCmd = new NpgsqlCommand("SELECT property_features_address_fingerprint,branz_address_fingerprint,property_features_status,branz_lookup_status FROM public.jobs_staging WHERE job_id=@job_id", conn))
         {
             needsCmd.Parameters.AddWithValue("job_id", jobId); await using var needsReader = await needsCmd.ExecuteReaderAsync();
             if (await needsReader.ReadAsync())
             {
                 needsFeatures = needsFeatures || !string.Equals(needsReader[0]?.ToString(), currentFingerprint, StringComparison.OrdinalIgnoreCase);
                 needsBranz = needsBranz || !string.Equals(needsReader[1]?.ToString(), currentFingerprint, StringComparison.OrdinalIgnoreCase);
+                needsFeatures = needsFeatures || !string.Equals(needsReader[2]?.ToString(), "available", StringComparison.OrdinalIgnoreCase);
+                needsBranz = needsBranz || !string.Equals(needsReader[3]?.ToString(), "available", StringComparison.OrdinalIgnoreCase);
             }
         }
         if ((needsFeatures || needsBranz) && await HasOnlinePropertyEntitlementAsync(conn, tenantId, inspectorId))
@@ -6239,6 +6280,8 @@ WHERE job_id=@job_id", conn);
             var allowance = await RegisterOnlinePropertyAddressAsync(conn, jobId, tenantId, currentFingerprint, incomingAddress);
             if (allowance.Allowed)
             {
+                if (needsFeatures) needsFeatures = (await GetOnlinePropertyFailureRetryGateAsync(conn, jobId, "property-features", currentFingerprint)).Allowed;
+                if (needsBranz) needsBranz = (await GetOnlinePropertyFailureRetryGateAsync(conn, jobId, "branz", currentFingerprint)).Allowed;
                 var featuresTask = needsFeatures ? PropertyFeaturesLookupService.LookupAsync(incomingAddress) : null;
                 var branzTask = needsBranz ? BranzLookupService.LookupAsync(incomingAddress) : null;
                 var pendingLookups = new List<Task>();
@@ -11895,14 +11938,62 @@ public static async Task<(bool Allowed, int Count)> RegisterOnlinePropertyAddres
     return (true, used + 1);
 }
 
-public static async Task<int?> GetOnlinePropertyCooldownAsync(NpgsqlConnection conn, Guid jobId, string source, string fingerprint, bool force)
+public static async Task<bool> IsRegisteredOnlinePropertyAddressAsync(NpgsqlConnection conn, Guid jobId, string fingerprint)
 {
-    if (!force) return null;
-    var column = source == "branz" ? "branz_retrieved_at" : "property_features_retrieved_at";
-    var fingerprintColumn = source == "branz" ? "branz_address_fingerprint" : "property_features_address_fingerprint";
-    await using var cmd = new NpgsqlCommand($"SELECT {column} FROM public.jobs_staging WHERE job_id=@job_id AND {fingerprintColumn}=@fingerprint", conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("fingerprint", fingerprint);
-    var value = await cmd.ExecuteScalarAsync(); if (value == null || value == DBNull.Value) return null;
-    var remaining = 900 - (int)(DateTimeOffset.UtcNow - new DateTimeOffset((DateTime)value)).TotalSeconds; return remaining > 0 ? remaining : null;
+    await using var cmd = new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.online_property_addresses WHERE job_id=@job_id AND address_fingerprint=@fingerprint)", conn);
+    cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("fingerprint", fingerprint);
+    return (bool)(await cmd.ExecuteScalarAsync() ?? false);
+}
+
+public static async Task<object?> LoadSuccessfulOnlinePropertyResultAsync(NpgsqlConnection conn, Guid jobId, string source, string fingerprint)
+{
+    if (source == "property-features")
+    {
+        await using var cmd = new NpgsqlCommand(@"SELECT property_features_json FROM public.jobs_staging
+WHERE job_id=@job_id AND property_features_status='available' AND property_features_address_fingerprint=@fingerprint", conn);
+        cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("fingerprint", fingerprint);
+        var json = Convert.ToString(await cmd.ExecuteScalarAsync());
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        var result = JsonSerializer.Deserialize<PropertyFeaturesResult>(json);
+        if (result == null) return null;
+        return new
+        {
+            result.Status, result.AddressFingerprint, result.RetrievedAt, result.Error, result.PropertyId, result.FormattedAddress,
+            result.Latitude, result.Longitude, result.PropertyType, result.PropertySubType, result.Bedrooms, result.Bathrooms,
+            result.CarSpaces, result.LandArea, result.FloorArea, result.YearBuilt, result.DecadeBuilt, result.RoofMaterial,
+            result.WallMaterial, result.TotalFloors, result.LegalDescription, result.CouncilArea, result.Postcode,
+            cacheStatus = "current_saved_data", message = "Current saved Property Features data."
+        };
+    }
+
+    await using var branzCmd = new NpgsqlCommand(@"SELECT branz_wind_zone,branz_exposure_zone,branz_latitude,branz_longitude,branz_retrieved_at,branz_lookup_error
+FROM public.jobs_staging WHERE job_id=@job_id AND branz_lookup_status='available' AND branz_address_fingerprint=@fingerprint", conn);
+    branzCmd.Parameters.AddWithValue("job_id", jobId); branzCmd.Parameters.AddWithValue("fingerprint", fingerprint);
+    await using var reader = await branzCmd.ExecuteReaderAsync(); if (!await reader.ReadAsync()) return null;
+    return new
+    {
+        windZone = reader["branz_wind_zone"]?.ToString() ?? "", exposureZone = reader["branz_exposure_zone"]?.ToString() ?? "",
+        status = "available", latitude = reader["branz_latitude"] == DBNull.Value ? null : (double?)Convert.ToDouble(reader["branz_latitude"]),
+        longitude = reader["branz_longitude"] == DBNull.Value ? null : (double?)Convert.ToDouble(reader["branz_longitude"]),
+        addressFingerprint = fingerprint, retrievedAt = reader["branz_retrieved_at"] == DBNull.Value ? null : reader["branz_retrieved_at"],
+        error = reader["branz_lookup_error"]?.ToString() ?? "", cacheStatus = "current_saved_data", message = "Current saved BRANZ data."
+    };
+}
+
+public static async Task<(bool Allowed, bool DailyLimitReached, int RetryAfterSeconds, int FailedAttemptsToday)> GetOnlinePropertyFailureRetryGateAsync(NpgsqlConnection conn, Guid jobId, string source, string fingerprint)
+{
+    const string sql = @"SELECT COUNT(*)::int AS failed_count, MAX(created_at) AS last_failed_at
+FROM public.online_property_lookup_audit
+WHERE job_id=@job_id AND source=@source AND address_fingerprint=@fingerprint
+  AND outcome<>'available' AND reason<>'administrator_force' AND created_at >= date_trunc('day', NOW())";
+    await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("source", source); cmd.Parameters.AddWithValue("fingerprint", fingerprint);
+    await using var reader = await cmd.ExecuteReaderAsync(); await reader.ReadAsync();
+    var count = reader["failed_count"] == DBNull.Value ? 0 : Convert.ToInt32(reader["failed_count"]);
+    if (count >= 5) return (false, true, 0, count);
+    if (reader["last_failed_at"] == DBNull.Value) return (true, false, 0, count);
+    var last = new DateTimeOffset(Convert.ToDateTime(reader["last_failed_at"]));
+    var remaining = 60 - (int)(DateTimeOffset.UtcNow - last).TotalSeconds;
+    return remaining > 0 ? (false, false, remaining, count) : (true, false, 0, count);
 }
 
 public static async Task StorePropertyFeaturesResultAsync(NpgsqlConnection conn, Guid jobId, PropertyFeaturesResult result)
