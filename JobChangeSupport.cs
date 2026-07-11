@@ -14,6 +14,14 @@ public sealed record JobChangePreparation(
     bool ReportReview,
     int ApprovedVersion);
 
+public sealed class JobFieldChange
+{
+    public string field { get; set; } = "";
+    public string oldValue { get; set; } = "";
+    public string newValue { get; set; } = "";
+    public string category { get; set; } = "";
+}
+
 public static class JobChangeSupport
 {
     public static async Task EnsureAsync(NpgsqlConnection conn)
@@ -71,6 +79,23 @@ WHERE approved_snapshot_json IS NULL AND COALESCE(raw_payload_json,'') <> ''", c
             await using var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET approved_snapshot_json=CAST(@snapshot AS jsonb),approved_snapshot_fingerprint=@fingerprint,
 approved_snapshot_version=1,current_snapshot_json=CAST(@snapshot AS jsonb),current_snapshot_fingerprint=@fingerprint WHERE job_id=@job AND approved_snapshot_json IS NULL", conn);
             update.Parameters.AddWithValue("job", row.JobId); update.Parameters.AddWithValue("snapshot", snapshot); update.Parameters.AddWithValue("fingerprint", fingerprint); await update.ExecuteNonQueryAsync();
+        }
+    }
+
+    public static async Task RepairPendingChangesAsync(NpgsqlConnection conn)
+    {
+        var rows = new List<(Guid JobId, string Approved, string Current)>();
+        await using (var select = new NpgsqlCommand(@"SELECT job_id,approved_snapshot_json::text,current_snapshot_json::text FROM public.jobs_staging
+WHERE change_review_pending=true AND approved_snapshot_json IS NOT NULL AND current_snapshot_json IS NOT NULL", conn))
+        await using (var reader = await select.ExecuteReaderAsync())
+            while (await reader.ReadAsync()) rows.Add((reader.GetGuid(0), reader.GetString(1), reader.GetString(2)));
+        foreach (var row in rows)
+        {
+            var changes = Diff(row.Approved, row.Current); if (changes.Count == 0) continue;
+            string json = JsonSerializer.Serialize(changes); string reasons = string.Join(",", changes.Select(change => change.category).Distinct()); string fingerprint = Fingerprint(row.Current);
+            await using var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET pending_change_json=CAST(@changes AS jsonb),pending_change_reasons=@reasons,
+pending_change_fingerprint=@fingerprint WHERE job_id=@job AND change_review_pending=true", conn);
+            update.Parameters.AddWithValue("job", row.JobId); update.Parameters.AddWithValue("changes", json); update.Parameters.AddWithValue("reasons", reasons); update.Parameters.AddWithValue("fingerprint", fingerprint); await update.ExecuteNonQueryAsync();
         }
     }
 
@@ -154,16 +179,16 @@ VALUES(@job,@tenant,@version,@event,@fingerprint,CAST(@changes AS jsonb),@reason
         cmd.Parameters.AddWithValue("reasons", reasons ?? ""); cmd.Parameters.AddWithValue("actor", actor ?? ""); await cmd.ExecuteNonQueryAsync();
     }
 
-    private static List<(string field, string oldValue, string newValue, string category)> Diff(string approvedJson, string currentJson)
+    public static List<JobFieldChange> Diff(string approvedJson, string currentJson)
     {
         using var oldDoc = JsonDocument.Parse(approvedJson); using var newDoc = JsonDocument.Parse(currentJson);
-        var result = new List<(string, string, string, string)>();
+        var result = new List<JobFieldChange>();
         foreach (var property in newDoc.RootElement.EnumerateObject())
         {
             oldDoc.RootElement.TryGetProperty(property.Name, out var oldValue);
             string before = oldValue.ValueKind == JsonValueKind.Undefined ? "" : oldValue.GetRawText(); string after = property.Value.GetRawText();
             if (string.Equals(before, after, StringComparison.Ordinal)) continue;
-            result.Add((property.Name, Display(before), Display(after), Category(property.Name)));
+            result.Add(new JobFieldChange { field = property.Name, oldValue = Display(before), newValue = Display(after), category = Category(property.Name) });
         }
         return result;
     }

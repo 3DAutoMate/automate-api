@@ -6688,6 +6688,7 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await EnsureOnlinePropertyTablesAsync(startupMigrationConnection);
     await JobChangeSupport.EnsureAsync(startupMigrationConnection);
     await JobChangeSupport.BackfillApprovedSnapshotsAsync(startupMigrationConnection);
+    await JobChangeSupport.RepairPendingChangesAsync(startupMigrationConnection);
 }
 
 app.Run();
