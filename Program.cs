@@ -3368,6 +3368,7 @@ app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
+        await EnsureJobInvoiceLinesTableAsync(conn);
         await EnsureInspectorsTableAsync(conn);
 
         var job = await LoadScheduleJobAsync(conn, jobId);
@@ -3375,6 +3376,9 @@ app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
             return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
 
         var fields = BuildEmailTemplateFields(job, null);
+        var invoiceContext = await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn, jobId);
+        if (invoiceContext != null)
+            MergeEmailTemplateFields(fields, invoiceContext.Tokens);
 
         return Results.Ok(new
         {
@@ -10199,6 +10203,10 @@ static async Task<RenderedEmailTemplate?> RenderBookingEmailTemplateAsync(
         htmlTemplate = BuildDefaultBookingTemplateHtml();
 
     var fields = BuildEmailTemplateFields(job, service);
+    await EnsureJobInvoiceLinesTableAsync(conn);
+    var invoiceContext = await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn, jobId);
+    if (invoiceContext != null)
+        MergeEmailTemplateFields(fields, invoiceContext.Tokens);
     var subject = RenderTemplateTokens(subjectTemplate, fields, htmlEncode: false);
     var htmlBody = RenderTemplateTokens(CleanEditorHtml(htmlTemplate), fields, htmlEncode: true);
     var toEmail = string.IsNullOrWhiteSpace(request.ToEmail) ? job.ClientEmail : request.ToEmail.Trim();
@@ -10339,9 +10347,18 @@ static string RenderTemplateTokens(string template, Dictionary<string, string> f
             if (!fields.TryGetValue(key, out var replacement))
                 return match.Value;
 
+            if (htmlEncode && string.Equals(key, "INVOICE_LINE_ITEMS", StringComparison.OrdinalIgnoreCase))
+                return replacement;
+
             return htmlEncode ? SafeHtml(replacement) : replacement;
         },
         RegexOptions.IgnoreCase);
+}
+
+static void MergeEmailTemplateFields(Dictionary<string, string> fields, IReadOnlyDictionary<string, string> additions)
+{
+    foreach (var pair in additions)
+        fields[pair.Key] = pair.Value;
 }
 
 static async Task MarkWorkflowActionFailedAsync(NpgsqlConnection conn, Guid jobId, string actionKey, string error)
@@ -10456,7 +10473,29 @@ static object[] GetEmailTemplatePlaceholders()
         .Take(8)
         .Concat(GetEmailTemplateAddOnServiceTypes().Select(BuildAddOnPlaceholder))
         .Concat(basePlaceholders.Skip(8))
+        .Concat(GetInvoiceEmailTemplatePlaceholders())
         .ToArray();
+}
+
+static object[] GetInvoiceEmailTemplatePlaceholders()
+{
+    var placeholders = new List<object>
+    {
+        new { key = "INVOICE_TOTAL", token = "{{INVOICE_TOTAL}}", label = "Invoice Total" },
+        new { key = "AMOUNT_PAID", token = "{{AMOUNT_PAID}}", label = "Amount Paid" },
+        new { key = "BALANCE_DUE", token = "{{BALANCE_DUE}}", label = "Balance Due" },
+        new { key = "INVOICE_LINE_ITEMS", token = "{{INVOICE_LINE_ITEMS}}", label = "Invoice Line Items Table" }
+    };
+
+    for (var line = 1; line <= AutoMateApi.EmailInvoiceTemplateContext.IndexedLineLimit; line++)
+    {
+        placeholders.Add(new { key = $"INVOICE_LINE_{line}_DESCRIPTION", token = $"{{{{INVOICE_LINE_{line}_DESCRIPTION}}}}", label = $"Invoice Line {line} Description" });
+        placeholders.Add(new { key = $"INVOICE_LINE_{line}_QUANTITY", token = $"{{{{INVOICE_LINE_{line}_QUANTITY}}}}", label = $"Invoice Line {line} Quantity" });
+        placeholders.Add(new { key = $"INVOICE_LINE_{line}_UNIT_PRICE", token = $"{{{{INVOICE_LINE_{line}_UNIT_PRICE}}}}", label = $"Invoice Line {line} Unit Price" });
+        placeholders.Add(new { key = $"INVOICE_LINE_{line}_TOTAL", token = $"{{{{INVOICE_LINE_{line}_TOTAL}}}}", label = $"Invoice Line {line} Total" });
+    }
+
+    return placeholders.ToArray();
 }
 
 static object[] GetEmailTemplatePlaceholderCategories()
@@ -10532,6 +10571,11 @@ static object[] GetEmailTemplatePlaceholderCategories()
                 new { key = "LOGO_URL", token = "{{LOGO_URL}}", label = "Logo URL" },
                 new { key = "COMPANY_LOGO_URL", token = "{{COMPANY_LOGO_URL}}", label = "Company Logo URL" }
             }
+        },
+        new
+        {
+            category = "Invoice Details",
+            placeholders = GetInvoiceEmailTemplatePlaceholders()
         },
         new
         {
@@ -10930,7 +10974,7 @@ static string GetEmailTemplateMakerHtml()
   </main>
 
   <script>
-    const state = { lastTarget: null, placeholders: [], editorReady: false };
+    const state = { lastTarget: null, placeholders: [], editorReady: false, previewTimer: null, previewRevision: 0 };
     const DEFAULT_TEST_INSPECTOR_ID = "dea3f71c-b8ca-4cbb-bbe3-3de48d380ec5";
     const $ = id => document.getElementById(id);
 
@@ -11004,6 +11048,7 @@ static string GetEmailTemplateMakerHtml()
       doc.body.addEventListener("focus", () => state.lastTarget = $("editor"));
       doc.body.addEventListener("click", () => state.lastTarget = $("editor"));
       doc.body.addEventListener("keyup", () => state.lastTarget = $("editor"));
+      doc.body.addEventListener("input", scheduleLivePreview);
       state.editorReady = true;
     }
 
@@ -11192,11 +11237,20 @@ static string GetEmailTemplateMakerHtml()
       setStatus("Template saved.", data.success ? "good" : "");
     }
 
-    async function previewTemplate() {
+    function scheduleLivePreview() {
+      clearTimeout(state.previewTimer);
+      if (!$('jobId').value.trim()) return;
+      state.previewTimer = setTimeout(() => {
+        previewTemplate(true).catch(err => setStatus(friendlyError(err.message), "bad"));
+      }, 650);
+    }
+
+    async function previewTemplate(isAutomatic) {
       const jobId = $("jobId").value.trim();
       if (!jobId) throw new Error("No test job is loaded yet. Refresh the local database connection or paste a Job ID.");
       await resolveInspectorFromJob(false);
-      setStatus("Rendering preview...");
+      const revision = ++state.previewRevision;
+      if (!isAutomatic) setStatus("Rendering preview...");
       const data = await api(`/jobs/${encodeURIComponent(jobId)}/email-templates/booking-email/preview`, {
         method: "POST",
         body: JSON.stringify({
@@ -11206,9 +11260,10 @@ static string GetEmailTemplateMakerHtml()
           htmlBody: getEditorHtml()
         })
       });
+      if (revision !== state.previewRevision) return;
       $("previewSubject").textContent = data.subject || "";
       $("preview").srcdoc = data.htmlBody || "";
-      setStatus("Preview rendered.", "good");
+      setStatus(isAutomatic ? "Live preview updated." : "Preview rendered.", "good");
     }
 
     async function sendTemplate() {
@@ -11230,19 +11285,18 @@ static string GetEmailTemplateMakerHtml()
     async function sendTestEmail() {
       const toEmail = $("toEmail").value.trim();
       if (!toEmail) throw new Error("Enter your email address in Send To Override first.");
+      const jobId = $("jobId").value.trim();
+      if (!jobId) throw new Error("A valid preview Job ID is required before sending a test.");
 
-      setStatus("Sending test email...");
-      const isLocal = location.hostname === "127.0.0.1" || location.hostname === "localhost";
-      const sendUrl = isLocal
-        ? "https://automate-api-production.up.railway.app/integrations/microsoft/send-test-email"
-        : "/integrations/microsoft/send-test-email";
-      const data = await api(sendUrl, {
+      setStatus("Sending test email through company SMTP...");
+      const data = await api("/connector/email-template-test", {
         method: "POST",
         body: JSON.stringify({
-          inspectorId: getInspectorIdForTest(),
+          jobId,
           toEmail,
-          subject: "[TEST] " + ($("subject").value || "Booking email"),
-          body: renderDraftForTest(getEditorHtml())
+          serviceTypeKey: $("serviceType").value || null,
+          subject: $("subject").value || "Booking email",
+          htmlBody: getEditorHtml()
         })
       });
       setStatus(data.message || "Test email sent.", data.success ? "good" : "");
@@ -11291,7 +11345,10 @@ static string GetEmailTemplateMakerHtml()
 
     $("editor").addEventListener("load", prepareEditor);
     setEditorHtml($("htmlBody").value);
-    $("jobId").addEventListener("input", updateJobActionState);
+    $("jobId").addEventListener("input", () => { updateJobActionState(); scheduleLivePreview(); });
+    $("subject").addEventListener("input", scheduleLivePreview);
+    $("htmlBody").addEventListener("input", scheduleLivePreview);
+    $("serviceType").addEventListener("change", scheduleLivePreview);
     updateJobActionState();
 
     for (const btn of document.querySelectorAll(".editor-tools button")) {
@@ -11300,7 +11357,7 @@ static string GetEmailTemplateMakerHtml()
 
     $("loadBtn").addEventListener("click", () => loadTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
     $("saveBtn").addEventListener("click", () => saveTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
-    $("previewBtn").addEventListener("click", () => previewTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
+    $("previewBtn").addEventListener("click", () => previewTemplate(false).catch(err => setStatus(friendlyError(err.message), "bad")));
     $("sendTestBtn").addEventListener("click", () => sendTestEmail().catch(err => setStatus(friendlyError(err.message), "bad")));
     $("sendBtn").addEventListener("click", () => sendTemplate().catch(err => setStatus(friendlyError(err.message), "bad")));
     $("jobInspectorBtn").addEventListener("click", () => resolveInspectorFromJob(true).catch(err => setStatus(friendlyError(err.message), "bad")));
