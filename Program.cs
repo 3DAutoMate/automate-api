@@ -11853,7 +11853,8 @@ CREATE TABLE IF NOT EXISTS public.address_change_audit
 );
 CREATE OR REPLACE FUNCTION public.clear_completed_address_change() RETURNS trigger AS $$
 BEGIN
- IF NEW.address_change_pending
+ IF OLD.address_change_pending
+    AND NEW.address_change_pending
     AND (NOT NEW.booking_email_required OR NEW.booking_email_sent)
     AND (NOT NEW.terms_required OR NEW.terms_sent)
     AND (NOT NEW.calendar_required OR NEW.calendar_created) THEN
