@@ -6498,8 +6498,8 @@ app.MapPost("/actions/ensure-tables", async () =>
 
 app.MapGet("/actions/catalog", () => Results.Ok(new
 {
-    events = new[] { "quote_accepted", "inspection_scheduled", "inspection_rescheduled", "post_scheduling_reached", "report_released" },
-    fields = new[] { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name" },
+    events = new[] { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" },
+    fields = new[] { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories" },
     operators = new[] { "includes", "does_not_include" },
     actions = new[] { "send_email", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" },
     modes = new[] { "disabled", "review" }
@@ -6583,6 +6583,19 @@ RETURNING rule_id, updated_at;";
     }
 });
 
+app.MapDelete("/actions/rules/{ruleId}", async (Guid ruleId, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureAdvancedActionsTablesAsync(conn);
+        await using var cmd = new NpgsqlCommand("DELETE FROM public.automation_rules WHERE rule_id=@rule AND tenant_id=@tenant", conn);
+        cmd.Parameters.AddWithValue("rule", ruleId); cmd.Parameters.AddWithValue("tenant", tenantId);
+        int rows = await cmd.ExecuteNonQueryAsync();
+        return rows == 0 ? Results.NotFound(new { success = false, message = "Workflow action was not found for this company." }) : Results.Ok(new { success = true });
+    }
+    catch (Exception ex) { return Results.Problem(title: "Delete workflow action failed", detail: ex.Message, statusCode: 500); }
+});
+
 app.MapPost("/actions/rules/preview", (AutomationRulePreviewRequest request) =>
 {
     var validation = ValidateAutomationRule(request.Rule);
@@ -6613,7 +6626,7 @@ app.MapPost("/actions/rules/preview", (AutomationRulePreviewRequest request) =>
 app.MapPost("/actions/events", async (AutomationEventRequest request) =>
 {
     var eventKey = NormalizeAutomationKey(request.EventKey);
-    var validEvents = new HashSet<string> { "quote_accepted", "inspection_scheduled", "inspection_rescheduled", "post_scheduling_reached", "report_released" };
+    var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" };
     if (request.TenantId == Guid.Empty || !validEvents.Contains(eventKey) || string.IsNullOrWhiteSpace(request.IdempotencyKey))
         return Results.BadRequest(new { success = false, message = "TenantId, a supported EventKey, and IdempotencyKey are required." });
     try
@@ -6756,15 +6769,14 @@ static string NormalizeAutomationKey(string? value)
 static List<string> ValidateAutomationRule(AutomationRuleSaveRequest request)
 {
     var errors = new List<string>();
-    var validEvents = new HashSet<string> { "quote_accepted", "inspection_scheduled", "inspection_rescheduled", "post_scheduling_reached", "report_released" };
-    var validFields = new HashSet<string> { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name" };
+    var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" };
+    var validFields = new HashSet<string> { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories" };
     var validOperators = new HashSet<string> { "includes", "does_not_include" };
     var validActions = new HashSet<string> { "send_email", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" };
     if (request.TenantId == Guid.Empty) errors.Add("TenantId is required.");
     if (string.IsNullOrWhiteSpace(request.Name)) errors.Add("Rule name is required.");
     if (!validEvents.Contains(NormalizeAutomationKey(request.EventKey))) errors.Add("Event is not supported.");
-    if (request.Conditions == null || request.Conditions.Count == 0) errors.Add("At least one condition is required.");
-    else foreach (var condition in request.Conditions)
+    if (request.Conditions != null) foreach (var condition in request.Conditions)
     {
         if (!validFields.Contains(NormalizeAutomationKey(condition.FieldKey))) errors.Add("Condition field is not supported: " + condition.FieldKey);
         if (!validOperators.Contains(NormalizeAutomationKey(condition.Operator))) errors.Add("Condition operator is not supported: " + condition.Operator);
