@@ -74,39 +74,14 @@ public static class BranzLookupService
     private static async Task<(double? Latitude, double? Longitude)> ResolveCoordinatesAsync(string address)
     {
         if (string.IsNullOrWhiteSpace(address)) return (null, null);
-        var suggestionUrl = "https://www.propertyvalue.co.nz/api/public/clapi/suggestions?q=" + Uri.EscapeDataString(address) + "&suggestionTypes=address&limit=5";
-        using var suggestionResponse = await Http.GetAsync(suggestionUrl);
-        suggestionResponse.EnsureSuccessStatusCode();
-        var json = await suggestionResponse.Content.ReadAsStringAsync();
-        using var doc = JsonDocument.Parse(json);
-        var pageUrl = FindFirstString(doc.RootElement, "url");
-        if (string.IsNullOrWhiteSpace(pageUrl)) return (null, null);
-        if (pageUrl.StartsWith('/')) pageUrl = "https://www.propertyvalue.co.nz" + pageUrl;
-        var html = await Http.GetStringAsync(pageUrl);
+        var match = await StructuredAddressResolver.ResolveAsync(address);
+        if (match == null) return (null, null);
+        var html = await Http.GetStringAsync(match.PageUrl);
         var lat = LatitudeRegex.Match(html);
         var lon = LongitudeRegex.Match(html);
         return lat.Success && lon.Success
             ? (double.Parse(lat.Groups["v"].Value, System.Globalization.CultureInfo.InvariantCulture), double.Parse(lon.Groups["v"].Value, System.Globalization.CultureInfo.InvariantCulture))
             : (null, null);
-    }
-
-    private static string FindFirstString(JsonElement element, string propertyName)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-            foreach (var property in element.EnumerateObject())
-            {
-                if (property.Name.Equals(propertyName, StringComparison.OrdinalIgnoreCase) && property.Value.ValueKind == JsonValueKind.String)
-                    return property.Value.GetString() ?? "";
-                var nested = FindFirstString(property.Value, propertyName);
-                if (nested.Length > 0) return nested;
-            }
-        if (element.ValueKind == JsonValueKind.Array)
-            foreach (var item in element.EnumerateArray())
-            {
-                var nested = FindFirstString(item, propertyName);
-                if (nested.Length > 0) return nested;
-            }
-        return "";
     }
 
     private static double[] ToNztm(double longitude, double latitude)

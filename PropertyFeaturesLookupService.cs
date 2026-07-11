@@ -31,9 +31,9 @@ public static class PropertyFeaturesLookupService
         if (!forceRefresh && Cache.TryGetValue(fingerprint, out var cached) && cached.Status == "available") return cached;
         try
         {
-            var pageUrl = await ResolvePageUrlAsync(address);
-            if (pageUrl.Length == 0) return Failed(fingerprint, "PropertyValue did not return an exact property page.");
-            var html = await Http.GetStringAsync(pageUrl);
+            var match = await StructuredAddressResolver.ResolveAsync(address);
+            if (match == null) return Failed(fingerprint, "PropertyValue did not return an exact street-address match.");
+            var html = await Http.GetStringAsync(match.PageUrl);
             const string marker = "window.REDUX_DATA=";
             var start = html.IndexOf(marker, StringComparison.Ordinal);
             if (start < 0) return Failed(fingerprint, "PropertyValue structured property data was not present.");
@@ -65,17 +65,6 @@ public static class PropertyFeaturesLookupService
         catch (Exception ex) { return Failed(fingerprint, ex.Message); }
     }
 
-    private static async Task<string> ResolvePageUrlAsync(string address)
-    {
-        if (string.IsNullOrWhiteSpace(address)) return "";
-        var url = "https://www.propertyvalue.co.nz/api/public/clapi/suggestions?q=" + Uri.EscapeDataString(address) + "&suggestionTypes=address&limit=5";
-        using var response = await Http.GetAsync(url); response.EnsureSuccessStatusCode();
-        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        var value = FindFirstString(doc.RootElement, "url");
-        if (value.StartsWith('/')) value = "https://www.propertyvalue.co.nz" + value;
-        return value;
-    }
-
     private static PropertyFeaturesResult Failed(string fingerprint, string error) => new("unavailable", fingerprint, DateTimeOffset.UtcNow, error,
         null, "", null, null, "", "", null, null, null, null, null, "", "", "", "", "", "", "", "");
     private static string Fingerprint(string address) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Regex.Replace((address ?? "").Trim().ToUpperInvariant(), "\\s+", " ")))).ToLowerInvariant();
@@ -83,10 +72,4 @@ public static class PropertyFeaturesLookupService
     private static string Text(JsonElement value, string name) { var child = Child(value, name); return child.ValueKind == JsonValueKind.String ? child.GetString() ?? "" : child.ValueKind == JsonValueKind.Number ? child.ToString() : ""; }
     private static int? Integer(JsonElement value, string name) { var child = Child(value, name); return child.ValueKind == JsonValueKind.Number && child.TryGetInt32(out var result) ? result : null; }
     private static double? Number(JsonElement value, string name) { var child = Child(value, name); return child.ValueKind == JsonValueKind.Number && child.TryGetDouble(out var result) ? result : null; }
-    private static string FindFirstString(JsonElement element, string name)
-    {
-        if (element.ValueKind == JsonValueKind.Object) foreach (var property in element.EnumerateObject()) { if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase) && property.Value.ValueKind == JsonValueKind.String) return property.Value.GetString() ?? ""; var nested = FindFirstString(property.Value, name); if (nested.Length > 0) return nested; }
-        if (element.ValueKind == JsonValueKind.Array) foreach (var item in element.EnumerateArray()) { var nested = FindFirstString(item, name); if (nested.Length > 0) return nested; }
-        return "";
-    }
 }
