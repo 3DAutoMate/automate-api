@@ -786,7 +786,6 @@ app.MapGet("/integrations/property-features/lookup", () => Results.Json(new { su
 app.MapGet("/jobs/{jobId}/online-property-data", async (Guid jobId, Guid? tenantId) =>
 {
     await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
-    await EnsureOnlinePropertyTablesAsync(conn);
     var current = await LoadOnlinePropertyDataAsync(conn, jobId, tenantId);
     return current == null ? Results.NotFound(new { success = false, message = "Job not found for this company." }) : Results.Ok(current);
 });
