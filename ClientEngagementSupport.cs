@@ -374,6 +374,21 @@ public static class ClientEngagementSupport
                 replayed = true;
             }
         }
+        // Revocation disables the old bearer links, not the immutable approved snapshot.
+        // A later explicit publish for the same approved revision must reactivate that
+        // publication so a newly issued, independently hashed token can use it.
+        await using (var reactivate = new NpgsqlCommand("""
+            UPDATE public.client_inspection_pages
+            SET revoked_at=NULL,revoked_by='',revoke_reason='',published_by=@actor
+            WHERE publication_id=@current AND tenant_id=@tenant AND job_id=@job;
+            """, connection, transaction))
+        {
+            reactivate.Parameters.AddWithValue("actor", request.Actor.Trim());
+            reactivate.Parameters.AddWithValue("current", publicationId);
+            reactivate.Parameters.AddWithValue("tenant", request.TenantId);
+            reactivate.Parameters.AddWithValue("job", request.JobId);
+            await reactivate.ExecuteNonQueryAsync(cancellationToken);
+        }
         if (request.RevokePrior)
         {
             await using var revokePublications = new NpgsqlCommand("""
