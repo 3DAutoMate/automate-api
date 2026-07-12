@@ -3390,13 +3390,13 @@ app.MapPut("/automation/basic/settings/{eventKey}/{recipientKey}", async (HttpCo
         await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn); await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
         if (!request.Confirmed) return Results.BadRequest(new { success=false,status="confirmation_required",message="Confirm the Basic setting change." });
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
-        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(NULLIF(inspector_name,''),inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
-        actorCmd.Parameters.AddWithValue("id", inspectorId); actorCmd.Parameters.AddWithValue("tenant", request.TenantId); var actor = Convert.ToString(await actorCmd.ExecuteScalarAsync()) ?? inspectorId.ToString();
+        var inspectorId = GetAuthenticatedInspectorId(context);
+        var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
         var result = await AutoMateApi.BasicSettingCommandSupport.SaveAsync(conn, new(request.TenantId, inspectorId, eventKey, recipientKey, request.Enabled, request.ExpectedVersion, request.IdempotencyKey, actor, context.TraceIdentifier), context.RequestAborted);
         if (result.Status is "conflict" or "idempotency_conflict" or "template_required") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.Enabled,result.SettingVersion,result.AuditId,message=result.Message }, statusCode:409);
         return Results.Ok(new { success=true,status=result.Status,result.Enabled,result.SettingVersion,result.Replayed,result.AuditId,message=result.Message,automaticSendingActive=false });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
     catch (Exception ex) { return Results.Problem(title:"Save Basic setting failed",detail:ex.Message,statusCode:500); }
 });
@@ -3409,7 +3409,7 @@ app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
         var labels = await LoadBasicContactLabelsAsync(conn, tenantId);
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        var inspectorId = GetAuthenticatedInspectorId(context);
         await AutoMateApi.BasicAutomationSupport.SeedSchedulingContactOneAsync(conn, tenantId, inspectorId, labels.Contact1, context.RequestAborted);
         var slot = (await AutoMateApi.BasicAutomationSupport.LoadAsync(conn, tenantId, context.RequestAborted)).FirstOrDefault(item => item.EventKey == eventKey && item.RecipientKey == recipientKey);
         if (slot == null) return Results.BadRequest(new { success = false, message = "Unsupported Basic template slot." });
@@ -3426,6 +3426,7 @@ app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         }
         return Results.Ok(new { success = true, eventKey, recipientKey, recipientLabel, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, recipientLabel), subject = string.IsNullOrWhiteSpace(slot.Subject) ? defaults.Subject : slot.Subject, htmlBody = string.IsNullOrWhiteSpace(slot.HtmlBody) ? defaults.HtmlBody : slot.HtmlBody, hasTemplate = slot.TemplateId.HasValue, templateId, templateVersion, updatedAt, defaultSubject = defaults.Subject, defaultHtmlBody = defaults.HtmlBody });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
     catch (Exception ex) { return Results.Problem(title: "Load Basic template failed", detail: ex.Message, statusCode: 500); }
 });
@@ -3442,15 +3443,14 @@ app.MapPut("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         if (request.Subject.Length > 500 || request.HtmlBody.Length > 250000) return Results.BadRequest(new { success = false, message = "The template exceeds the supported size." });
         if (string.IsNullOrWhiteSpace(request.IdempotencyKey)) return Results.BadRequest(new { success = false, message = "IdempotencyKey is required." });
         var labels = await LoadBasicContactLabelsAsync(conn, request.TenantId); var label = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
-        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(NULLIF(inspector_name,''),inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
-        actorCmd.Parameters.AddWithValue("id", inspectorId); actorCmd.Parameters.AddWithValue("tenant", request.TenantId);
-        var actor = Convert.ToString(await actorCmd.ExecuteScalarAsync()) ?? inspectorId.ToString();
+        var inspectorId = GetAuthenticatedInspectorId(context);
+        var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
         var requestId = string.IsNullOrWhiteSpace(request.RequestId) ? context.TraceIdentifier : request.RequestId.Trim();
         var result = await AutoMateApi.BasicTemplateCommandSupport.SaveAsync(conn, new AutoMateApi.BasicTemplateSaveCommand(request.TenantId, inspectorId, eventKey, recipientKey, label, request.Subject.Trim(), SanitizeBasicTemplateHtml(request.HtmlBody), request.ExpectedVersion, request.IdempotencyKey, actor, requestId), context.RequestAborted);
         if (result.Status is "conflict" or "idempotency_conflict") return Results.Json(new { success=false, status=result.Status, code=result.Status, message=result.Message, templateId=result.TemplateId, templateVersion=result.TemplateVersion, auditId=result.AuditId }, statusCode:409);
         return Results.Ok(new { success = true, status=result.Status, templateId=result.TemplateId, templateVersion=result.TemplateVersion, updatedAt=result.UpdatedAt, auditId=result.AuditId, replayed=result.Replayed, requestId, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, label) });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
     catch (Exception ex) { return Results.Problem(title: "Save Basic template failed", detail: ex.Message, statusCode: 500); }
 });
@@ -3502,13 +3502,14 @@ app.MapPut("/automation/basic/test-jobs/{jobId}", async (HttpContext context, Gu
         await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
         await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        var inspectorId = GetAuthenticatedInspectorId(context);
         var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
         var result = await AutoMateApi.BasicTestExecutionSupport.SetOptInAsync(conn,
             new(request.TenantId, jobId, request.Enabled, request.DisposableConfirmed, request.Confirmed, request.ExpectedVersion, actor), context.RequestAborted);
         if (result.Status is "conflict" or "confirmation_required") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.Enabled,result.Version,message=result.Message }, statusCode:409);
         return Results.Ok(new { success=true,status=result.Status,result.Enabled,result.Version,message=result.Message,automaticSendingActive=false });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (UnauthorizedAccessException) { return Results.NotFound(new { success=false,message="Job not found for this company." }); }
     catch (Exception ex) { return Results.Problem(title:"Save Basic test-job selection failed",detail:ex.Message,statusCode:500); }
 });
@@ -3523,12 +3524,13 @@ app.MapPost("/jobs/{jobId}/automation/basic/queue/prepare", async (HttpContext c
         var job = await LoadScheduleJobAsync(conn, jobId); if (job == null || job.TenantId != request.TenantId) return Results.NotFound(new { success=false,message="Job not found for this company." });
         if (!request.Confirmed) return Results.BadRequest(new { success=false,status="confirmation_required",message="Confirm preparation of this disposable-job test action." });
         var rendered = await RenderBasicEmailAsync(conn, job, "scheduling", request.RecipientKey, null, null);
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var inspectorId = GetAuthenticatedInspectorId(context); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
         var result = await AutoMateApi.BasicTestExecutionSupport.PrepareAsync(conn,
             new(request.TenantId, jobId, request.RevisionKey, request.RecipientKey, rendered.Subject, rendered.HtmlBody, actor), context.RequestAborted);
         if (result.Status is "not_selected" or "slot_disabled" or "template_required" or "recipient_required" or "revision_conflict") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.ActionId,result.State,message=result.Message }, statusCode:409);
         return Results.Ok(new { success=true,status=result.Status,queueId=result.ActionId,state=result.State,result.Replayed,message=result.Message,automaticSendingActive=false });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
     catch (Exception ex) { return Results.Problem(title:"Prepare Basic test action failed",detail:ex.Message,statusCode:500); }
 });
@@ -3553,11 +3555,12 @@ app.MapPost("/jobs/{jobId}/automation/basic/queue/{queueId}/approve", async (Htt
     {
         await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var inspectorId = GetAuthenticatedInspectorId(context); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
         var result = await AutoMateApi.BasicTestExecutionSupport.ApproveAsync(conn, new(request.TenantId, jobId, queueId, request.Confirmed, actor), context.RequestAborted);
         if (result.Status is "confirmation_required" or "invalid_state" or "not_found") return Results.Json(new { success=false,status=result.Status,code=result.Status,message=result.Message }, statusCode:409);
         return Results.Ok(new { success=true,status=result.Status,queueId=result.ActionId,state=result.State,result.Replayed,message=result.Message });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (Exception ex) { return Results.Problem(title:"Approve Basic test action failed",detail:ex.Message,statusCode:500); }
 });
 
@@ -3567,12 +3570,13 @@ app.MapPost("/jobs/{jobId}/automation/basic/queue/{queueId}/complete", async (Ht
     {
         await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
-        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var inspectorId = GetAuthenticatedInspectorId(context); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
         var result = await AutoMateApi.BasicTestExecutionSupport.CompleteAsync(conn,
             new(request.TenantId, jobId, queueId, request.TestRecipientEmail, request.Confirmed, request.Succeeded, request.ProviderMessageId, request.Error, actor), context.RequestAborted);
         if (result.Status is "confirmation_required" or "invalid_state" or "not_found" or "completion_conflict") return Results.Json(new { success=false,status=result.Status,code=result.Status,message=result.Message }, statusCode:409);
         return Results.Ok(new { success=true,status=result.Status,queueId=result.ActionId,state=result.State,result.Replayed,message=result.Message });
     }
+    catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (Exception ex) { return Results.Problem(title:"Complete Basic test action failed",detail:ex.Message,statusCode:500); }
 });
 
@@ -10279,7 +10283,16 @@ static async Task<string> LoadAuthenticatedAutomationActorAsync(NpgsqlConnection
 {
     await using var command = new NpgsqlCommand("SELECT COALESCE(NULLIF(inspector_name,''),inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
     command.Parameters.AddWithValue("id", inspectorId); command.Parameters.AddWithValue("tenant", tenantId);
-    return Convert.ToString(await command.ExecuteScalarAsync()) ?? inspectorId.ToString();
+    var storedActor = Convert.ToString(await command.ExecuteScalarAsync());
+    return AutoMateApi.AutomationActorSupport.Resolve(storedActor, inspectorId);
+}
+
+static Guid GetAuthenticatedInspectorId(HttpContext context)
+{
+    var raw = context.Request.Headers["X-AutoMate-Inspector-ID"].FirstOrDefault();
+    if (!Guid.TryParse(raw, out var inspectorId) || inspectorId == Guid.Empty)
+        throw new AuthenticatedAutomationIdentityException("A valid authenticated AutoMate/THREED user is required.");
+    return inspectorId;
 }
 
 static bool IsSmtpEmailSenderMode(string? mode)
@@ -13048,6 +13061,11 @@ public class JobUploadRequest
     public ContactFlat Contact1 { get; set; } = new ContactFlat();
     public ContactFlat Contact2 { get; set; } = new ContactFlat();
     public MetaSection Meta { get; set; } = new MetaSection();
+}
+
+public sealed class AuthenticatedAutomationIdentityException : Exception
+{
+    public AuthenticatedAutomationIdentityException(string message) : base(message) { }
 }
 
 public sealed class BasicAutomationSettingRequest
