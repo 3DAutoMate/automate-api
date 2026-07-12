@@ -945,13 +945,7 @@ WHERE job_id=@job AND action_type='booking_email' AND status <> 'superseded'", c
     }
     await tx.CommitAsync();
     await JobChangeSupport.AuditAsync(conn, jobId, rowTenant, version, "confirmed", fingerprint, changes, reasons, confirmedBy ?? "Connector user");
-    var basicResults=new List<object>();var changedJob=await LoadScheduleJobAsync(conn,jobId);
-    if(changedJob!=null)
-    {
-        if(categories.Contains("schedule"))basicResults.Add(await ExecuteBasicEmailEventAsync(conn,changedJob,"rescheduling",fingerprint,builder.Configuration));
-        if(categories.Contains("services")||categories.Contains("scope"))basicResults.Add(await ExecuteBasicEmailEventAsync(conn,changedJob,"service_change",fingerprint,builder.Configuration));
-    }
-    return Results.Ok(new { success = true, reasons, queued = new { email, terms, calendar }, basicEmails=basicResults, xeroUnchanged = true });
+    return Results.Ok(new { success = true, reasons, queued = new { email, terms, calendar }, xeroUnchanged = true });
 });
 
 app.MapPost("/jobs/{jobId}/manual-review/{reviewType}/complete", async (Guid jobId, string reviewType, Guid? tenantId, string? completedBy) =>
@@ -977,8 +971,7 @@ xero_review_required=(xero_review_required OR invoice_sent),workflow_updated_at=
     { cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.AddWithValue("missing", sourceMissing); await cmd.ExecuteNonQueryAsync(); }
     await using (var actions = new NpgsqlCommand("UPDATE public.job_workflow_actions SET status='superseded',retry_requested=false,updated_at=NOW() WHERE job_id=@job AND status <> 'sent'", conn))
     { actions.Parameters.AddWithValue("job", jobId); await actions.ExecuteNonQueryAsync(); }
-    var cancellation=await ExecuteBasicEmailEventAsync(conn,job,"cancellation",sourceMissing?"source-missing":"manual-cancel",builder.Configuration);
-    return Results.Ok(new { success = calendar.Success, jobId, unscheduled = true, sourceMissing, calendar, cancellationEmail = cancellation, xeroUnchanged = true, cancelledBy });
+    return Results.Ok(new { success = calendar.Success, jobId, unscheduled = true, sourceMissing, calendar, xeroUnchanged = true, cancelledBy });
 });
 
 app.MapPost("/jobs/{jobId}/confirm-address-change", async (Guid jobId, Guid? tenantId, string? confirmedBy) =>
@@ -3388,21 +3381,6 @@ app.MapGet("/automation/basic", async (HttpContext context, Guid tenantId) =>
     catch (Exception ex) { return Results.Problem(title: "Load Basic Automations failed", detail: ex.Message, statusCode: 500); }
 });
 
-app.MapPut("/automation/basic/settings", async (HttpContext context, BasicAutomationSettingRequest request) =>
-{
-    try
-    {
-        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
-        await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
-        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
-        await AutoMateApi.BasicAutomationSupport.SetEnabledAsync(conn, request.TenantId, request.EventKey, request.RecipientKey, request.Enabled, context.RequestAborted);
-        await AutomationFoundationSupport.AuditAsync(conn, request.TenantId, null, "basic_automation_setting_changed", "", $"{request.EventKey}:{request.RecipientKey}:{request.Enabled}", context.Request.Headers["X-AutoMate-Inspector-ID"].FirstOrDefault() ?? "Connector user");
-        return Results.Ok(new { success = true });
-    }
-    catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
-    catch (Exception ex) { return Results.Problem(title: "Save Basic Automation setting failed", detail: ex.Message, statusCode: 500); }
-});
-
 app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpContext context, string eventKey, string recipientKey, Guid tenantId) =>
 {
     try
@@ -3417,7 +3395,16 @@ app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         if (slot == null) return Results.BadRequest(new { success = false, message = "Unsupported Basic template slot." });
         var recipientLabel = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
         var defaults = BuildDefaultBasicTemplate(eventKey, recipientKey, recipientLabel);
-        return Results.Ok(new { success = true, eventKey, recipientKey, recipientLabel, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, recipientLabel), subject = string.IsNullOrWhiteSpace(slot.Subject) ? defaults.Subject : slot.Subject, htmlBody = string.IsNullOrWhiteSpace(slot.HtmlBody) ? defaults.HtmlBody : slot.HtmlBody, hasTemplate = slot.TemplateId.HasValue, defaultSubject = defaults.Subject, defaultHtmlBody = defaults.HtmlBody });
+        Guid? templateId = null; var templateVersion = 0; DateTimeOffset? updatedAt = null;
+        if (slot.TemplateId.HasValue)
+        {
+            const string metadataSql = "SELECT template_id,template_version,updated_at FROM public.email_templates WHERE tenant_id=@tenant AND template_id=@template AND archived_at IS NULL";
+            await using var metadata = new NpgsqlCommand(metadataSql, conn);
+            metadata.Parameters.AddWithValue("tenant", tenantId); metadata.Parameters.AddWithValue("template", slot.TemplateId.Value);
+            await using var reader = await metadata.ExecuteReaderAsync(context.RequestAborted);
+            if (await reader.ReadAsync(context.RequestAborted)) { templateId = reader.GetGuid(0); templateVersion = reader.GetInt32(1); updatedAt = reader.GetFieldValue<DateTimeOffset>(2); }
+        }
+        return Results.Ok(new { success = true, eventKey, recipientKey, recipientLabel, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, recipientLabel), subject = string.IsNullOrWhiteSpace(slot.Subject) ? defaults.Subject : slot.Subject, htmlBody = string.IsNullOrWhiteSpace(slot.HtmlBody) ? defaults.HtmlBody : slot.HtmlBody, hasTemplate = slot.TemplateId.HasValue, templateId, templateVersion, updatedAt, defaultSubject = defaults.Subject, defaultHtmlBody = defaults.HtmlBody });
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
     catch (Exception ex) { return Results.Problem(title: "Load Basic template failed", detail: ex.Message, statusCode: 500); }
@@ -3428,34 +3415,47 @@ app.MapPut("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
     try
     {
         await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
-        await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn); await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        if (!request.Confirmed) return Results.BadRequest(new { success = false, message = "Template save confirmation is required." });
         if (string.IsNullOrWhiteSpace(request.Subject) || string.IsNullOrWhiteSpace(request.HtmlBody)) return Results.BadRequest(new { success = false, message = "Subject and email body are required." });
+        if (request.Subject.Length > 500 || request.HtmlBody.Length > 250000) return Results.BadRequest(new { success = false, message = "The template exceeds the supported size." });
+        if (string.IsNullOrWhiteSpace(request.IdempotencyKey)) return Results.BadRequest(new { success = false, message = "IdempotencyKey is required." });
         var labels = await LoadBasicContactLabelsAsync(conn, request.TenantId); var label = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
         var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
-        var id = await AutoMateApi.BasicAutomationSupport.SaveTemplateAsync(conn, request.TenantId, inspectorId, eventKey, recipientKey, label, request.Subject.Trim(), CleanEditorHtml(request.HtmlBody), context.RequestAborted);
-        return Results.Ok(new { success = true, templateId = id, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, label) });
+        var actor = string.IsNullOrWhiteSpace(request.ConfirmedBy) ? inspectorId.ToString() : request.ConfirmedBy.Trim();
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId) ? context.TraceIdentifier : request.RequestId.Trim();
+        var result = await AutoMateApi.BasicTemplateCommandSupport.SaveAsync(conn, new AutoMateApi.BasicTemplateSaveCommand(request.TenantId, inspectorId, eventKey, recipientKey, label, request.Subject.Trim(), SanitizeBasicTemplateHtml(request.HtmlBody), request.ExpectedVersion, request.IdempotencyKey, actor, requestId), context.RequestAborted);
+        if (result.Status is "conflict" or "idempotency_conflict") return Results.Json(new { success=false, status=result.Status, code=result.Status, message=result.Message, templateId=result.TemplateId, templateVersion=result.TemplateVersion, auditId=result.AuditId }, statusCode:409);
+        return Results.Ok(new { success = true, status=result.Status, templateId=result.TemplateId, templateVersion=result.TemplateVersion, updatedAt=result.UpdatedAt, auditId=result.AuditId, replayed=result.Replayed, requestId, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, label) });
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
     catch (Exception ex) { return Results.Problem(title: "Save Basic template failed", detail: ex.Message, statusCode: 500); }
 });
 
-app.MapGet("/automation/basic/pending", async (HttpContext context, Guid tenantId) =>
+app.MapGet("/automation/basic/audit", async (HttpContext context, Guid tenantId, Guid? templateId, int? limit) =>
 {
     try
     {
         await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
-        await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
-        const string sql = @"SELECT e.job_id,e.revision_key,e.event_key,e.recipient_key
-FROM public.basic_automation_executions e JOIN public.jobs_staging j ON j.job_id=e.job_id
-WHERE e.tenant_id=@tenant AND e.state='claimed' AND NOT j.change_review_pending AND (NOT j.unscheduled OR e.event_key='cancellation')
-ORDER BY e.claimed_at LIMIT 100";
-        var rows = new List<object>(); await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("tenant", tenantId);
-        await using var reader = await cmd.ExecuteReaderAsync(); while (await reader.ReadAsync()) rows.Add(new { jobId=reader.GetGuid(0), revisionKey=reader.GetString(1), eventKey=reader.GetString(2), recipientKey=reader.GetString(3) });
-        return Results.Ok(rows);
+        var items = await AutoMateApi.BasicTemplateCommandSupport.LoadTemplateAuditAsync(conn, tenantId, templateId, Math.Clamp(limit ?? 100, 1, 250), context.RequestAborted);
+        return Results.Ok(new { success=true, items });
     }
-    catch (Exception ex) { return Results.Problem(title:"Load pending Basic emails failed",detail:ex.Message,statusCode:500); }
+    catch (Exception ex) { return Results.Problem(title:"Load Basic template audit failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapGet("/jobs/{jobId}/audit", async (HttpContext context, Guid jobId, Guid tenantId, int? limit) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        if (!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn, tenantId, jobId)) return Results.NotFound(new { success=false,message="Job not found for this company." });
+        var items = await AutoMateApi.BasicTemplateCommandSupport.LoadJobAuditAsync(conn, tenantId, jobId, Math.Clamp(limit ?? 150, 1, 300), context.RequestAborted);
+        return Results.Ok(new { success=true, jobId, items });
+    }
+    catch (Exception ex) { return Results.Problem(title:"Load job audit failed",detail:ex.Message,statusCode:500); }
 });
 
 app.MapPost("/jobs/{jobId}/automation/basic-render", async (HttpContext context, Guid jobId, BasicAutomationRenderRequest request) =>
@@ -3471,21 +3471,6 @@ app.MapPost("/jobs/{jobId}/automation/basic-render", async (HttpContext context,
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
     catch (Exception ex) { return Results.Problem(title:"Render Basic email failed",detail:ex.Message,statusCode:500); }
-});
-
-app.MapPost("/jobs/{jobId}/automation/basic-complete", async (HttpContext context, Guid jobId, BasicAutomationCompleteRequest request) =>
-{
-    try
-    {
-        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
-        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
-        var state = request.Success ? AutoMateApi.BasicExecutionState.Sent : AutoMateApi.BasicExecutionState.Failed;
-        await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,request.TenantId,jobId,request.RevisionKey,request.EventKey,request.RecipientKey,state,"",request.Error,context.RequestAborted);
-        if (!request.Success) await SetBasicEmailAttentionAsync(conn,jobId,request.EventKey,request.RecipientKey,request.Error);
-        if (request.Success && request.EventKey=="scheduling" && !await HasIncompleteBasicEventAsync(conn,request.TenantId,jobId,request.RevisionKey,"scheduling")) await MarkBookingEmailSentAsync(conn,jobId);
-        return Results.Ok(new { success=true });
-    }
-    catch (Exception ex) { return Results.Problem(title:"Complete Basic email failed",detail:ex.Message,statusCode:500); }
 });
 
 app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
@@ -7126,6 +7111,7 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await EnsureAdvancedActionsTablesAsync(startupMigrationConnection);
     await AutomationFoundationSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicAutomationSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(startupMigrationConnection);
     await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
 
@@ -8271,42 +8257,58 @@ static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
 {
     if (job.BookingEmailSent)
         return ScheduleActionResult.Skip("booking-email", "Booking email was already marked sent.");
-    return await ExecuteBasicEmailEventAsync(conn,job,"scheduling","initial",configuration);
-}
 
-static async Task<ScheduleActionResult> ExecuteBasicEmailEventAsync(NpgsqlConnection conn,ScheduleJobInput job,string eventKey,string revisionKey,IConfiguration configuration)
-{
-    await EnsureEmailTemplatesTableAsync(conn);await AutomationFoundationSupport.EnsureAsync(conn);await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
-    var activationMode=await AutomationFoundationSupport.GetActivationModeAsync(conn,job.TenantId);
-    if(await AutomationFoundationSupport.JobUsesAdvancedAsync(conn,job.TenantId,job.JobId,activationMode))return ScheduleActionResult.Skip("booking-email","This job is assigned to Advanced Workflows; Basic email execution was skipped.");
-    var labels=await LoadBasicContactLabelsAsync(conn,job.TenantId);await AutoMateApi.BasicAutomationSupport.SeedSchedulingContactOneAsync(conn,job.TenantId,job.InspectorId,labels.Contact1);
-    var enabled=(await AutoMateApi.BasicAutomationSupport.LoadAsync(conn,job.TenantId)).Where(slot=>slot.EventKey==eventKey&&slot.Enabled).ToArray();
-    if(enabled.Length==0)return ScheduleActionResult.Skip("booking-email",$"No {eventKey} Basic emails are enabled.");
-    IntegrationAccountResult? account=null;HttpClient? http=null;var sent=new List<string>();var queued=new List<string>();var skipped=new List<string>();
-    try
+    if (string.IsNullOrWhiteSpace(job.ClientEmail))
     {
-        if(!IsSmtpEmailSenderMode(job.EmailSenderMode))
-        {
-            account=await GetMicrosoftMailAccountAsync(conn,job.InspectorId,configuration);if(!account.Success)return ScheduleActionResult.Failed("booking-email",account.ErrorMessage??"Microsoft email is not connected.");
-            http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);
-        }
-        foreach(var slot in enabled)
-        {
-            if(!await AutoMateApi.BasicAutomationSupport.TryClaimExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey))continue;
-            var rendered=await RenderBasicEmailAsync(conn,job,eventKey,slot.RecipientKey);
-            if(string.IsNullOrWhiteSpace(rendered.ToEmail))
-            {
-                var error=$"{rendered.RecipientLabel} is missing or has no email address.";await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey,AutoMateApi.BasicExecutionState.Skipped,"",error);await SetBasicEmailAttentionAsync(conn,job.JobId,eventKey,slot.RecipientKey,error);skipped.Add(rendered.RecipientLabel);continue;
-            }
-            if(IsSmtpEmailSenderMode(job.EmailSenderMode)){queued.Add(rendered.RecipientLabel);continue;}
-            var response=await SendMicrosoftMailAsync(http!,rendered.ToEmail,rendered.Subject,rendered.HtmlBody);
-            if(!response.Success){await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey,AutoMateApi.BasicExecutionState.Failed,"",response.Message);await SetBasicEmailAttentionAsync(conn,job.JobId,eventKey,slot.RecipientKey,response.Message);continue;}
-            await AutoMateApi.BasicAutomationSupport.CompleteExecutionAsync(conn,job.TenantId,job.JobId,revisionKey,eventKey,slot.RecipientKey,AutoMateApi.BasicExecutionState.Sent);sent.Add(rendered.RecipientLabel);
-        }
-        if(eventKey=="scheduling"&&queued.Count==0)await MarkBookingEmailSentAsync(conn,job.JobId);
-        return ScheduleActionResult.Ok("booking-email",$"Basic {eventKey}: {sent.Count} sent, {queued.Count} queued, {skipped.Count} skipped.",new{sent,queued,skipped});
+        await MarkBookingEmailFailedAsync(conn, job.JobId, "Client email is missing.");
+        return ScheduleActionResult.Failed("booking-email", "Client email is missing.");
     }
-    finally{http?.Dispose();}
+
+    var services = GetSchedulableServices(job).ToArray();
+    if (services.Length == 0)
+        return ScheduleActionResult.Skip("booking-email", "No schedulable services were found.");
+
+    if (IsSmtpEmailSenderMode(job.EmailSenderMode))
+    {
+        return ScheduleActionResult.Skip(
+            "booking-email",
+            "Booking email is pending for local SMTP sending in the desktop connector.",
+            new
+            {
+                senderMode = job.EmailSenderMode,
+                provider = GetEmailSenderModeLabel(job.EmailSenderMode),
+                pending = services.Select(service => service.Label).ToArray()
+            });
+    }
+
+    var account = await GetMicrosoftMailAccountAsync(conn, job.InspectorId, configuration);
+    if (!account.Success)
+    {
+        await MarkBookingEmailFailedAsync(conn, job.JobId, account.ErrorMessage ?? "Microsoft email is not connected.");
+        return ScheduleActionResult.Failed("booking-email", account.ErrorMessage ?? "Microsoft email is not connected.");
+    }
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+
+    var sent = new List<string>();
+    foreach (var service in services)
+    {
+        var subject = $"Booking confirmation - {service.Label}";
+        var body = BuildScheduleBookingEmailHtml(job, service);
+        var response = await SendMicrosoftMailAsync(httpClient, job.ClientEmail, subject, body);
+        if (!response.Success)
+        {
+            await MarkBookingEmailFailedAsync(conn, job.JobId, response.Message);
+            return ScheduleActionResult.Failed("booking-email", response.Message, new { sent });
+        }
+
+        await MarkWorkflowActionSentAsync(conn, job.JobId, BuildBookingActionKey(service.ServiceKey, service.Label));
+        sent.Add(service.Label);
+    }
+
+    await MarkBookingEmailSentAsync(conn, job.JobId);
+    return ScheduleActionResult.Ok("booking-email", $"Sent {sent.Count} booking email(s).", new { sent });
 }
 
 static IEnumerable<ScheduleServiceInput> GetSchedulableServices(ScheduleJobInput job)
@@ -10476,18 +10478,6 @@ static async Task<RenderedBasicEmail> RenderBasicEmailAsync(NpgsqlConnection con
     return new RenderedBasicEmail(recipientKey=="contact_2"?job.AgentEmail:job.ClientEmail,RenderTemplateTokens(subjectTemplate,fields,false),RenderTemplateTokens(CleanEditorHtml(htmlTemplate),fields,true),label);
 }
 
-static async Task SetBasicEmailAttentionAsync(NpgsqlConnection conn,Guid jobId,string eventKey,string recipientKey,string? error)
-{
-    var message=$"{eventKey} / {recipientKey}: {error}";
-    await using var cmd=new NpgsqlCommand("UPDATE public.jobs_staging SET booking_email_last_error=@error,workflow_updated_at=NOW() WHERE job_id=@job",conn);cmd.Parameters.AddWithValue("job",jobId);cmd.Parameters.AddWithValue("error",message);await cmd.ExecuteNonQueryAsync();
-}
-
-static async Task<bool> HasIncompleteBasicEventAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,string revisionKey,string eventKey)
-{
-    await using var cmd=new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.basic_automation_executions WHERE tenant_id=@tenant AND job_id=@job AND revision_key=@revision AND event_key=@event AND state IN ('claimed','failed'))",conn);
-    cmd.Parameters.AddWithValue("tenant",tenantId);cmd.Parameters.AddWithValue("job",jobId);cmd.Parameters.AddWithValue("revision",revisionKey);cmd.Parameters.AddWithValue("event",eventKey);return Convert.ToBoolean(await cmd.ExecuteScalarAsync());
-}
-
 static ScheduleServiceInput ResolveTemplateService(ScheduleJobInput job, string serviceTypeKey)
 {
     var services = GetSchedulableServices(job).ToArray();
@@ -12050,6 +12040,17 @@ static string CleanEditorHtml(string? html)
         RegexOptions.IgnoreCase);
 }
 
+static string SanitizeBasicTemplateHtml(string? html)
+{
+    var clean = CleanEditorHtml(html);
+    clean = Regex.Replace(clean, @"<(script|iframe|object|embed|form|style|meta|link|base)\b[^>]*>.*?</\1\s*>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    clean = Regex.Replace(clean, @"<(script|iframe|object|embed|form|style|meta|link|base)\b[^>]*/?>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    clean = Regex.Replace(clean, """\s+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", "", RegexOptions.IgnoreCase);
+    clean = Regex.Replace(clean, "(href|src)\\s*=\\s*\"\\s*(?:javascript:|data:text/html)[^\"]*\"", "$1=\"#\"", RegexOptions.IgnoreCase);
+    clean = Regex.Replace(clean, """(href|src)\s*=\s*'\s*(?:javascript:|data:text/html)[^']*'""", "$1=\"#\"", RegexOptions.IgnoreCase);
+    return clean;
+}
+
 static string RenderTestEmailBody(
     string htmlBody,
     string? companyName,
@@ -12949,6 +12950,11 @@ public class BasicAutomationTemplateRequest
     public Guid TenantId { get; set; }
     public string Subject { get; set; } = "";
     public string HtmlBody { get; set; } = "";
+    public int ExpectedVersion { get; set; }
+    public string IdempotencyKey { get; set; } = "";
+    public string ConfirmedBy { get; set; } = "";
+    public string RequestId { get; set; } = "";
+    public bool Confirmed { get; set; }
 }
 
 public sealed class BasicAutomationRenderRequest : BasicAutomationTemplateRequest
