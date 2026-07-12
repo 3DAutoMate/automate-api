@@ -33,8 +33,9 @@ public static class BasicSettingCommandSupport
                 await using var existing = new NpgsqlCommand("SELECT request_hash,result_status,COALESCE(result_json::text,'') FROM public.automation_command_idempotency WHERE tenant_id=@tenant AND command_type=@type AND idempotency_key=@key FOR UPDATE", connection, transaction);
                 existing.Parameters.AddWithValue("tenant", request.TenantId); existing.Parameters.AddWithValue("type", CommandType); existing.Parameters.AddWithValue("key", request.IdempotencyKey);
                 await using var reader = await existing.ExecuteReaderAsync(cancellationToken); await reader.ReadAsync(cancellationToken);
-                if (reader.GetString(0) != hash) { await transaction.CommitAsync(cancellationToken); return new("idempotency_conflict", false, 0, false, null, "The idempotency key was already used for different content."); }
-                var json = reader.GetString(2); if (!string.IsNullOrWhiteSpace(json)) { var replay = JsonSerializer.Deserialize<BasicSettingSaveResult>(json)! with { Replayed = true }; await transaction.CommitAsync(cancellationToken); return replay; }
+                var existingHash = reader.GetString(0); var json = reader.GetString(2); await reader.DisposeAsync();
+                if (existingHash != hash) { await transaction.CommitAsync(cancellationToken); return new("idempotency_conflict", false, 0, false, null, "The idempotency key was already used for different content."); }
+                if (!string.IsNullOrWhiteSpace(json)) { var replay = JsonSerializer.Deserialize<BasicSettingSaveResult>(json)! with { Replayed = true }; await transaction.CommitAsync(cancellationToken); return replay; }
                 throw new InvalidOperationException("The same setting command is already being processed.");
             }
         }
