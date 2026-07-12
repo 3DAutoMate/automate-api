@@ -3755,6 +3755,98 @@ app.MapPost("/jobs/{jobId}/automation/basic/queue/{queueId}/complete", async (Ht
     catch (Exception ex) { return Results.Problem(title:"Complete Basic test action failed",detail:ex.Message,statusCode:500); }
 });
 
+app.MapGet("/jobs/{jobId}/automation/basic/production", async (HttpContext context, Guid jobId, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var status=await AutoMateApi.BasicProductionSchedulingSupport.LoadStatusAsync(conn,tenantId,jobId,context.RequestAborted);
+        var latest=status.Actions.FirstOrDefault();
+        return Results.Ok(new{success=true,jobId,armed=status.Armed,armVersion=status.ArmVersion,approvedRevision=status.ApprovedVersion.ToString(),approvedFingerprint=status.ApprovedFingerprint,
+            recipientAvailable=status.RecipientAvailable,recipientName=status.RecipientName,recipientEmail=status.RecipientEmail,templateEnabled=status.SlotEnabled,templateSaved=status.TemplateSaved,
+            bookingEmailState=status.BookingEmailSent?"completed":status.BookingEmailRequired?"pending":"not_required",changeReviewPending=status.ChangeReviewPending,unscheduled=status.Unscheduled,
+            action=latest==null?null:new{actionId=latest.ActionId,jobId,approvedRevision=latest.ApprovedVersion.ToString(),recipientKey="contact_1",latest.RecipientName,latest.RecipientEmail,
+                latest.RenderedSubject,latest.TemplateVersion,state=latest.State,createdAt=latest.PreparedAt,claimedAt=latest.ClaimedAt,completedAt=latest.CompletedAt,error=latest.CompletionError}});
+    }
+    catch(UnauthorizedAccessException){return Results.NotFound(new{success=false,message="Job or Basic entitlement was not found."});}
+    catch(Exception ex){return Results.Problem(title:"Load production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/jobs/{jobId}/automation/basic/production/arm", async (HttpContext context, Guid jobId, BasicProductionArmRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var result=await AutoMateApi.BasicProductionSchedulingSupport.SetArmAsync(conn,new(request.TenantId,jobId,request.Armed,request.DisposableConfirmed,request.Confirmed,request.ExpectedVersion,actor),context.RequestAborted);
+        if(result.Status is "confirmation_required" or "conflict")return Results.Json(new{success=false,status=result.Status,message=result.Message,armed=result.Armed,armVersion=result.Version},statusCode:409);
+        return Results.Ok(new{success=true,status=result.Status,armed=result.Armed,armVersion=result.Version,message=result.Message});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Arm production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/production/prepare", async (HttpContext context, Guid jobId, BasicProductionCommandRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound();
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var rendered=await RenderBasicEmailAsync(conn,job,"scheduling","contact_1",null,null);
+        var result=await AutoMateApi.BasicProductionSchedulingSupport.PrepareAsync(conn,new(request.TenantId,jobId,rendered.Subject,rendered.HtmlBody,request.Confirmed,actor),context.RequestAborted);
+        if(result.ActionId==null||result.Status is not ("prepared" or "replayed"))return Results.Json(new{success=false,status=result.Status,message=result.Message,actionId=result.ActionId,state=result.State},statusCode:409);
+        return Results.Ok(new{success=true,status=result.Status,actionId=result.ActionId,state=result.State,replayed=result.Replayed,message=result.Message});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Prepare production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/approve", async (HttpContext context, Guid jobId, Guid actionId, BasicProductionCommandRequest request) =>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var result=await AutoMateApi.BasicProductionSchedulingSupport.ApproveAsync(conn,new(request.TenantId,jobId,actionId,request.Confirmed,actor),context.RequestAborted);return result.State=="approved"?Results.Ok(new{success=true,status=result.Status,actionId,state=result.State,message=result.Message}):Results.Json(new{success=false,status=result.Status,message=result.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Approve production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/claim", async (HttpContext context, Guid jobId, Guid actionId, BasicProductionCommandRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var claim=await AutoMateApi.BasicProductionSchedulingSupport.ClaimForDeliveryAsync(conn,new(request.TenantId,jobId,actionId,request.Confirmed,actor),context.RequestAborted);
+        if(claim.Status!="claimed")return Results.Json(new{success=false,status=claim.Status,message=claim.Message,state=claim.State},statusCode:409);
+        var html=claim.HtmlBody;Guid? communicationId=null;
+        try
+        {
+            var settings=await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn,request.TenantId,context.RequestAborted);
+            if((settings.PageEnabled||settings.PixelEnabled)&&!string.IsNullOrWhiteSpace(clientTokenPepper))
+            {
+                var publication=await AutoMateApi.ClientEngagementSupport.PublishApprovedSnapshotAsync(conn,new(request.TenantId,jobId,actor),context.RequestAborted);
+                var job=await LoadScheduleJobAsync(conn,jobId);var expiry=(job?.JobDate??DateTime.UtcNow).ToUniversalTime().AddDays(90);
+                var token=AutoMateApi.ClientEngagementSupport.CreateToken("inspection_page",clientTokenPepper);
+                var issued=await AutoMateApi.ClientEngagementSupport.IssueCommunicationAsync(conn,new(request.TenantId,jobId,publication.PublicationId,"contact_1",claim.ToEmail,"inspection_page",$"basic-production|{actionId:N}|v{publication.ApprovedVersion}",token.Secret,expiry,claim.Subject,false,false,actor),clientTokenPepper,context.RequestAborted);
+                if(issued.RawToken==null)throw new InvalidOperationException("The engagement token was already issued; delivery will not be retried.");
+                communicationId=issued.CommunicationId;var url=$"{publicBaseUrl}/inspection/{Uri.EscapeDataString(issued.RawToken)}";html+=BuildClientEngagementFooter(url,settings.PageEnabled,settings.PixelEnabled);
+            }
+        }
+        catch(Exception)
+        {
+            await AutoMateApi.BasicProductionSchedulingSupport.CompleteAsync(conn,new(request.TenantId,jobId,actionId,true,"unknown",null,"Engagement preparation failed after the one-time claim; manual reconciliation required.",actor),context.RequestAborted);
+            return Results.Json(new{success=false,status="reconciliation_required",message="Email preparation became uncertain after the one-time claim. It will not retry automatically."},statusCode:409);
+        }
+        return Results.Ok(new{success=true,status="claimed",actionId,state="sending",toEmail=claim.ToEmail,subject=claim.Subject,htmlBody=html,communicationId,message=claim.Message});
+    }
+    catch(Exception ex){return Results.Problem(title:"Claim production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/complete", async (HttpContext context, Guid jobId, Guid actionId, BasicProductionCompleteRequest request) =>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var result=await AutoMateApi.BasicProductionSchedulingSupport.CompleteAsync(conn,new(request.TenantId,jobId,actionId,request.Confirmed,request.Outcome,request.ProviderMessageId,request.Error,actor),context.RequestAborted);return result.Status is "smtp_accepted" or "failed" or "reconciliation_required"?Results.Ok(new{success=true,status=result.Status,actionId,state=result.State,message=result.Message}):Results.Json(new{success=false,status=result.Status,message=result.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Complete production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
+});
+
 app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
 {
     try
@@ -7460,6 +7552,7 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.BasicProductionSchedulingSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.ClientEngagementSupport.EnsureAsync(startupMigrationConnection);
     await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
@@ -13409,6 +13502,28 @@ public sealed class BasicAutomationRenderRequest : BasicAutomationTemplateReques
 {
     public string EventKey { get; set; } = "";
     public string RecipientKey { get; set; } = "";
+}
+
+public sealed class BasicProductionArmRequest
+{
+    public Guid TenantId { get; set; }
+    public bool Armed { get; set; }
+    public bool DisposableConfirmed { get; set; }
+    public bool Confirmed { get; set; }
+    public int ExpectedVersion { get; set; }
+}
+
+public class BasicProductionCommandRequest
+{
+    public Guid TenantId { get; set; }
+    public bool Confirmed { get; set; }
+}
+
+public sealed class BasicProductionCompleteRequest : BasicProductionCommandRequest
+{
+    public string Outcome { get; set; } = "";
+    public string ProviderMessageId { get; set; } = "";
+    public string Error { get; set; } = "";
 }
 
 public sealed class BasicTestJobSelectionRequest
