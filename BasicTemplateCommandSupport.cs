@@ -189,10 +189,10 @@ public static class BasicTemplateCommandSupport
         limit = Math.Clamp(limit, 1, 500);
         var entries = new List<JobAuditEntry>();
 
-        await AddJobChangeAuditAsync(connection, tenantId, jobId, entries, cancellationToken);
-        await AddAddressAuditAsync(connection, tenantId, jobId, entries, cancellationToken);
-        await AddPropertyAuditAsync(connection, tenantId, jobId, entries, cancellationToken);
-        await AddAutomationAuditAsync(connection, tenantId, jobId, entries, cancellationToken);
+        await AddJobChangeAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
+        await AddAddressAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
+        await AddPropertyAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
+        await AddAutomationAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
         return entries.OrderByDescending(x => x.CreatedAt).Take(limit).ToArray();
     }
 
@@ -387,61 +387,62 @@ public static class BasicTemplateCommandSupport
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task AddJobChangeAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId,
+    private static async Task AddJobChangeAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId, int sourceLimit,
         List<JobAuditEntry> target, CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "job_change_audit", cancellationToken)) return;
         const string sql = """
-            SELECT event_type,COALESCE(actor,''),COALESCE(reasons,''),created_at
-            FROM public.job_change_audit WHERE job_id=@job AND tenant_id=@tenant;
+            SELECT audit_id::text,event_type,COALESCE(actor,''),COALESCE(reasons,''),created_at,COALESCE(snapshot_fingerprint,''),approved_version
+            FROM public.job_change_audit WHERE job_id=@job AND tenant_id=@tenant ORDER BY created_at DESC LIMIT @source_limit;
             """;
-        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, "Job change", target, cancellationToken);
+        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, sourceLimit, "Job change", target, cancellationToken);
     }
 
-    private static async Task AddAddressAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId,
+    private static async Task AddAddressAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId, int sourceLimit,
         List<JobAuditEntry> target, CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "address_change_audit", cancellationToken)) return;
         const string sql = """
-            SELECT 'Address changed',COALESCE(confirmed_by,''),
-                   CONCAT(COALESCE(previous_address,''),' -> ',COALESCE(new_address,'')),created_at
-            FROM public.address_change_audit WHERE job_id=@job AND tenant_id=@tenant;
+            SELECT audit_id::text,'Address changed',COALESCE(confirmed_by,''),
+                   CONCAT(COALESCE(previous_address,''),' -> ',COALESCE(new_address,'')),created_at,'',0
+            FROM public.address_change_audit WHERE job_id=@job AND tenant_id=@tenant ORDER BY created_at DESC LIMIT @source_limit;
             """;
-        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, "Address", target, cancellationToken);
+        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, sourceLimit, "Address", target, cancellationToken);
     }
 
-    private static async Task AddPropertyAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId,
+    private static async Task AddPropertyAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId, int sourceLimit,
         List<JobAuditEntry> target, CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "online_property_lookup_audit", cancellationToken)) return;
         const string sql = """
-            SELECT CONCAT(source,' lookup'),'',CONCAT(outcome,CASE WHEN COALESCE(error,'')='' THEN '' ELSE ': '||error END),created_at
-            FROM public.online_property_lookup_audit WHERE job_id=@job AND tenant_id=@tenant;
+            SELECT audit_id::text,CONCAT(source,' lookup'),'',CONCAT(outcome,CASE WHEN COALESCE(error,'')='' THEN '' ELSE ': '||error END),created_at,COALESCE(address_fingerprint,''),0
+            FROM public.online_property_lookup_audit WHERE job_id=@job AND tenant_id=@tenant ORDER BY created_at DESC LIMIT @source_limit;
             """;
-        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, "Online property", target, cancellationToken);
+        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, sourceLimit, "Online property", target, cancellationToken);
     }
 
-    private static async Task AddAutomationAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId,
+    private static async Task AddAutomationAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId, int sourceLimit,
         List<JobAuditEntry> target, CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "automation_foundation_audit", cancellationToken)) return;
         const string sql = """
-            SELECT action_key,COALESCE(changed_by,''),CONCAT(COALESCE(previous_value,''),' -> ',COALESCE(new_value,'')),created_at
-            FROM public.automation_foundation_audit WHERE job_id=@job AND tenant_id=@tenant;
+            SELECT audit_id::text,action_key,COALESCE(changed_by,''),CONCAT(COALESCE(previous_value,''),' -> ',COALESCE(new_value,'')),created_at,'',0
+            FROM public.automation_foundation_audit WHERE job_id=@job AND tenant_id=@tenant ORDER BY created_at DESC LIMIT @source_limit;
             """;
-        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, "Automation", target, cancellationToken);
+        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, sourceLimit, "Automation", target, cancellationToken);
     }
 
     private static async Task ReadJobEntriesAsync(NpgsqlConnection connection, string sql, Guid tenantId,
-        Guid jobId, string source, List<JobAuditEntry> target, CancellationToken cancellationToken)
+        Guid jobId, int sourceLimit, string source, List<JobAuditEntry> target, CancellationToken cancellationToken)
     {
         await using var command = new NpgsqlCommand(sql, connection);
         command.Parameters.AddWithValue("tenant", tenantId);
         command.Parameters.AddWithValue("job", jobId);
+        command.Parameters.AddWithValue("source_limit", sourceLimit);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
-            target.Add(new(source, reader.GetString(0), reader.GetString(1), reader.GetString(2),
-                reader.GetFieldValue<DateTimeOffset>(3)));
+            target.Add(new(reader.GetString(0), source, reader.GetString(1), reader.GetString(2), reader.GetString(3),
+                reader.GetFieldValue<DateTimeOffset>(4), reader.GetString(5), reader.GetInt32(6)));
     }
 
     private static async Task<bool> TableExistsAsync(NpgsqlConnection connection, string table,
@@ -494,4 +495,4 @@ public sealed record TemplateAuditEntry(
     int NewVersion, string[] ChangedFields, string Actor, string RequestId, string IdempotencyKey,
     string Outcome, DateTimeOffset CreatedAt);
 
-public sealed record JobAuditEntry(string Source, string Action, string Actor, string Outcome, DateTimeOffset CreatedAt);
+public sealed record JobAuditEntry(string SourceId, string Source, string Action, string Actor, string Outcome, DateTimeOffset CreatedAt, string SnapshotFingerprint, int ApprovedVersion);

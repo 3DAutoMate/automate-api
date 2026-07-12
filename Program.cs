@@ -929,6 +929,7 @@ calendar_created=CASE WHEN @calendar AND calendar_required THEN false ELSE calen
 calendar_retry_requested=CASE WHEN @calendar AND calendar_required THEN true ELSE calendar_retry_requested END,
 approved_snapshot_json=CAST(@snapshot AS jsonb),approved_snapshot_fingerprint=@fingerprint,approved_snapshot_version=@version,
 change_review_pending=false,pending_change_json=NULL,pending_change_fingerprint=NULL,pending_change_reasons=NULL,
+change_detected_at=NULL,xero_review_change_owned=false,report_review_change_owned=false,
 change_template_setup_required=(change_template_setup_required OR @template_setup),
 change_confirmed_at=NOW(),change_confirmed_by=@actor,address_change_pending=false,workflow_updated_at=NOW()
 WHERE job_id=@job", conn, tx))
@@ -950,10 +951,10 @@ WHERE job_id=@job AND action_type='booking_email' AND status <> 'superseded'", c
 
 app.MapPost("/jobs/{jobId}/manual-review/{reviewType}/complete", async (Guid jobId, string reviewType, Guid? tenantId, string? completedBy) =>
 {
-    string column = reviewType.Trim().ToLowerInvariant() switch { "xero" => "xero_review_required", "report" => "report_review_required", "template" => "change_template_setup_required", _ => "" };
-    if (column.Length == 0) return Results.BadRequest(new { success = false, message = "reviewType must be xero, report or template." });
+    string assignments = reviewType.Trim().ToLowerInvariant() switch { "xero" => "xero_review_required=false,xero_review_change_owned=false", "report" => "report_review_required=false,report_review_change_owned=false", "template" => "change_template_setup_required=false", _ => "" };
+    if (assignments.Length == 0) return Results.BadRequest(new { success = false, message = "reviewType must be xero, report or template." });
     await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
-    await using var cmd = new NpgsqlCommand($"UPDATE public.jobs_staging SET {column}=false WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn);
+    await using var cmd = new NpgsqlCommand($"UPDATE public.jobs_staging SET {assignments} WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn);
     cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value;
     int rows = await cmd.ExecuteNonQueryAsync(); return rows == 0 ? Results.NotFound() : Results.Ok(new { success = true, reviewType, completedBy });
 });
@@ -3375,10 +3376,29 @@ app.MapGet("/automation/basic", async (HttpContext context, Guid tenantId) =>
         {
             success = true,
             contactLabels = new { contact1Name = labels.Contact1, contact2Name = labels.Contact2 },
-            settings = slots.Select(slot => new { slot.EventKey, slot.RecipientKey, slot.Enabled, hasTemplate = slot.TemplateId.HasValue, slot.TemplateName, slot.UpdatedAt })
+            settings = slots.Select(slot => new { slot.EventKey, slot.RecipientKey, slot.Enabled, slot.SettingVersion, hasTemplate = slot.TemplateId.HasValue, slot.TemplateName, slot.UpdatedAt })
         });
     }
     catch (Exception ex) { return Results.Problem(title: "Load Basic Automations failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapPut("/automation/basic/settings/{eventKey}/{recipientKey}", async (HttpContext context, string eventKey, string recipientKey, BasicAutomationSettingRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn); await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        if (!request.Confirmed) return Results.BadRequest(new { success=false,status="confirmation_required",message="Confirm the Basic setting change." });
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(inspector_name,email,inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
+        actorCmd.Parameters.AddWithValue("id", inspectorId); actorCmd.Parameters.AddWithValue("tenant", request.TenantId); var actor = Convert.ToString(await actorCmd.ExecuteScalarAsync()) ?? inspectorId.ToString();
+        var result = await AutoMateApi.BasicSettingCommandSupport.SaveAsync(conn, new(request.TenantId, inspectorId, eventKey, recipientKey, request.Enabled, request.ExpectedVersion, request.IdempotencyKey, actor, context.TraceIdentifier), context.RequestAborted);
+        if (result.Status is "conflict" or "idempotency_conflict" or "template_required") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.Enabled,result.SettingVersion,result.AuditId,message=result.Message }, statusCode:409);
+        return Results.Ok(new { success=true,status=result.Status,result.Enabled,result.SettingVersion,result.Replayed,result.AuditId,message=result.Message,automaticSendingActive=false });
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
+    catch (Exception ex) { return Results.Problem(title:"Save Basic setting failed",detail:ex.Message,statusCode:500); }
 });
 
 app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpContext context, string eventKey, string recipientKey, Guid tenantId) =>
@@ -3423,7 +3443,9 @@ app.MapPut("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         if (string.IsNullOrWhiteSpace(request.IdempotencyKey)) return Results.BadRequest(new { success = false, message = "IdempotencyKey is required." });
         var labels = await LoadBasicContactLabelsAsync(conn, request.TenantId); var label = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
         var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
-        var actor = string.IsNullOrWhiteSpace(request.ConfirmedBy) ? inspectorId.ToString() : request.ConfirmedBy.Trim();
+        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(inspector_name,email,inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
+        actorCmd.Parameters.AddWithValue("id", inspectorId); actorCmd.Parameters.AddWithValue("tenant", request.TenantId);
+        var actor = Convert.ToString(await actorCmd.ExecuteScalarAsync()) ?? inspectorId.ToString();
         var requestId = string.IsNullOrWhiteSpace(request.RequestId) ? context.TraceIdentifier : request.RequestId.Trim();
         var result = await AutoMateApi.BasicTemplateCommandSupport.SaveAsync(conn, new AutoMateApi.BasicTemplateSaveCommand(request.TenantId, inspectorId, eventKey, recipientKey, label, request.Subject.Trim(), SanitizeBasicTemplateHtml(request.HtmlBody), request.ExpectedVersion, request.IdempotencyKey, actor, requestId), context.RequestAborted);
         if (result.Status is "conflict" or "idempotency_conflict") return Results.Json(new { success=false, status=result.Status, code=result.Status, message=result.Message, templateId=result.TemplateId, templateVersion=result.TemplateVersion, auditId=result.AuditId }, statusCode:409);
@@ -7112,6 +7134,7 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await AutomationFoundationSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicAutomationSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(startupMigrationConnection);
     await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
 
@@ -12043,8 +12066,9 @@ static string CleanEditorHtml(string? html)
 static string SanitizeBasicTemplateHtml(string? html)
 {
     var clean = CleanEditorHtml(html);
-    clean = Regex.Replace(clean, @"<(script|iframe|object|embed|form|style|meta|link|base)\b[^>]*>.*?</\1\s*>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-    clean = Regex.Replace(clean, @"<(script|iframe|object|embed|form|style|meta|link|base)\b[^>]*/?>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    clean = Regex.Replace(clean, @"<(script|iframe|object|embed|form|meta|link|base)\b[^>]*>.*?</\1\s*>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    clean = Regex.Replace(clean, @"<(script|iframe|object|embed|form|meta|link|base)\b[^>]*/?>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    clean = Regex.Replace(clean, """(?is)@import\s+[^;]+;|expression\s*\([^)]*\)|behavior\s*:[^;]+;|url\s*\(\s*['"]?\s*(?:javascript:|data:text/html)[^)]*\)""", "");
     clean = Regex.Replace(clean, """\s+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", "", RegexOptions.IgnoreCase);
     clean = Regex.Replace(clean, "(href|src)\\s*=\\s*\"\\s*(?:javascript:|data:text/html)[^\"]*\"", "$1=\"#\"", RegexOptions.IgnoreCase);
     clean = Regex.Replace(clean, """(href|src)\s*=\s*'\s*(?:javascript:|data:text/html)[^']*'""", "$1=\"#\"", RegexOptions.IgnoreCase);
@@ -12943,6 +12967,9 @@ public sealed class BasicAutomationSettingRequest
     public string EventKey { get; set; } = "";
     public string RecipientKey { get; set; } = "";
     public bool Enabled { get; set; }
+    public int ExpectedVersion { get; set; }
+    public string IdempotencyKey { get; set; } = "";
+    public bool Confirmed { get; set; }
 }
 
 public class BasicAutomationTemplateRequest
@@ -12952,7 +12979,6 @@ public class BasicAutomationTemplateRequest
     public string HtmlBody { get; set; } = "";
     public int ExpectedVersion { get; set; }
     public string IdempotencyKey { get; set; } = "";
-    public string ConfirmedBy { get; set; } = "";
     public string RequestId { get; set; } = "";
     public bool Confirmed { get; set; }
 }

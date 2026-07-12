@@ -56,6 +56,7 @@ public static class BasicAutomationSupport
                 template_id uuid NULL,
                 created_at timestamptz NOT NULL DEFAULT NOW(),
                 updated_at timestamptz NOT NULL DEFAULT NOW(),
+                setting_version integer NOT NULL DEFAULT 1,
                 PRIMARY KEY (tenant_id, event_key, recipient_key),
                 CONSTRAINT ck_basic_automation_event
                     CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change')),
@@ -134,7 +135,7 @@ public static class BasicAutomationSupport
         const string sql = """
             SELECT s.event_key,s.recipient_key,s.enabled,s.template_id,
                    COALESCE(t.name,''),COALESCE(t.subject,''),COALESCE(t.html_body,''),
-                   t.updated_at
+                   t.updated_at,s.setting_version
             FROM public.basic_automation_settings s
             LEFT JOIN public.email_templates t
               ON t.template_id=s.template_id AND t.tenant_id=s.tenant_id AND t.archived_at IS NULL
@@ -152,7 +153,7 @@ public static class BasicAutomationSupport
                 reader.GetString(0), reader.GetString(1), reader.GetBoolean(2),
                 reader.IsDBNull(3) ? null : reader.GetGuid(3), reader.GetString(4),
                 reader.GetString(5), reader.GetString(6),
-                reader.IsDBNull(7) ? null : reader.GetDateTime(7)));
+                reader.IsDBNull(7) ? null : reader.GetDateTime(7), reader.GetInt32(8)));
         }
         return results;
     }
@@ -337,7 +338,7 @@ public static class BasicAutomationSupport
 
 public sealed record BasicAutomationSlot(
     string EventKey, string RecipientKey, bool Enabled, Guid? TemplateId,
-    string TemplateName, string Subject, string HtmlBody, DateTime? UpdatedAt);
+    string TemplateName, string Subject, string HtmlBody, DateTime? UpdatedAt, int SettingVersion);
 
 public enum BasicExecutionState
 {
