@@ -3391,7 +3391,7 @@ app.MapPut("/automation/basic/settings/{eventKey}/{recipientKey}", async (HttpCo
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
         if (!request.Confirmed) return Results.BadRequest(new { success=false,status="confirmation_required",message="Confirm the Basic setting change." });
         var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
-        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(inspector_name,email,inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
+        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(NULLIF(inspector_name,''),inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
         actorCmd.Parameters.AddWithValue("id", inspectorId); actorCmd.Parameters.AddWithValue("tenant", request.TenantId); var actor = Convert.ToString(await actorCmd.ExecuteScalarAsync()) ?? inspectorId.ToString();
         var result = await AutoMateApi.BasicSettingCommandSupport.SaveAsync(conn, new(request.TenantId, inspectorId, eventKey, recipientKey, request.Enabled, request.ExpectedVersion, request.IdempotencyKey, actor, context.TraceIdentifier), context.RequestAborted);
         if (result.Status is "conflict" or "idempotency_conflict" or "template_required") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.Enabled,result.SettingVersion,result.AuditId,message=result.Message }, statusCode:409);
@@ -3443,7 +3443,7 @@ app.MapPut("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         if (string.IsNullOrWhiteSpace(request.IdempotencyKey)) return Results.BadRequest(new { success = false, message = "IdempotencyKey is required." });
         var labels = await LoadBasicContactLabelsAsync(conn, request.TenantId); var label = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
         var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
-        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(inspector_name,email,inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
+        await using var actorCmd = new NpgsqlCommand("SELECT COALESCE(NULLIF(inspector_name,''),inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
         actorCmd.Parameters.AddWithValue("id", inspectorId); actorCmd.Parameters.AddWithValue("tenant", request.TenantId);
         var actor = Convert.ToString(await actorCmd.ExecuteScalarAsync()) ?? inspectorId.ToString();
         var requestId = string.IsNullOrWhiteSpace(request.RequestId) ? context.TraceIdentifier : request.RequestId.Trim();
