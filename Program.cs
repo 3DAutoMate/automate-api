@@ -8,6 +8,8 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using Npgsql;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
@@ -21,6 +23,19 @@ builder.Services.AddCors(options =>
             .AllowAnyHeader()
             .AllowAnyMethod();
     });
+});
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("public-inspection", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 });
 
 // Use Railway DATABASE_PUBLIC_URL if available, otherwise use local fallback for testing
@@ -82,7 +97,11 @@ var V1MappingFields = new List<V1MappingField>
 
 var app = builder.Build();
 app.UseCors("LocalTemplateMaker");
+app.UseRateLimiter();
 const string FoundersTrialAccessCode = "PILOT";
+var clientTokenPepper = builder.Configuration["AUTOMATE_CLIENT_PAGE_TOKEN_KEY"] ?? "";
+var publicBaseUrl = (builder.Configuration["AUTOMATE_PUBLIC_BASE_URL"] ?? "https://automate-api-production.up.railway.app").TrimEnd('/');
+var TransparentGif = Convert.FromBase64String("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==");
 
 // =============================
 // ROOT
@@ -151,6 +170,144 @@ app.MapPost("/accounts/ensure-tables", async () =>
             statusCode: 500
         );
     }
+});
+
+// =============================
+// CLIENT INSPECTION PAGE / EMAIL ENGAGEMENT
+// =============================
+app.MapGet("/inspection/{token}", async (HttpContext context, string token) =>
+{
+    if (string.IsNullOrWhiteSpace(clientTokenPepper)) return Results.Problem(statusCode: 503, title: "Inspection page unavailable");
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var access = await AutoMateApi.ClientEngagementSupport.ResolveAsync(conn, token, "inspection_page", clientTokenPepper, context.RequestAborted);
+        if (access == null) return Results.Content(ExpiredClientPageHtml(), "text/html", Encoding.UTF8, 404);
+        await AutoMateApi.ClientEngagementSupport.RecordViewAsync(conn, EngagementCommand(context, access, "view", EngagementEventKey(context, "view")), clientTokenPepper, context.RequestAborted);
+        var display = await LoadClientInspectionDisplayAsync(conn, access, context.RequestAborted);
+        return Results.Content(AutoMateApi.ClientInspectionPageRenderer.Render(access, display, token), "text/html", Encoding.UTF8);
+    }
+    catch { return Results.Content(ExpiredClientPageHtml(), "text/html", Encoding.UTF8, 404); }
+}).RequireRateLimiting("public-inspection");
+
+app.MapGet("/inspection/{token}/pixel.gif", async (HttpContext context, string token) =>
+{
+    try
+    {
+        if (!string.IsNullOrWhiteSpace(clientTokenPepper))
+        {
+            await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+            var access = await AutoMateApi.ClientEngagementSupport.ResolveForPixelAsync(conn, token, "inspection_page", clientTokenPepper, context.RequestAborted);
+            if (access != null) await AutoMateApi.ClientEngagementSupport.RecordPixelAsync(conn, EngagementCommand(context, access, "pixel", EngagementEventKey(context, "pixel")), clientTokenPepper, context.RequestAborted);
+        }
+    }
+    catch { }
+    finally { context.Response.Headers.CacheControl = "no-store, private"; }
+    return Results.Bytes(TransparentGif, "image/gif");
+}).RequireRateLimiting("public-inspection");
+
+app.MapPost("/inspection/{token}/confirm", async (HttpContext context, string token) =>
+{
+    if (string.IsNullOrWhiteSpace(clientTokenPepper)) return Results.NotFound();
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var access = await AutoMateApi.ClientEngagementSupport.ResolveAsync(conn, token, "inspection_page", clientTokenPepper, context.RequestAborted);
+        if (access == null) return Results.NotFound();
+        var result = await AutoMateApi.ClientEngagementSupport.RecordConfirmAsync(conn, EngagementCommand(context, access, "confirm", "confirmed"), clientTokenPepper, context.RequestAborted);
+        return Results.Ok(new { success=true,status="confirmed",confirmedAt=result.OccurredAt,replayed=result.Replayed });
+    }
+    catch { return Results.NotFound(); }
+}).RequireRateLimiting("public-inspection");
+
+app.MapGet("/inspection/{token}/calendar.ics", async (HttpContext context, string token) =>
+{
+    if (string.IsNullOrWhiteSpace(clientTokenPepper)) return Results.NotFound();
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var access = await AutoMateApi.ClientEngagementSupport.ResolveAsync(conn, token, "inspection_page", clientTokenPepper, context.RequestAborted);
+        if (access == null) return Results.NotFound();
+        await AutoMateApi.ClientEngagementSupport.RecordCalendarAsync(conn, EngagementCommand(context, access, "calendar", "ics"), clientTokenPepper, context.RequestAborted);
+        var display = await LoadClientInspectionDisplayAsync(conn, access, context.RequestAborted);
+        context.Response.Headers.ContentDisposition = "attachment; filename=inspection.ics";
+        return Results.Text(AutoMateApi.ClientInspectionPageRenderer.Calendar(access, display), "text/calendar", Encoding.UTF8);
+    }
+    catch { return Results.NotFound(); }
+}).RequireRateLimiting("public-inspection");
+
+app.MapGet("/automation/engagement/settings", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId); if(!owner.Allowed)return owner.Error!;
+        var settings=await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn,tenantId,context.RequestAborted);
+        return Results.Ok(new { success=true,openTrackingEnabled=settings.PixelEnabled,clientPageEnabled=settings.PageEnabled,expiresAfterDays=90,settings.Version,settings.UpdatedAt });
+    }
+    catch(Exception ex){return Results.Problem(title:"Load engagement settings failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/engagement/settings", async (HttpContext context, ClientEngagementSettingsRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
+        var result=await AutoMateApi.ClientEngagementSupport.SaveSettingsAsync(conn,new(request.TenantId,request.ClientPageEnabled,request.OpenTrackingEnabled,request.ExpectedVersion,request.IdempotencyKey,request.Confirmed,actor),context.RequestAborted);
+        if(result.Status is "conflict" or "idempotency_conflict" or "confirmation_required")return Results.Json(new{success=false,status=result.Status,message=result.Message,settings=result.Settings},statusCode:409);
+        return Results.Ok(new{success=true,status=result.Status,message=result.Message,settings=result.Settings,expiresAfterDays=90});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Save engagement settings failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/{jobId}/communications", async (HttpContext context, Guid jobId, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        if(!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn,tenantId,jobId))return Results.NotFound();
+        var items=await AutoMateApi.ClientEngagementSupport.LoadCommunicationsAsync(conn,tenantId,jobId,context.RequestAborted);
+        return Results.Ok(new{success=true,jobId,items});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load job communications failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/communications", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        await AutoMateApi.ClientEngagementSupport.EnsureAsync(conn,context.RequestAborted);
+        const string sql=@"SELECT c.communication_id,c.job_id,c.delivery_state,c.issued_at,c.provider,c.redacted_error,c.confirmed_at,
+COUNT(e.event_id) FILTER(WHERE e.event_type='pixel') AS pixel_count,MAX(e.occurred_at) FILTER(WHERE e.event_type='pixel') AS last_pixel,
+COUNT(e.event_id) FILTER(WHERE e.event_type='view') AS view_count,MAX(e.occurred_at) FILTER(WHERE e.event_type='view') AS last_view
+FROM public.email_communications c LEFT JOIN public.email_engagement_events e ON e.communication_id=c.communication_id
+WHERE c.tenant_id=@tenant GROUP BY c.communication_id,c.job_id,c.delivery_state,c.issued_at,c.provider,c.redacted_error,c.confirmed_at
+ORDER BY c.issued_at DESC LIMIT 200";
+        await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("tenant",tenantId);await using var reader=await cmd.ExecuteReaderAsync(context.RequestAborted);var items=new List<object>();
+        while(await reader.ReadAsync(context.RequestAborted))items.Add(new{communicationId=reader.GetGuid(0),jobId=reader.GetGuid(1),deliveryState=reader.GetString(2),issuedAt=reader.GetDateTime(3),provider=reader.GetString(4),error=reader.GetString(5),confirmedAt=reader.IsDBNull(6)?null:(DateTime?)reader.GetDateTime(6),possibleOpenCount=reader.GetInt64(7),lastPossibleOpenAt=reader.IsDBNull(8)?null:(DateTime?)reader.GetDateTime(8),viewCount=reader.GetInt64(9),lastViewAt=reader.IsDBNull(10)?null:(DateTime?)reader.GetDateTime(10)});
+        return Results.Ok(new{success=true,items});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load communications failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/client-page/revoke", async (HttpContext context, Guid jobId, RevokeClientPageRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(!request.Confirmed)return Results.BadRequest(new{success=false,status="confirmation_required",message="Confirm client-page revocation."});
+        var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
+        var count=await AutoMateApi.ClientEngagementSupport.RevokeJobAsync(conn,new(request.TenantId,jobId,string.IsNullOrWhiteSpace(request.Reason)?"revoked by tenant":request.Reason,actor),context.RequestAborted);
+        return Results.Ok(new{success=true,jobId,revoked=count});
+    }
+    catch(Exception ex){return Results.Problem(title:"Revoke client page failed",detail:ex.Message,statusCode:500);}
 });
 
 app.MapPost("/accounts/register-trial", async (TrialRegistrationRequest request) =>
@@ -3620,6 +3777,51 @@ app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
     }
 });
 
+app.MapPost("/jobs/{jobId}/communications/client-email/prepare", async (HttpContext context, Guid jobId, PrepareClientEmailRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        await EnsureJobPaymentColumnsAsync(conn);await EnsureInspectorsTableAsync(conn);await EnsureEmailTemplatesTableAsync(conn);await AutoMateApi.ClientEngagementSupport.EnsureAsync(conn);
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound(new{success=false,message="Job not found for this company."});
+        if(!string.Equals(request.RecipientKey,"contact_1",StringComparison.Ordinal))return Results.BadRequest(new{success=false,status="client_only",message="Client engagement is available only for THREED Contact 1."});
+        var rendered=await RenderBookingEmailTemplateAsync(conn,jobId,new EmailTemplateRenderRequest{ServiceTypeKey=request.ServiceTypeKey,ToEmail=job.ClientEmail,ActionKey=request.ActionKey},false);
+        if(rendered==null)return Results.NotFound();
+        var settings=await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn,request.TenantId,context.RequestAborted);
+        if(!settings.PageEnabled&&!settings.PixelEnabled)return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,communicationId=(Guid?)null});
+        if(string.IsNullOrWhiteSpace(clientTokenPepper))return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,engagementWarning="Client engagement is not configured on the server.",communicationId=(Guid?)null});
+        var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
+        AutoMateApi.ClientPagePublicationResult publication;
+        try{publication=await AutoMateApi.ClientEngagementSupport.PublishApprovedSnapshotAsync(conn,new(request.TenantId,jobId,actor),context.RequestAborted);}
+        catch(InvalidOperationException ex){return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,engagementWarning=ex.Message,communicationId=(Guid?)null});}
+        var expiry=(job.JobDate??DateTime.UtcNow).ToUniversalTime().AddDays(90);if(expiry<=DateTime.UtcNow)return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,engagementWarning="The inspection-page expiry has already passed.",communicationId=(Guid?)null});
+        var token=AutoMateApi.ClientEngagementSupport.CreateToken("inspection_page",clientTokenPepper);
+        var idempotency=$"{request.EventKey}|{rendered.ActionKey}|v{publication.ApprovedVersion}";
+        AutoMateApi.ClientCommunicationIssueResult issued;
+        try{issued=await AutoMateApi.ClientEngagementSupport.IssueCommunicationAsync(conn,new(request.TenantId,jobId,publication.PublicationId,"contact_1",job.ClientEmail,"inspection_page",idempotency,token.Secret,expiry,rendered.Subject,request.IsTest,request.IsPreview,actor),clientTokenPepper,context.RequestAborted);}
+        catch(InvalidOperationException ex) when(ex.Message.Contains("idempotency",StringComparison.OrdinalIgnoreCase)){return Results.Conflict(new{success=false,status="delivery_already_prepared",message="This email delivery was already prepared and will not be sent again automatically."});}
+        if(issued.RawToken==null)return Results.Conflict(new{success=false,status="delivery_already_prepared",message="This email delivery was already prepared and will not be sent again automatically."});
+        var url=$"{publicBaseUrl}/inspection/{Uri.EscapeDataString(issued.RawToken)}";
+        var footer=BuildClientEngagementFooter(url,settings.PageEnabled,settings.PixelEnabled);
+        return Results.Ok(new{success=true,rendered.Subject,HtmlBody=rendered.HtmlBody+footer,rendered.ToEmail,rendered.ActionKey,trackingApplied=true,settings.PageEnabled,settings.PixelEnabled,communicationId=issued.CommunicationId,expiresAt=issued.ExpiresAt});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Prepare tracked Client email failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/communications/{communicationId}/delivery", async (HttpContext context, Guid jobId, Guid communicationId, ClientDeliveryRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
+        var result=await AutoMateApi.ClientEngagementSupport.MarkDeliveryAsync(conn,new(request.TenantId,jobId,communicationId,request.Accepted,request.Provider,request.ConnectorVersion,request.Error,actor),context.RequestAborted);
+        if(result.Status=="conflict")return Results.Conflict(new{success=false,status=result.Status,message=result.Message});return Results.Ok(new{success=true,status=result.Status,state=result.DeliveryState,replayed=result.Replayed});
+    }
+    catch(Exception ex){return Results.Problem(title:"Record Client email delivery failed",detail:ex.Message,statusCode:500);}
+});
+
 app.MapPost("/jobs/{jobId}/email-templates/booking-email/preview", async (Guid jobId, EmailTemplateRenderRequest request) =>
 {
     try
@@ -3708,6 +3910,15 @@ app.MapPost("/jobs/{jobId}/email-templates/booking-email/send", async (Guid jobI
 
         if (string.IsNullOrWhiteSpace(rendered.ToEmail))
             return Results.BadRequest(new { success = false, message = "Recipient email is required." });
+
+        if (builder.Configuration.GetValue("AUTOMATE_SMTP_ONLY", true))
+            return Results.BadRequest(new
+            {
+                success = false,
+                message = "AutoMate email is SMTP-only. Send from the desktop connector so the company's SMTP credentials remain local.",
+                senderMode = "customer-smtp",
+                provider = "Customer SMTP"
+            });
 
         if (IsSmtpEmailSenderMode(rendered.EmailSenderMode))
         {
@@ -7221,10 +7432,44 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.ClientEngagementSupport.EnsureAsync(startupMigrationConnection);
     await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
 
 app.Run();
+
+static AutoMateApi.ClientEngagementCommand EngagementCommand(HttpContext context, AutoMateApi.ClientPageAccess access, string eventType, string eventKey) =>
+    new(access.CommunicationId,access.TenantId,access.JobId,eventType,eventKey,
+        context.Connection.RemoteIpAddress?.ToString(),context.Request.Headers.UserAgent.ToString(),context.Request.Headers.Referer.ToString(),"{}");
+
+static string EngagementEventKey(HttpContext context,string type)
+{
+    var bucket=DateTime.UtcNow.ToString("yyyyMMddHHmm");
+    var agent=context.Request.Headers.UserAgent.ToString();
+    var family=agent.Contains("GoogleImageProxy",StringComparison.OrdinalIgnoreCase)?"google-proxy":agent.Contains("Apple",StringComparison.OrdinalIgnoreCase)?"apple":agent.Contains("bot",StringComparison.OrdinalIgnoreCase)||agent.Contains("scanner",StringComparison.OrdinalIgnoreCase)?"scanner":"client";
+    return $"{type}:{bucket}:{family}";
+}
+
+static string BuildClientEngagementFooter(string url,bool pageEnabled,bool pixelEnabled)
+{
+    var safe=WebUtility.HtmlEncode(url);
+    var button=pageEnabled?$"<div style=\"margin:24px 0;text-align:center\"><a href=\"{safe}\" style=\"display:inline-block;background:#0b5f86;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-family:Segoe UI,Arial,sans-serif;font-weight:700\">View Inspection Details</a></div>":"";
+    var pixel=pixelEnabled?$"<img src=\"{safe}/pixel.gif\" width=\"1\" height=\"1\" alt=\"\" style=\"display:block;width:1px;height:1px;border:0;opacity:0\">":"";
+    return $"<!-- AutoMate client engagement -->{button}{pixel}";
+}
+
+static string ExpiredClientPageHtml()=>"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex,nofollow\"><title>Inspection page unavailable</title></head><body style=\"margin:0;background:#f5f7f9;color:#17212b;font:16px/1.5 Segoe UI,Arial,sans-serif\"><main style=\"max-width:620px;margin:12vh auto;padding:32px\"><div style=\"background:white;border:1px solid #dfe5e9;border-radius:14px;padding:32px\"><h1>Inspection page unavailable</h1><p>This secure link has expired, was replaced, or is no longer available. Contact your inspection company for assistance.</p></div></main></body></html>";
+
+static async Task<AutoMateApi.ClientInspectionDisplay> LoadClientInspectionDisplayAsync(NpgsqlConnection conn,AutoMateApi.ClientPageAccess access,CancellationToken cancellationToken)
+{
+    const string sql=@"SELECT COALESCE((SELECT i2.company_name FROM public.inspectors i2 WHERE i2.tenant_id::text=j.tenant_id::text ORDER BY i2.created_at LIMIT 1),''),
+COALESCE(NULLIF(j.inspector_name,''),i.email_from_name,''),COALESCE(NULLIF(j.inspector_phone,''),i.phone,''),COALESCE(NULLIF(j.inspector_email,''),i.email_from_address,''),
+COALESCE(j.contact1_display_name,''),COALESCE(j.amount_paid,0),j.terms_required,j.terms_signed,COALESCE(j.signnow_signing_link,''),COALESCE(j.unscheduled,false)
+FROM public.jobs_staging j LEFT JOIN public.inspectors i ON i.inspector_id=j.inspector_id WHERE j.job_id=@job AND j.tenant_id::text=@tenant LIMIT 1";
+    await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("job",access.JobId);cmd.Parameters.AddWithValue("tenant",access.TenantId.ToString());
+    await using var reader=await cmd.ExecuteReaderAsync(cancellationToken);if(!await reader.ReadAsync(cancellationToken))throw new UnauthorizedAccessException();
+    return new(reader.GetString(0),"","",reader.GetString(1),reader.GetString(2),reader.GetString(3),reader.GetString(4),reader.GetDecimal(5),reader.GetBoolean(6),reader.GetBoolean(7),reader.GetString(8),reader.GetBoolean(9));
+}
 
 static async Task<(bool Allowed, IResult? Error)> RequireAutomationOwnerAsync(HttpContext context, NpgsqlConnection conn, Guid tenantId)
 {
@@ -13077,6 +13322,44 @@ public sealed class BasicAutomationSettingRequest
     public int ExpectedVersion { get; set; }
     public string IdempotencyKey { get; set; } = "";
     public bool Confirmed { get; set; }
+}
+
+public sealed class ClientEngagementSettingsRequest
+{
+    public Guid TenantId { get; set; }
+    public bool OpenTrackingEnabled { get; set; }
+    public bool ClientPageEnabled { get; set; }
+    public int ExpectedVersion { get; set; }
+    public string IdempotencyKey { get; set; } = "";
+    public bool Confirmed { get; set; }
+}
+
+public sealed class RevokeClientPageRequest
+{
+    public Guid TenantId { get; set; }
+    public string Reason { get; set; } = "";
+    public bool Confirmed { get; set; }
+}
+
+public sealed class PrepareClientEmailRequest
+{
+    public Guid TenantId { get; set; }
+    public string RecipientKey { get; set; } = "contact_1";
+    public string EventKey { get; set; } = "scheduling";
+    public string ServiceTypeKey { get; set; } = "";
+    public string ActionKey { get; set; } = "";
+    public string ConnectorVersion { get; set; } = "";
+    public bool IsTest { get; set; }
+    public bool IsPreview { get; set; }
+}
+
+public sealed class ClientDeliveryRequest
+{
+    public Guid TenantId { get; set; }
+    public bool Accepted { get; set; }
+    public string Provider { get; set; } = "";
+    public string ConnectorVersion { get; set; } = "";
+    public string Error { get; set; } = "";
 }
 
 public class BasicAutomationTemplateRequest
