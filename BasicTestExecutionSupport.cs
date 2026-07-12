@@ -277,6 +277,7 @@ public static class BasicTestExecutionSupport
                 var existingId = reader.GetGuid(0);
                 var existingState = reader.GetString(1);
                 var existingFingerprint = reader.GetString(2);
+                await reader.DisposeAsync();
                 await transaction.CommitAsync(cancellationToken);
                 return existingFingerprint == fingerprint
                     ? new("replayed", existingId, existingState, true, "The same inert test action already exists.")
