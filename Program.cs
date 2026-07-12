@@ -3786,7 +3786,16 @@ app.MapPost("/jobs/{jobId}/communications/client-email/prepare", async (HttpCont
         var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
         var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound(new{success=false,message="Job not found for this company."});
         if(!string.Equals(request.RecipientKey,"contact_1",StringComparison.Ordinal))return Results.BadRequest(new{success=false,status="client_only",message="Client engagement is available only for THREED Contact 1."});
-        var rendered=await RenderBookingEmailTemplateAsync(conn,jobId,new EmailTemplateRenderRequest{ServiceTypeKey=request.ServiceTypeKey,ToEmail=job.ClientEmail,ActionKey=request.ActionKey},false);
+        var controlledTest=request.ControlledClientPageTest;
+        var deliveryAddress=job.ClientEmail;
+        if(controlledTest)
+        {
+            if(!request.Confirmed)return Results.BadRequest(new{success=false,status="confirmation_required",message="Confirm the controlled client-page test."});
+            try{deliveryAddress=new System.Net.Mail.MailAddress(request.DeliveryAddressOverride).Address;}catch{return Results.BadRequest(new{success=false,status="invalid_test_recipient",message="Enter a valid tester-owned email address."});}
+            if(string.Equals(deliveryAddress,job.ClientEmail,StringComparison.OrdinalIgnoreCase))return Results.BadRequest(new{success=false,status="customer_recipient_forbidden",message="The tester address must differ from the THREED Client email."});
+            if(string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.BadRequest(new{success=false,status="idempotency_required",message="A test idempotency key is required."});
+        }
+        var rendered=await RenderBookingEmailTemplateAsync(conn,jobId,new EmailTemplateRenderRequest{ServiceTypeKey=request.ServiceTypeKey,ToEmail=deliveryAddress,ActionKey=request.ActionKey},false);
         if(rendered==null)return Results.NotFound();
         var settings=await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn,request.TenantId,context.RequestAborted);
         if(!settings.PageEnabled&&!settings.PixelEnabled)return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,communicationId=(Guid?)null});
@@ -3797,14 +3806,15 @@ app.MapPost("/jobs/{jobId}/communications/client-email/prepare", async (HttpCont
         catch(InvalidOperationException ex){return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,engagementWarning=ex.Message,communicationId=(Guid?)null});}
         var expiry=(job.JobDate??DateTime.UtcNow).ToUniversalTime().AddDays(90);if(expiry<=DateTime.UtcNow)return Results.Ok(new{success=true,rendered.Subject,rendered.HtmlBody,rendered.ToEmail,rendered.ActionKey,trackingApplied=false,engagementWarning="The inspection-page expiry has already passed.",communicationId=(Guid?)null});
         var token=AutoMateApi.ClientEngagementSupport.CreateToken("inspection_page",clientTokenPepper);
-        var idempotency=$"{request.EventKey}|{rendered.ActionKey}|v{publication.ApprovedVersion}";
+        var idempotency=controlledTest?$"client-page-test|{request.IdempotencyKey.Trim()}|v{publication.ApprovedVersion}":$"{request.EventKey}|{rendered.ActionKey}|v{publication.ApprovedVersion}";
         AutoMateApi.ClientCommunicationIssueResult issued;
-        try{issued=await AutoMateApi.ClientEngagementSupport.IssueCommunicationAsync(conn,new(request.TenantId,jobId,publication.PublicationId,"contact_1",job.ClientEmail,"inspection_page",idempotency,token.Secret,expiry,rendered.Subject,request.IsTest,request.IsPreview,actor),clientTokenPepper,context.RequestAborted);}
+        try{issued=await AutoMateApi.ClientEngagementSupport.IssueCommunicationAsync(conn,new(request.TenantId,jobId,publication.PublicationId,"contact_1",deliveryAddress,"inspection_page",idempotency,token.Secret,expiry,rendered.Subject,false,request.IsPreview,actor),clientTokenPepper,context.RequestAborted);}
         catch(InvalidOperationException ex) when(ex.Message.Contains("idempotency",StringComparison.OrdinalIgnoreCase)){return Results.Conflict(new{success=false,status="delivery_already_prepared",message="This email delivery was already prepared and will not be sent again automatically."});}
         if(issued.RawToken==null)return Results.Conflict(new{success=false,status="delivery_already_prepared",message="This email delivery was already prepared and will not be sent again automatically."});
         var url=$"{publicBaseUrl}/inspection/{Uri.EscapeDataString(issued.RawToken)}";
         var footer=BuildClientEngagementFooter(url,settings.PageEnabled,settings.PixelEnabled);
-        return Results.Ok(new{success=true,rendered.Subject,HtmlBody=rendered.HtmlBody+footer,rendered.ToEmail,rendered.ActionKey,trackingApplied=true,settings.PageEnabled,settings.PixelEnabled,communicationId=issued.CommunicationId,expiresAt=issued.ExpiresAt});
+        var subject=controlledTest?"[CLIENT PAGE TEST] "+rendered.Subject:rendered.Subject;
+        return Results.Ok(new{success=true,Subject=subject,HtmlBody=rendered.HtmlBody+footer,ToEmail=deliveryAddress,rendered.ActionKey,trackingApplied=true,controlledClientPageTest=controlledTest,settings.PageEnabled,settings.PixelEnabled,communicationId=issued.CommunicationId,expiresAt=issued.ExpiresAt});
     }
     catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
     catch(Exception ex){return Results.Problem(title:"Prepare tracked Client email failed",detail:ex.Message,statusCode:500);}
@@ -13351,6 +13361,10 @@ public sealed class PrepareClientEmailRequest
     public string ConnectorVersion { get; set; } = "";
     public bool IsTest { get; set; }
     public bool IsPreview { get; set; }
+    public bool ControlledClientPageTest { get; set; }
+    public string DeliveryAddressOverride { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
+    public bool Confirmed { get; set; }
 }
 
 public sealed class ClientDeliveryRequest
