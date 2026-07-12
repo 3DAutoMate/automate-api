@@ -248,6 +248,24 @@ app.MapGet("/automation/engagement/settings", async (HttpContext context, Guid t
     catch(Exception ex){return Results.Problem(title:"Load engagement settings failed",detail:ex.Message,statusCode:500);}
 });
 
+app.MapGet("/jobs/{jobId}/client-page/preview", async (HttpContext context, Guid jobId, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        const string sql=@"SELECT approved_snapshot_version,COALESCE(approved_snapshot_fingerprint,''),COALESCE(approved_snapshot_json::text,'') FROM public.jobs_staging WHERE job_id=@job AND tenant_id::text=@tenant LIMIT 1";
+        await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("job",jobId);cmd.Parameters.AddWithValue("tenant",tenantId.ToString());
+        await using var reader=await cmd.ExecuteReaderAsync(context.RequestAborted);if(!await reader.ReadAsync(context.RequestAborted))return Results.NotFound(new{success=false,message="Job not found for this company."});
+        var version=reader.GetInt32(0);var fingerprint=reader.GetString(1);var snapshot=reader.GetString(2);await reader.DisposeAsync();
+        if(version<1||string.IsNullOrWhiteSpace(fingerprint)||string.IsNullOrWhiteSpace(snapshot))return Results.Conflict(new{success=false,status="approved_snapshot_required",message="No approved client snapshot is available for this job."});
+        var access=new AutoMateApi.ClientPageAccess(jobId,Guid.Empty,tenantId,jobId,"contact_1",DateTime.UtcNow.AddDays(1),version,fingerprint,snapshot);
+        var display=await LoadClientInspectionDisplayAsync(conn,access,context.RequestAborted);
+        return Results.Ok(new{success=true,jobId,approvedVersion=version,html=AutoMateApi.ClientInspectionPageRenderer.RenderPreview(access,display),recordsEngagement=false});
+    }
+    catch(Exception ex){return Results.Problem(title:"Preview client page failed",detail:ex.Message,statusCode:500);}
+});
+
 app.MapPut("/automation/engagement/settings", async (HttpContext context, ClientEngagementSettingsRequest request) =>
 {
     try

@@ -12,6 +12,16 @@ public sealed record ClientInspectionDisplay(
 
 public static class ClientInspectionPageRenderer
 {
+    public static string RenderPreview(ClientPageAccess access, ClientInspectionDisplay display)
+    {
+        var html = Render(access, display, "preview");
+        html = html.Replace("<body><main class=\"shell\">", "<body><main class=\"shell\"><section class=\"card\" style=\"border:2px solid #d49328;background:#fff7e8\"><strong>Preview — not the live client link</strong><p style=\"margin-bottom:0\">This shows the approved customer-facing snapshot. Preview actions are disabled and no engagement is recorded.</p></section>");
+        html = html.Replace("<button id=\"confirm\" class=\"button primary\">Confirm received</button>", "<button class=\"button primary\" disabled>Confirm received</button>");
+        html = html.Replace("<a class=\"button\" href=\"/inspection/preview/calendar.ics\">Add to calendar</a>", "<button class=\"button\" disabled>Add to calendar</button>");
+        html = System.Text.RegularExpressions.Regex.Replace(html, "<script>.*?</script>", "", System.Text.RegularExpressions.RegexOptions.Singleline);
+        return html;
+    }
+
     public static string Render(ClientPageAccess access, ClientInspectionDisplay display, string rawToken)
     {
         using var document = JsonDocument.Parse(access.SnapshotJson);
