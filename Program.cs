@@ -3495,6 +3495,87 @@ app.MapPost("/jobs/{jobId}/automation/basic-render", async (HttpContext context,
     catch (Exception ex) { return Results.Problem(title:"Render Basic email failed",detail:ex.Message,statusCode:500); }
 });
 
+app.MapPut("/automation/basic/test-jobs/{jobId}", async (HttpContext context, Guid jobId, BasicTestJobSelectionRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await AutomationFoundationSupport.EnsureAsync(conn); await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!);
+        var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var result = await AutoMateApi.BasicTestExecutionSupport.SetOptInAsync(conn,
+            new(request.TenantId, jobId, request.Enabled, request.DisposableConfirmed, request.Confirmed, request.ExpectedVersion, actor), context.RequestAborted);
+        if (result.Status is "conflict" or "confirmation_required") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.Enabled,result.Version,message=result.Message }, statusCode:409);
+        return Results.Ok(new { success=true,status=result.Status,result.Enabled,result.Version,message=result.Message,automaticSendingActive=false });
+    }
+    catch (UnauthorizedAccessException) { return Results.NotFound(new { success=false,message="Job not found for this company." }); }
+    catch (Exception ex) { return Results.Problem(title:"Save Basic test-job selection failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/queue/prepare", async (HttpContext context, Guid jobId, BasicTestPrepareRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        await EnsureJobInvoiceLinesTableAsync(conn); await EnsureEmailTemplatesTableAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn); await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var job = await LoadScheduleJobAsync(conn, jobId); if (job == null || job.TenantId != request.TenantId) return Results.NotFound(new { success=false,message="Job not found for this company." });
+        if (!request.Confirmed) return Results.BadRequest(new { success=false,status="confirmation_required",message="Confirm preparation of this disposable-job test action." });
+        var rendered = await RenderBasicEmailAsync(conn, job, "scheduling", request.RecipientKey, null, null);
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var result = await AutoMateApi.BasicTestExecutionSupport.PrepareAsync(conn,
+            new(request.TenantId, jobId, request.RevisionKey, request.RecipientKey, rendered.Subject, rendered.HtmlBody, actor), context.RequestAborted);
+        if (result.Status is "not_selected" or "slot_disabled" or "template_required" or "recipient_required" or "revision_conflict") return Results.Json(new { success=false,status=result.Status,code=result.Status,result.ActionId,result.State,message=result.Message }, statusCode:409);
+        return Results.Ok(new { success=true,status=result.Status,queueId=result.ActionId,state=result.State,result.Replayed,message=result.Message,automaticSendingActive=false });
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
+    catch (Exception ex) { return Results.Problem(title:"Prepare Basic test action failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapGet("/jobs/{jobId}/automation/basic/queue", async (HttpContext context, Guid jobId, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
+        var selection = await AutoMateApi.BasicTestExecutionSupport.LoadOptInAsync(conn, tenantId, jobId, context.RequestAborted);
+        var items = await AutoMateApi.BasicTestExecutionSupport.LoadQueueAsync(conn, tenantId, jobId, context.RequestAborted);
+        return Results.Ok(new { success=true,jobId,selected=selection.Enabled,selectionVersion=selection.Version,items,automaticSendingActive=false });
+    }
+    catch (UnauthorizedAccessException) { return Results.NotFound(new { success=false,message="Job not found for this company." }); }
+    catch (Exception ex) { return Results.Problem(title:"Load Basic test queue failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/queue/{queueId}/approve", async (HttpContext context, Guid jobId, Guid queueId, BasicTestApproveRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var result = await AutoMateApi.BasicTestExecutionSupport.ApproveAsync(conn, new(request.TenantId, jobId, queueId, request.Confirmed, actor), context.RequestAborted);
+        if (result.Status is "confirmation_required" or "invalid_state" or "not_found") return Results.Json(new { success=false,status=result.Status,code=result.Status,message=result.Message }, statusCode:409);
+        return Results.Ok(new { success=true,status=result.Status,queueId=result.ActionId,state=result.State,result.Replayed,message=result.Message });
+    }
+    catch (Exception ex) { return Results.Problem(title:"Approve Basic test action failed",detail:ex.Message,statusCode:500); }
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/queue/{queueId}/complete", async (HttpContext context, Guid jobId, Guid queueId, BasicTestCompleteRequest request) =>
+{
+    try
+    {
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
+        var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
+        var inspectorId = Guid.Parse(context.Request.Headers["X-AutoMate-Inspector-ID"].First()!); var actor = await LoadAuthenticatedAutomationActorAsync(conn, request.TenantId, inspectorId);
+        var result = await AutoMateApi.BasicTestExecutionSupport.CompleteAsync(conn,
+            new(request.TenantId, jobId, queueId, request.TestRecipientEmail, request.Confirmed, request.Succeeded, request.ProviderMessageId, request.Error, actor), context.RequestAborted);
+        if (result.Status is "confirmation_required" or "invalid_state" or "not_found" or "completion_conflict") return Results.Json(new { success=false,status=result.Status,code=result.Status,message=result.Message }, statusCode:409);
+        return Results.Ok(new { success=true,status=result.Status,queueId=result.ActionId,state=result.State,result.Replayed,message=result.Message });
+    }
+    catch (Exception ex) { return Results.Problem(title:"Complete Basic test action failed",detail:ex.Message,statusCode:500); }
+});
+
 app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
 {
     try
@@ -7135,6 +7216,7 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await AutoMateApi.BasicAutomationSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(startupMigrationConnection);
     await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
 
@@ -10193,6 +10275,13 @@ static string NormalizeEmailSenderMode(string? mode)
     };
 }
 
+static async Task<string> LoadAuthenticatedAutomationActorAsync(NpgsqlConnection conn, Guid tenantId, Guid inspectorId)
+{
+    await using var command = new NpgsqlCommand("SELECT COALESCE(NULLIF(inspector_name,''),inspector_id::text) FROM public.inspectors WHERE inspector_id=@id AND tenant_id=@tenant LIMIT 1", conn);
+    command.Parameters.AddWithValue("id", inspectorId); command.Parameters.AddWithValue("tenant", tenantId);
+    return Convert.ToString(await command.ExecuteScalarAsync()) ?? inspectorId.ToString();
+}
+
 static bool IsSmtpEmailSenderMode(string? mode)
 {
     var normalized = NormalizeEmailSenderMode(mode);
@@ -12987,6 +13076,37 @@ public sealed class BasicAutomationRenderRequest : BasicAutomationTemplateReques
 {
     public string EventKey { get; set; } = "";
     public string RecipientKey { get; set; } = "";
+}
+
+public sealed class BasicTestJobSelectionRequest
+{
+    public Guid TenantId { get; set; }
+    public bool Enabled { get; set; }
+    public bool DisposableConfirmed { get; set; }
+    public bool Confirmed { get; set; }
+    public int ExpectedVersion { get; set; }
+}
+
+public sealed class BasicTestPrepareRequest
+{
+    public Guid TenantId { get; set; }
+    public string RevisionKey { get; set; } = "";
+    public string RecipientKey { get; set; } = "";
+    public bool Confirmed { get; set; }
+}
+
+public class BasicTestApproveRequest
+{
+    public Guid TenantId { get; set; }
+    public bool Confirmed { get; set; }
+}
+
+public sealed class BasicTestCompleteRequest : BasicTestApproveRequest
+{
+    public string TestRecipientEmail { get; set; } = "";
+    public bool Succeeded { get; set; }
+    public string? ProviderMessageId { get; set; }
+    public string? Error { get; set; }
 }
 
 public sealed class BasicAutomationCompleteRequest
