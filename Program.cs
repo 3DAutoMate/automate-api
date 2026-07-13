@@ -118,6 +118,41 @@ var clientTokenPepper = builder.Configuration["AUTOMATE_CLIENT_PAGE_TOKEN_KEY"] 
 var publicBaseUrl = (builder.Configuration["AUTOMATE_PUBLIC_BASE_URL"] ?? "https://automate-api-production.up.railway.app").TrimEnd('/');
 var TransparentGif = Convert.FromBase64String("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==");
 
+app.Use(async (context, next) =>
+{
+    if (!TryGetMappingGuardJobId(context.Request, out var guardedJobId))
+    {
+        await next();
+        return;
+    }
+
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync(context.RequestAborted);
+    await TenantMappingProfileSupport.EnsureAsync(connection, context.RequestAborted);
+    await using var command = new NpgsqlCommand("""
+SELECT mapping_workflow_ready,COALESCE(mapping_validation_status,''),COALESCE(mapping_attention_reason,'')
+FROM public.jobs_staging WHERE job_id=@job;
+""", connection);
+    command.Parameters.AddWithValue("job", guardedJobId);
+    await using var result = await command.ExecuteReaderAsync(context.RequestAborted);
+    if (await result.ReadAsync(context.RequestAborted) && !result.GetBoolean(0))
+    {
+        context.Response.StatusCode = StatusCodes.Status409Conflict;
+        await context.Response.WriteAsJsonAsync(new
+        {
+            success = false,
+            status = string.IsNullOrWhiteSpace(result.GetString(1)) ? "mapping_review_required" : result.GetString(1),
+            message = string.IsNullOrWhiteSpace(result.GetString(2))
+                ? "Validate the tenant mapping and re-sync this job before running external workflows."
+                : result.GetString(2),
+            jobId = guardedJobId
+        }, context.RequestAborted);
+        return;
+    }
+    await result.DisposeAsync();
+    await next();
+});
+
 // =============================
 // ROOT
 // =============================
@@ -3061,6 +3096,7 @@ app.MapPost("/integrations/signnow/jobs/{jobId}/send-terms", async (Guid jobId) 
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
+        await TenantMappingProfileSupport.EnsureAsync(conn);
         await JobChangeSupport.EnsureAsync(conn);
         await EnsureSignNowTemplateMappingsTableAsync(conn);
         await EnsureInspectorIntegrationsTableAsync(conn);
@@ -4312,12 +4348,18 @@ app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
         await EnsureWorkflowActionsTableAsync(conn);
         await JobChangeSupport.EnsureAsync(conn);
 
-        await using (var gate = new NpgsqlCommand("SELECT change_review_pending,unscheduled FROM public.jobs_staging WHERE job_id=@job", conn))
+        await TenantMappingProfileSupport.EnsureAsync(conn);
+        await using (var gate = new NpgsqlCommand("SELECT change_review_pending,unscheduled,mapping_workflow_ready FROM public.jobs_staging WHERE job_id=@job", conn))
         {
             gate.Parameters.AddWithValue("job", jobId);
             await using var gateReader = await gate.ExecuteReaderAsync();
-            if (await gateReader.ReadAsync() && (gateReader.GetBoolean(0) || gateReader.GetBoolean(1)))
-                return Results.Conflict(new { success = false, status = "change_review_required", message = "Review the detected 3D job changes before running customer workflows." });
+            if (await gateReader.ReadAsync())
+            {
+                if (!gateReader.GetBoolean(2))
+                    return Results.Conflict(new { success = false, status = "mapping_review_required", message = "Validate the tenant mapping and re-sync this job before running customer workflows." });
+                if (gateReader.GetBoolean(0) || gateReader.GetBoolean(1))
+                    return Results.Conflict(new { success = false, status = "change_review_required", message = "Review the detected 3D job changes before running customer workflows." });
+            }
         }
 
         var job = await LoadScheduleJobAsync(conn, jobId);
@@ -4405,6 +4447,7 @@ app.MapGet("/jobs/pending-workflows", async () =>
         await conn.OpenAsync();
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureSignNowJobColumnsAsync(conn);
+        await TenantMappingProfileSupport.EnsureAsync(conn);
 
         const string sql = @"
 SELECT
@@ -4557,7 +4600,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) s ON TRUE
 WHERE
-NOT j.change_review_pending AND NOT j.unscheduled AND
+NOT j.change_review_pending AND NOT j.unscheduled AND j.mapping_workflow_ready AND
 (
     (j.booking_email_required = true AND (j.booking_email_sent = false OR j.booking_email_retry_requested = true))
     OR (j.terms_required = true AND (j.terms_sent = false OR j.terms_retry_requested = true))
@@ -4762,6 +4805,7 @@ app.MapGet("/jobs/workflow-status", async () =>
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
         await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        await TenantMappingProfileSupport.EnsureAsync(conn);
         await EnsureEmailTemplatesTableAsync(conn);
         await EnsureAdvancedActionsTablesAsync(conn);
         await AutomationFoundationSupport.EnsureAsync(conn);
@@ -4825,6 +4869,17 @@ SELECT
     j.change_template_setup_required,
     j.source_missing,
     j.unscheduled,
+    j.mapping_contract_version,
+    j.mapping_profile_version,
+    j.mapping_profile_fingerprint,
+    j.mapping_discovery_fingerprint,
+    j.mapping_validation_status,
+    j.mapping_compatibility_mode,
+    j.mapping_source,
+    j.mapping_workflow_ready,
+    j.mapping_review_required,
+    j.mapping_attention_reason,
+    j.mapping_synced_at,
     COALESCE(a.pending_action_count, 0) AS pending_action_count,
     COALESCE(a.sent_action_count, 0) AS sent_action_count,
     COALESCE(a.failed_action_count, 0) AS failed_action_count,
@@ -4908,6 +4963,17 @@ LIMIT 500;";
                 change_template_setup_required = reader["change_template_setup_required"]?.ToString(),
                 source_missing = reader["source_missing"]?.ToString(),
                 unscheduled = reader["unscheduled"]?.ToString(),
+                mapping_contract_version = reader["mapping_contract_version"]?.ToString(),
+                mapping_profile_version = reader["mapping_profile_version"]?.ToString(),
+                mapping_profile_fingerprint = reader["mapping_profile_fingerprint"]?.ToString(),
+                mapping_discovery_fingerprint = reader["mapping_discovery_fingerprint"]?.ToString(),
+                mapping_validation_status = reader["mapping_validation_status"]?.ToString(),
+                mapping_compatibility_mode = reader["mapping_compatibility_mode"]?.ToString(),
+                mapping_source = reader["mapping_source"]?.ToString(),
+                mapping_workflow_ready = reader["mapping_workflow_ready"]?.ToString(),
+                mapping_review_required = reader["mapping_review_required"]?.ToString(),
+                mapping_attention_reason = reader["mapping_attention_reason"]?.ToString(),
+                mapping_synced_at = reader["mapping_synced_at"]?.ToString(),
                 pending_action_count = reader["pending_action_count"]?.ToString(),
                 sent_action_count = reader["sent_action_count"]?.ToString(),
                 failed_action_count = reader["failed_action_count"]?.ToString(),
@@ -4941,6 +5007,7 @@ app.MapGet("/workflow-actions/pending", async (Guid? inspectorId) =>
         await EnsureSignNowJobColumnsAsync(conn);
         await EnsureWorkflowActionsTableAsync(conn);
         await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
+        await TenantMappingProfileSupport.EnsureAsync(conn);
 
         const string sql = @"
 SELECT
@@ -5062,7 +5129,7 @@ LEFT JOIN LATERAL (
 ) s ON TRUE
 WHERE a.action_type = 'booking_email'
   AND (a.status = 'pending' OR a.retry_requested = true)
-  AND NOT j.change_review_pending AND NOT j.unscheduled
+   AND NOT j.change_review_pending AND NOT j.unscheduled AND j.mapping_workflow_ready
   AND NOT EXISTS (SELECT 1 FROM public.automation_tenant_settings ats WHERE ats.tenant_id::text=j.tenant_id::text AND ats.activation_mode='all_jobs')
   AND NOT EXISTS (SELECT 1 FROM public.automation_job_selections ajs WHERE ajs.tenant_id::text=j.tenant_id::text AND ajs.job_id=j.job_id AND ajs.use_advanced_workflows=true)
   AND NOT EXISTS (SELECT 1 FROM public.basic_automation_settings bas WHERE bas.tenant_id::text=j.tenant_id::text AND bas.event_key='scheduling')
@@ -6778,8 +6845,15 @@ ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_role_label tex
 
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureOnlinePropertyTablesAsync(conn);
+        await TenantMappingProfileSupport.EnsureAsync(conn, context.RequestAborted);
+        var canonicalResolution = await CanonicalSyncResolver.ResolveAsync(
+            conn, tenantId, body, payload, new CanonicalSyncGateOptions(true, false), context.RequestAborted);
+        if (canonicalResolution.Gate.Allowed && canonicalResolution.Values != null)
+            CanonicalSyncProjection.Apply(payload, canonicalResolution.Values);
         await JobChangeSupport.EnsureAsync(conn);
-        var changePreparation = await JobChangeSupport.PrepareAsync(conn, jobId, payload);
+        JobChangePreparation? changePreparation = canonicalResolution.Gate.Allowed
+            ? await JobChangeSupport.PrepareAsync(conn, jobId, payload)
+            : null;
 
         string previousAddress = "";
         bool workflowStartedBeforeAddressChange = false;
@@ -6870,6 +6944,19 @@ INSERT INTO public.jobs_staging
     connector_version,
     source_instance,
     raw_payload_json,
+    mapping_contract_version,
+    mapping_profile_version,
+    mapping_profile_fingerprint,
+    mapping_discovery_fingerprint,
+    mapping_validation_status,
+    mapping_compatibility_mode,
+    mapping_values_fingerprint,
+    mapping_source,
+    mapping_workflow_ready,
+    canonical_values_json,
+    mapping_review_required,
+    mapping_attention_reason,
+    mapping_synced_at,
     updated_at
 )
 VALUES
@@ -6943,6 +7030,19 @@ VALUES
     @connector_version,
     @source_instance,
     @raw_payload_json,
+    @mapping_contract_version,
+    @mapping_profile_version,
+    @mapping_profile_fingerprint,
+    @mapping_discovery_fingerprint,
+    @mapping_validation_status,
+    @mapping_compatibility_mode,
+    @mapping_values_fingerprint,
+    @mapping_source,
+    @mapping_workflow_ready,
+    CAST(@canonical_values_json AS jsonb),
+    @mapping_review_required,
+    @mapping_attention_reason,
+    NOW(),
     NOW()
 )
 ON CONFLICT (job_id)
@@ -7015,6 +7115,19 @@ DO UPDATE SET
     connector_version            = EXCLUDED.connector_version,
     source_instance              = EXCLUDED.source_instance,
     raw_payload_json             = EXCLUDED.raw_payload_json,
+    mapping_contract_version     = EXCLUDED.mapping_contract_version,
+    mapping_profile_version      = EXCLUDED.mapping_profile_version,
+    mapping_profile_fingerprint  = EXCLUDED.mapping_profile_fingerprint,
+    mapping_discovery_fingerprint= EXCLUDED.mapping_discovery_fingerprint,
+    mapping_validation_status    = EXCLUDED.mapping_validation_status,
+    mapping_compatibility_mode   = EXCLUDED.mapping_compatibility_mode,
+    mapping_values_fingerprint   = EXCLUDED.mapping_values_fingerprint,
+    mapping_source               = EXCLUDED.mapping_source,
+    mapping_workflow_ready       = EXCLUDED.mapping_workflow_ready,
+    canonical_values_json        = EXCLUDED.canonical_values_json,
+    mapping_review_required      = EXCLUDED.mapping_review_required,
+    mapping_attention_reason     = EXCLUDED.mapping_attention_reason,
+    mapping_synced_at            = EXCLUDED.mapping_synced_at,
     updated_at                   = NOW();";
 
         await using (var cmd = new NpgsqlCommand(upsertSql, conn))
@@ -7095,6 +7208,19 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("connector_version", payload.Meta?.ConnectorVersion ?? "");
             cmd.Parameters.AddWithValue("source_instance", payload.Meta?.SourceInstance ?? "");
             cmd.Parameters.AddWithValue("raw_payload_json", body);
+            var mappingEnvelope = canonicalResolution.Parse.Envelope;
+            cmd.Parameters.AddWithValue("mapping_contract_version", mappingEnvelope?.ContractVersion ?? 0);
+            cmd.Parameters.AddWithValue("mapping_profile_version", mappingEnvelope?.ProfileVersion ?? 0);
+            cmd.Parameters.AddWithValue("mapping_profile_fingerprint", mappingEnvelope?.ProfileFingerprint ?? "");
+            cmd.Parameters.AddWithValue("mapping_discovery_fingerprint", mappingEnvelope?.DiscoveryFingerprint ?? "");
+            cmd.Parameters.AddWithValue("mapping_validation_status", canonicalResolution.Gate.Code);
+            cmd.Parameters.AddWithValue("mapping_compatibility_mode", canonicalResolution.Gate.CompatibilityMode);
+            cmd.Parameters.AddWithValue("mapping_values_fingerprint", mappingEnvelope?.ComputedValuesFingerprint ?? "");
+            cmd.Parameters.AddWithValue("mapping_source", mappingEnvelope?.MappingSource ?? "invalid");
+            cmd.Parameters.AddWithValue("mapping_workflow_ready", canonicalResolution.Gate.Allowed);
+            cmd.Parameters.AddWithValue("canonical_values_json", mappingEnvelope?.Values.GetRawText() ?? "{}");
+            cmd.Parameters.AddWithValue("mapping_review_required", !canonicalResolution.Gate.Allowed);
+            cmd.Parameters.AddWithValue("mapping_attention_reason", CanonicalSyncResolver.AttentionReason(canonicalResolution.Gate));
 
             await cmd.ExecuteNonQueryAsync();
         }
@@ -7141,9 +7267,12 @@ WHERE job_id=@job_id", conn);
             }
         }
 
-        await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
-        await RefreshJobInvoiceLinesAsync(conn, payload, jobId);
-        await JobChangeSupport.ApplyAsync(conn, jobId, tenantId, changePreparation);
+        if (canonicalResolution.Gate.Allowed && changePreparation != null)
+        {
+            await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
+            await RefreshJobInvoiceLinesAsync(conn, payload, jobId);
+            await JobChangeSupport.ApplyAsync(conn, jobId, tenantId, changePreparation);
+        }
 
         return Results.Ok(new
         {
@@ -7152,9 +7281,18 @@ WHERE job_id=@job_id", conn);
             jobId = payload.Job.JobId,
             tenantId = payload.TenantId,
             inspectorId = payload.Job.InspectorId,
-            changeReviewPending = changePreparation.Pending,
-            changeReasons = changePreparation.Reasons,
-            currentSnapshotFingerprint = changePreparation.Fingerprint
+            changeReviewPending = changePreparation?.Pending ?? false,
+            changeReasons = changePreparation?.Reasons ?? "",
+            currentSnapshotFingerprint = changePreparation?.Fingerprint ?? "",
+            mapping = new
+            {
+                ready = canonicalResolution.Gate.Allowed,
+                status = canonicalResolution.Gate.Code,
+                compatibilityMode = canonicalResolution.Gate.CompatibilityMode,
+                profileVersion = canonicalResolution.Parse.Envelope?.ProfileVersion ?? 0,
+                profileFingerprint = canonicalResolution.Parse.Envelope?.ProfileFingerprint ?? "",
+                attention = CanonicalSyncResolver.AttentionReason(canonicalResolution.Gate)
+            }
         });
     }
     catch (PostgresException pgEx)
@@ -12808,6 +12946,25 @@ static int CalculateTrialDaysRemaining(DateTime? trialEndsAt)
         return 0;
 
     return Math.Max(1, (int)Math.Ceiling(remaining.TotalDays));
+}
+
+static bool TryGetMappingGuardJobId(HttpRequest request, out Guid jobId)
+{
+    jobId = Guid.Empty;
+    if (!HttpMethods.IsPost(request.Method) && !HttpMethods.IsPut(request.Method)) return false;
+    var path = request.Path.Value ?? "";
+    var patterns = new[]
+    {
+        @"^/jobs/(?<job>[0-9a-f-]{36})/(?:schedule|cancel-unschedule|email-templates/booking-email/send|communications/client-email/prepare)$",
+        @"^/jobs/(?<job>[0-9a-f-]{36})/automation/basic/(?:queue/[0-9a-f-]{36}/approve|production/[0-9a-f-]{36}/claim)$",
+        @"^/integrations/(?:xero/jobs/(?<job>[0-9a-f-]{36})/create-draft-invoice|signnow/jobs/(?<job>[0-9a-f-]{36})/(?:send-terms|ensure-webhook))$"
+    };
+    foreach (var pattern in patterns)
+    {
+        var match = Regex.Match(path, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (match.Success && Guid.TryParse(match.Groups["job"].Value, out jobId)) return true;
+    }
+    return false;
 }
 
 public class BookingEmailFailureRequest
