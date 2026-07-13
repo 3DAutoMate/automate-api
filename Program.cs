@@ -8,6 +8,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using Npgsql;
+using AutoMateApi;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Threading.RateLimiting;
 
@@ -113,10 +114,51 @@ app.MapTenantMappingProfileEndpoints(
         await connection.OpenAsync(cancellationToken);
         return await LoadAuthenticatedAutomationActorAsync(connection, tenantId, GetAuthenticatedInspectorId(context));
     });
+app.MapControlledTestCycleEndpoints(
+    connectionString,
+    async (context, tenantId, cancellationToken) =>
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        var owner = await RequireAutomationOwnerAsync(context, connection, tenantId);
+        // AutoMate currently exposes only registered company-level connector identities.
+        // This boundary remains separate so explicit office roles can replace it later.
+        return owner.Allowed;
+    },
+    async (context, tenantId, cancellationToken) =>
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        return await LoadAuthenticatedAutomationActorAsync(connection, tenantId, GetAuthenticatedInspectorId(context));
+    });
 const string FoundersTrialAccessCode = "PILOT";
 var clientTokenPepper = builder.Configuration["AUTOMATE_CLIENT_PAGE_TOKEN_KEY"] ?? "";
 var publicBaseUrl = (builder.Configuration["AUTOMATE_PUBLIC_BASE_URL"] ?? "https://automate-api-production.up.railway.app").TrimEnd('/');
 var TransparentGif = Convert.FromBase64String("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==");
+
+// The legacy test reset endpoints discard local references to external evidence.
+// Keep their route definitions temporarily for source compatibility, but make them
+// unreachable while controlled, evidence-preserving test cycles replace them.
+app.Use(async (context, next) =>
+{
+    var path = context.Request.Path.Value ?? "";
+    var isLegacyDestructiveReset = context.Request.Method == HttpMethods.Post &&
+        (Regex.IsMatch(path, @"^/jobs/[0-9a-fA-F-]{36}/hard-reset/?$") ||
+         Regex.IsMatch(path, @"^/jobs/[0-9a-fA-F-]{36}/terms/reset/?$"));
+    if (!isLegacyDestructiveReset)
+    {
+        await next();
+        return;
+    }
+
+    context.Response.StatusCode = StatusCodes.Status410Gone;
+    await context.Response.WriteAsJsonAsync(new
+    {
+        success = false,
+        status = "legacy_reset_disabled",
+        message = "This reset is disabled because it can detach retained email, Terms, Calendar or Xero evidence. Use a controlled test cycle instead."
+    }, context.RequestAborted);
+});
 
 app.Use(async (context, next) =>
 {
@@ -9527,6 +9569,7 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
                 return ScheduleActionResult.Failed("calendar", "Google Calendar event update failed: " + patchJson);
             }
             await MarkCalendarCreatedAsync(conn, job.JobId);
+            await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, existingEventId, "active", GetJsonString(items[0], "htmlLink"));
             return ScheduleActionResult.Ok("calendar", "Google Calendar event updated.", new
             {
                 eventId = existingEventId,
@@ -9583,6 +9626,7 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
 
     var created = JsonDocument.Parse(createJson).RootElement;
     await MarkCalendarCreatedAsync(conn, job.JobId);
+    await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, GetJsonString(created, "id"), "active", GetJsonString(created, "htmlLink"));
     return ScheduleActionResult.Ok("calendar", "Google Calendar event created.", new
     {
         eventId = GetJsonString(created, "id"),
@@ -9613,10 +9657,29 @@ static async Task<ScheduleActionResult> CancelGoogleCalendarEventForJobAsync(
         var response = await httpClient.DeleteAsync($"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events/{Uri.EscapeDataString(id)}");
         if (!response.IsSuccessStatusCode && response.StatusCode != System.Net.HttpStatusCode.Gone && response.StatusCode != System.Net.HttpStatusCode.NotFound)
             return ScheduleActionResult.Failed("calendar", "Calendar cancellation failed: " + await response.Content.ReadAsStringAsync());
+        await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, id, "removed", "");
     }
     await using var cmd = new NpgsqlCommand("UPDATE public.jobs_staging SET calendar_created=false,calendar_created_at=NULL WHERE job_id=@job", conn);
     cmd.Parameters.AddWithValue("job", job.JobId); await cmd.ExecuteNonQueryAsync();
     return ScheduleActionResult.Ok("calendar", "Calendar event cancelled.");
+}
+
+static async Task RecordCalendarEvidenceAsync(NpgsqlConnection conn, Guid tenantId, Guid jobId, string calendarId, string eventId, string status, string htmlLink)
+{
+    if (tenantId == Guid.Empty || jobId == Guid.Empty || string.IsNullOrWhiteSpace(eventId)) return;
+    await ControlledTestCycleSupport.EnsureAsync(conn);
+    await using var command = new NpgsqlCommand("""
+        INSERT INTO public.job_calendar_evidence
+            (evidence_id,tenant_id,job_id,provider,calendar_id,event_id,event_status,metadata_json,removed_at)
+        VALUES(gen_random_uuid(),@tenant,@job,'google',@calendar,@event,@status,CAST(@metadata AS jsonb),CASE WHEN @status='removed' THEN NOW() ELSE NULL END)
+        ON CONFLICT(tenant_id,job_id,provider,calendar_id,event_id) DO UPDATE SET
+            event_status=EXCLUDED.event_status,last_observed_at=NOW(),metadata_json=EXCLUDED.metadata_json,
+            removed_at=CASE WHEN EXCLUDED.event_status='removed' THEN NOW() ELSE NULL END;
+        """, conn);
+    command.Parameters.AddWithValue("tenant", tenantId); command.Parameters.AddWithValue("job", jobId);
+    command.Parameters.AddWithValue("calendar", calendarId ?? ""); command.Parameters.AddWithValue("event", eventId);
+    command.Parameters.AddWithValue("status", status); command.Parameters.AddWithValue("metadata", JsonSerializer.Serialize(new { htmlLink }));
+    await command.ExecuteNonQueryAsync();
 }
 
 static string BuildGoogleCalendarDescription(ScheduleJobInput job, List<XeroInvoiceLineInput> invoiceLines)
