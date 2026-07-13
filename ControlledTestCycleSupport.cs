@@ -492,11 +492,11 @@ public static class ControlledTestCycleSupport
                 calendar_retry_requested=false,calendar_last_error=NULL,
                 report_retry_requested=false,report_last_error=NULL,
                 workflow_updated_at=NOW()
-            WHERE tenant_id=@tenant AND job_id=@job;
+            WHERE tenant_id::text=@tenant AND job_id=@job;
             """, connection, transaction))
         {
             updateJob.Parameters.AddWithValue("version", newVersion); updateJob.Parameters.AddWithValue("reset_terms", resetTerms);
-            updateJob.Parameters.AddWithValue("tenant", request.TenantId); updateJob.Parameters.AddWithValue("job", request.JobId);
+            updateJob.Parameters.AddWithValue("tenant", request.TenantId.ToString()); updateJob.Parameters.AddWithValue("job", request.JobId);
             await updateJob.ExecuteNonQueryAsync(cancellationToken);
         }
         await using (var supersede = new NpgsqlCommand("UPDATE public.job_test_cycles SET status='superseded',superseded_at=NOW(),updated_at=NOW() WHERE tenant_id=@tenant AND job_id=@job AND status='active' AND cycle_id<>@cycle", connection, transaction))
@@ -530,9 +530,9 @@ public static class ControlledTestCycleSupport
                    terms_signed,COALESCE(signnow_document_id,''),COALESCE(signnow_invite_id,''),COALESCE(signnow_webhook_subscription_id,''),COALESCE(signnow_document_status,''),
                    paid,COALESCE(amount_paid,0),COALESCE(payment_status,''),COALESCE(xero_contact_id,''),COALESCE(xero_invoice_id,''),COALESCE(xero_invoice_number,''),COALESCE(xero_invoice_status,''),
                    calendar_created,report_workflow_sent,COALESCE(report_sent,''),xero_review_required,report_review_required
-            FROM public.jobs_staging WHERE tenant_id=@tenant AND job_id=@job;
+            FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job;
             """, connection, transaction);
-        command.Parameters.AddWithValue("tenant", tenantId); command.Parameters.AddWithValue("job", jobId);
+        command.Parameters.AddWithValue("tenant", tenantId.ToString()); command.Parameters.AddWithValue("job", jobId);
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
         {
             if (!await reader.ReadAsync(cancellationToken)) throw new UnauthorizedAccessException("Job not found for this company.");
@@ -666,8 +666,8 @@ public static class ControlledTestCycleSupport
 
     private static async Task<JobState> LoadJobForUpdateAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid tenantId, Guid jobId, CancellationToken token)
     {
-        await using var command = new NpgsqlCommand("SELECT approved_snapshot_version,COALESCE(approved_snapshot_fingerprint,''),mapping_workflow_ready,change_review_pending,address_change_pending FROM public.jobs_staging WHERE tenant_id=@tenant AND job_id=@job FOR UPDATE", connection, transaction);
-        command.Parameters.AddWithValue("tenant", tenantId); command.Parameters.AddWithValue("job", jobId);
+        await using var command = new NpgsqlCommand("SELECT approved_snapshot_version,COALESCE(approved_snapshot_fingerprint,''),mapping_workflow_ready,change_review_pending,address_change_pending FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job FOR UPDATE", connection, transaction);
+        command.Parameters.AddWithValue("tenant", tenantId.ToString()); command.Parameters.AddWithValue("job", jobId);
         await using var reader = await command.ExecuteReaderAsync(token); if (!await reader.ReadAsync(token)) throw new UnauthorizedAccessException("Job not found for this company.");
         return new(reader.GetInt32(0), reader.GetString(1), reader.GetBoolean(2), reader.GetBoolean(3), reader.GetBoolean(4));
     }
