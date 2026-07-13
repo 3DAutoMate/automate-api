@@ -98,6 +98,21 @@ var V1MappingFields = new List<V1MappingField>
 var app = builder.Build();
 app.UseCors("LocalTemplateMaker");
 app.UseRateLimiter();
+app.MapTenantMappingProfileEndpoints(
+    connectionString,
+    async (context, tenantId, cancellationToken) =>
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        var owner = await RequireAutomationOwnerAsync(context, connection, tenantId);
+        return owner.Allowed;
+    },
+    async (context, tenantId, cancellationToken) =>
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        return await LoadAuthenticatedAutomationActorAsync(connection, tenantId, GetAuthenticatedInspectorId(context));
+    });
 const string FoundersTrialAccessCode = "PILOT";
 var clientTokenPepper = builder.Configuration["AUTOMATE_CLIENT_PAGE_TOKEN_KEY"] ?? "";
 var publicBaseUrl = (builder.Configuration["AUTOMATE_PUBLIC_BASE_URL"] ?? "https://automate-api-production.up.railway.app").TrimEnd('/');
