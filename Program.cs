@@ -373,6 +373,24 @@ app.MapPut("/automation/engagement/settings", async (HttpContext context, Client
     catch(Exception ex){return Results.Problem(title:"Save engagement settings failed",detail:ex.Message,statusCode:500);}
 });
 
+app.MapGet("/automation/integrations/signnow/mappings",async(HttpContext context,Guid tenantId) =>
+{
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();await AutomationFoundationSupport.EnsureAsync(conn);var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+    return Results.Ok(new{success=true,state=await AutoMateApi.SignNowCatalogueMappingSupport.LoadAsync(conn,tenantId,context.RequestAborted),externalActionsEnabled=false});
+});
+
+app.MapPut("/automation/integrations/signnow/mappings",async(HttpContext context,AutoMateApi.SignNowMappingSaveRequest request) =>
+{
+    try{if(!request.Confirmed)return Results.BadRequest(new{success=false,status="confirmation_required",message="Confirm the SignNow mapping configuration save."});await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();await AutomationFoundationSupport.EnsureAsync(conn);var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var state=await AutoMateApi.SignNowCatalogueMappingSupport.SaveAsync(conn,request,actor,context.RequestAborted);return Results.Ok(new{success=true,state,externalActionsEnabled=false,message="SignNow mappings saved. Agreement preparation and sending remain disabled."});}
+    catch(AutoMateApi.SignNowMappingException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+});
+
+app.MapPost("/automation/integrations/signnow/mappings/preview",async(HttpContext context,AutoMateApi.SignNowMappingPreviewRequest request) =>
+{
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();await AutomationFoundationSupport.EnsureAsync(conn);var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+    const string sql="SELECT COALESCE(service_catalogue_version,0),COALESCE(service_catalogue_snapshot_json::text,''),COALESCE(contact1_email,'') FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job LIMIT 1";await using var command=new NpgsqlCommand(sql,conn);command.Parameters.AddWithValue("tenant",request.TenantId.ToString());command.Parameters.AddWithValue("job",request.JobId);await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);if(!await reader.ReadAsync(context.RequestAborted))return Results.NotFound(new{success=false,status="job_not_found",message="The controlled job was not found for this company."});var version=reader.GetInt32(0);var snapshot=reader.GetString(1);var missingEmail=string.IsNullOrWhiteSpace(reader.GetString(2));await reader.DisposeAsync();var state=await AutoMateApi.SignNowCatalogueMappingSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);return Results.Ok(new{success=true,preview=AutoMateApi.SignNowCatalogueMappingSupport.Preview(state,version,snapshot,missingEmail),sideEffectsExecuted=false});
+});
+
 app.MapGet("/jobs/{jobId}/communications", async (HttpContext context, Guid jobId, Guid tenantId) =>
 {
     try
