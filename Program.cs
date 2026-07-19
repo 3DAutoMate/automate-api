@@ -212,7 +212,9 @@ FROM public.jobs_staging WHERE job_id=@job;
 app.MapGet("/", () => Results.Ok(new
 {
     ok = true,
-    service = "3D AutoMate API"
+    service = "3D AutoMate API",
+    buildCommit = Environment.GetEnvironmentVariable("RAILWAY_GIT_COMMIT_SHA") ?? "local",
+    featureContract = "inspector_quote_travel_v1"
 }));
 
 // =============================
@@ -232,7 +234,9 @@ app.MapGet("/db-test", async () =>
         {
             success = true,
             message = "Database connection successful.",
-            serverTime = result?.ToString()
+            serverTime = result?.ToString(),
+            buildCommit = Environment.GetEnvironmentVariable("RAILWAY_GIT_COMMIT_SHA") ?? "local",
+            featureContract = "inspector_quote_travel_v1"
         });
     }
     catch (Exception ex)
@@ -293,10 +297,66 @@ app.MapGet("/automation/quotes/{quoteId:guid}",async(HttpContext context,Guid te
     try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var quote=await AutoMateApi.QuoteWorkflowSupport.LoadAsync(conn,tenantId,quoteId,context.RequestAborted);return quote==null?Results.NotFound(new{success=false,message="Quote not found for this company."}):Results.Ok(new{quote,conversionPreview=new{enabled=false,status="pilot_required",message="THREED conversion remains disabled until a disposable write/read-back pilot passes.",jobState="Unscheduled",inspector="Unassigned",providerActions=false}});}
     catch(Exception ex){return Results.Problem(title:"Load quote failed",detail:ex.Message,statusCode:500);}
 });
+app.MapPost("/automation/quotes/address-predictions",async(HttpContext context,AutoMateApi.QuoteAddressPredictionRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        return Results.Ok(await AutoMateApi.RailwayPropertyMediaService.PredictAsync(request.Query,request.SessionToken,builder.Configuration,context.RequestAborted));
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="address_prediction_unavailable",message=ex.Message},statusCode:422);}
+    catch(Exception){return Results.Problem(title:"Address prediction failed",detail:"The address service is temporarily unavailable.",statusCode:503);}
+});
+app.MapPost("/automation/locations/resolve",async(HttpContext context,AutoMateApi.QuotePlaceResolutionRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(string.IsNullOrWhiteSpace(request.CanonicalAddress)||string.IsNullOrWhiteSpace(request.PlaceId))return Results.BadRequest(new{success=false,status="selected_address_required",message="Select an address from Google predictions."});
+        var address=await AutoMateApi.RailwayPropertyMediaService.ResolvePlaceAsync(request.CanonicalAddress,request.PlaceId,request.SessionToken,builder.Configuration,context.RequestAborted);
+        return Results.Ok(new{success=true,address});
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="address_resolution_unavailable",message=ex.Message},statusCode:422);}
+    catch(Exception){return Results.Problem(title:"Confirm address failed",detail:"The address service is temporarily unavailable.",statusCode:503);}
+});
+app.MapPost("/automation/quotes/travel",async(HttpContext context,AutoMateApi.QuoteTravelRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        return Results.Ok(new{success=true,travel=await AutoMateApi.QuoteTravelSupport.CalculateAsync(conn,request,builder.Configuration,context.RequestAborted)});
+    }
+    catch(AutoMateApi.QuoteTravelException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception){return Results.Problem(title:"Calculate quote travel failed",detail:"Travel calculation is temporarily unavailable.",statusCode:503);}
+});
 app.MapPost("/automation/quotes/enrich-address",async(HttpContext context,AutoMateApi.QuoteAddressEnrichmentRequest request)=>
 {
-    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;if(string.IsNullOrWhiteSpace(request.CanonicalAddress))return Results.BadRequest(new{success=false,status="confirmed_address_required",message="Confirm a canonical address first."});var property=await PropertyFeaturesLookupService.LookupAsync(request.CanonicalAddress);var lat=property.Latitude??request.Latitude;var lng=property.Longitude??request.Longitude;var imagery=lat.HasValue&&lng.HasValue?new{status="review_available",streetViewUrl=$"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat.Value.ToString(CultureInfo.InvariantCulture)},{lng.Value.ToString(CultureInfo.InvariantCulture)}",satelliteUrl=$"https://www.google.com/maps/search/?api=1&query={lat.Value.ToString(CultureInfo.InvariantCulture)},{lng.Value.ToString(CultureInfo.InvariantCulture)}",aiReviewStatus="disabled_pending_licensing",message="Visual evidence requires office review. Google imagery is not submitted to external AI."}:new{status="unavailable",streetViewUrl="",satelliteUrl="",aiReviewStatus="disabled_pending_licensing",message="Coordinates were unavailable; continue with manual property review."};return Results.Ok(new{address=new{canonicalAddress=request.CanonicalAddress,placeId=request.PlaceId??"",latitude=lat,longitude=lng,confirmed=true},property=new{property.Status,source="PropertyValue",fields=property,warnings=string.IsNullOrWhiteSpace(property.Error)?Array.Empty<string>():new[]{property.Error}},imagery,suggestions=Array.Empty<object>(),manualReviewAvailable=true});}
-    catch(Exception ex){return Results.Problem(ex.Message,statusCode:500,title:"Enrich quote address failed");}
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(string.IsNullOrWhiteSpace(request.CanonicalAddress))return Results.BadRequest(new{success=false,status="confirmed_address_required",message="Confirm a canonical address first."});
+        return Results.Ok(await AutoMateApi.RailwayPropertyMediaService.EnrichAsync(request,builder.Configuration,context.RequestAborted));
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="property_enrichment_unavailable",message=ex.Message},statusCode:422);}
+    catch(Exception){return Results.Problem("The property service is temporarily unavailable.",statusCode:503,title:"Enrich quote address failed");}
+});
+app.MapGet("/automation/jobs/{jobId:guid}/location-media",async(HttpContext context,Guid tenantId,Guid jobId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        await using var command=new NpgsqlCommand("SELECT COALESCE(site_address,'') FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job LIMIT 1",conn);command.Parameters.AddWithValue("tenant",tenantId.ToString("D"));command.Parameters.AddWithValue("job",jobId);
+        var address=Convert.ToString(await command.ExecuteScalarAsync(context.RequestAborted))??"";if(string.IsNullOrWhiteSpace(address))return Results.NotFound(new{success=false,status="job_address_unavailable",message="This job does not have a current property address."});
+        return Results.Ok(await AutoMateApi.RailwayPropertyMediaService.LoadJobMediaAsync(address,builder.Configuration,context.RequestAborted));
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="property_media_unavailable",message=ex.Message},statusCode:422);}
+    catch(Exception){return Results.Problem("The property imagery service is temporarily unavailable.",statusCode:503,title:"Load job location media failed");}
+});
+app.MapGet("/automation/property-services/capabilities",async(HttpContext context,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;return Results.Ok(await AutoMateApi.RailwayPropertyMediaService.CheckCapabilitiesAsync(builder.Configuration,context.RequestAborted));}
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,ready=false,message=ex.Message},statusCode:422);}
+    catch(Exception){return Results.Problem("The provider capability check is temporarily unavailable.",statusCode:503,title:"Check property services failed");}
 });
 app.MapPost("/automation/quotes/drafts",async(HttpContext context,AutoMateApi.QuoteDraftSaveRequest request)=>
 {

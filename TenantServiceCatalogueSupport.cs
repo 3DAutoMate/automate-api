@@ -107,6 +107,11 @@ END $$;
             foreach(var id in rule.CategoryIds??[])if(!categoryIds.Contains(id))errors.Add(new("Floor-area pricing","category_missing","An applicable service category no longer exists."));
         }
         if(quantityRules.Count(x=>x.Active)>1)errors.Add(new("Floor-area pricing","duplicate_active_rule","Only one floor-area pricing rule may be active."));
+        if(draft.TravelPricingRule is { Active:true } travel)
+        {
+            if(travel.RuleVersion!=1||string.IsNullOrWhiteSpace(travel.InvoiceItemId)||string.IsNullOrWhiteSpace(travel.InvoiceItemName)||travel.PriceInclGst<=0)
+                errors.Add(new("Travel charge","invoice_item_required","Choose one active THREED invoice item with a positive GST-inclusive travel price."));
+        }
         return new(errors.Count == 0, errors, warnings);
     }
 
@@ -288,7 +293,7 @@ UPDATE public.jobs_staging SET service_catalogue_review_required=true WHERE tena
     private static string Normalize(string? value)=>(value??"").Trim().ToLowerInvariant();
 }
 
-public sealed record ServiceCatalogueDraft(int ContractVersion,string DiscoveryFingerprint,List<FieldClassificationDraft> Fields,List<ServiceCategoryDraft> Categories,List<ServiceDefinitionDraft> Services,List<ModifierGroupDraft> ModifierGroups,List<QuantityPricingRuleDraft>? QuantityPricingRules=null);
+public sealed record ServiceCatalogueDraft(int ContractVersion,string DiscoveryFingerprint,List<FieldClassificationDraft> Fields,List<ServiceCategoryDraft> Categories,List<ServiceDefinitionDraft> Services,List<ModifierGroupDraft> ModifierGroups,List<QuantityPricingRuleDraft>? QuantityPricingRules=null,TravelPricingRuleDraft? TravelPricingRule=null);
 public sealed record FieldClassificationDraft(string SourceField,string SourceLabel,string Role);
 public sealed record ServiceCategoryDraft(Guid Id,string Name,bool Archived,int SortOrder);
 public sealed record ServiceDefinitionDraft(Guid Id,string Name,Guid CategoryId,bool Archived,List<ServiceSourceBinding> Bindings);
@@ -296,6 +301,7 @@ public sealed record ServiceSourceBinding(string SourceField,string SourceLabel,
 public sealed record ModifierGroupDraft(Guid Id,string Name,string SourceField,string SourceLabel,bool Archived,bool AllCategories,List<Guid> CategoryIds,List<ModifierOptionDraft> Options);
 public sealed record ModifierOptionDraft(string ListItemId,string ListItemName,string NormalizedValue,bool Active,string InvoiceItemId,string InvoiceItemName,decimal? InvoiceItemPrice);
 public sealed record QuantityPricingRuleDraft(Guid Id,int RuleVersion,string SourceCanonicalField,string InvoiceItemId,string InvoiceItemName,decimal UnitRateInclGst,bool AllCategories,List<Guid> CategoryIds,bool Active);
+public sealed record TravelPricingRuleDraft(Guid Id,int RuleVersion,string InvoiceItemId,string InvoiceItemName,decimal PriceInclGst,bool Active);
 public sealed record ServiceCatalogueIssue(string Subject,string Code,string Message);
 public sealed record ServiceCatalogueValidation(bool Valid,List<ServiceCatalogueIssue> Errors,List<ServiceCatalogueIssue> Warnings);
 public sealed record ServiceCatalogueState(int DraftVersion,int ActiveVersion,ServiceCatalogueDraft Draft,string DiscoveryFingerprint,ServiceCatalogueValidation Validation);
