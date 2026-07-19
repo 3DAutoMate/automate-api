@@ -8,7 +8,8 @@ public static class ControlledTestCycleEndpoints
         this WebApplication app,
         string connectionString,
         Func<HttpContext, Guid, CancellationToken, Task<bool>> authorizeTenantAdmin,
-        Func<HttpContext, Guid, CancellationToken, Task<string>> resolveActor)
+        Func<HttpContext, Guid, CancellationToken, Task<string>> resolveActor,
+        Func<HttpContext, Guid, Guid, CancellationToken, Task<IReadOnlyList<CalendarDiscoveryEvent>>>? discoverCalendar = null)
     {
         app.MapGet("/jobs/{jobId:guid}/controlled-test", async (HttpContext context, Guid jobId, Guid tenantId) =>
             await Execute(context, tenantId, jobId, false, async connection =>
@@ -27,13 +28,44 @@ public static class ControlledTestCycleEndpoints
             await Execute(context, tenantId, jobId, false, async connection =>
                 await ControlledTestCycleSupport.LoadReadinessAsync(connection, tenantId, jobId, context.RequestAborted)));
 
+        app.MapPost("/jobs/{jobId:guid}/test-cycle/accept-baseline", async (
+            HttpContext context, Guid jobId, ControlledTestBaselineAcceptApiRequest request) =>
+        {
+            if (!string.Equals(request.ConfirmationText, "ACCEPT CURRENT TEST BASELINE", StringComparison.Ordinal))
+                return Results.Json(new { success = false, status = "confirmation_required", message = "Type ACCEPT CURRENT TEST BASELINE exactly." }, statusCode: 409);
+            return await Execute(context, request.TenantId, jobId, true, async connection =>
+            {
+                var actor = await resolveActor(context, request.TenantId, context.RequestAborted);
+                return await ControlledTestCycleSupport.AcceptPendingBaselineAsync(connection,
+                    new(request.TenantId, jobId, request.ExpectedApprovedVersion, request.ExpectedPendingFingerprint,
+                        request.Confirmed, request.Reason, request.IdempotencyKey, actor), context.RequestAborted);
+            });
+        });
+
+        app.MapPost("/jobs/{jobId:guid}/test-cycle/calendar/discover", async (
+            HttpContext context, Guid jobId, ControlledCalendarDiscoveryApiRequest request) =>
+        {
+            if (!string.Equals(request.ConfirmationText, "DISCOVER EXISTING CALENDAR", StringComparison.Ordinal))
+                return Results.Json(new { success = false, status = "confirmation_required", message = "Type DISCOVER EXISTING CALENDAR exactly." }, statusCode: 409);
+            return await Execute(context, request.TenantId, jobId, true, async connection =>
+            {
+                if (discoverCalendar is null)
+                    throw new ControlledTestCycleException("calendar_discovery_not_configured", "Read-only Calendar discovery is not wired on this server.");
+                var actor = await resolveActor(context, request.TenantId, context.RequestAborted);
+                var events = await discoverCalendar(context, request.TenantId, jobId, context.RequestAborted);
+                return await ControlledTestCycleSupport.RetainCalendarDiscoveryAsync(connection,
+                    new(request.TenantId, jobId, request.ExpectedApprovedVersion, request.Confirmed,
+                        request.Reason, request.IdempotencyKey, actor), events, context.RequestAborted);
+            });
+        });
+
         app.MapPost("/jobs/{jobId:guid}/test-cycle/prepare", async (HttpContext context, Guid jobId, ControlledTestPrepareApiRequest request) =>
             await Execute(context, request.TenantId, jobId, true, async connection =>
             {
                 var actor = await resolveActor(context, request.TenantId, context.RequestAborted);
                 return await ControlledTestCycleSupport.PrepareAsync(connection,
                     new(request.TenantId, jobId, request.ExpectedDesignationVersion, request.ExpectedApprovedVersion,
-                        request.Confirmed, request.Reason, request.IdempotencyKey, actor, NormalizeXeroPolicy(request.XeroPolicy)),
+                        request.Confirmed, request.Reason, request.IdempotencyKey, actor, NormalizeXeroPolicy(request.XeroPolicy), request.FullRetest),
                     context.RequestAborted);
             }));
 
@@ -58,7 +90,7 @@ public static class ControlledTestCycleEndpoints
                 return await ControlledTestCycleSupport.StartAsync(connection,
                     new(request.TenantId, jobId, cycleId, request.ExpectedApprovedVersion,
                         request.ExpectedReconciliationFingerprint, request.Confirmed, request.Reason,
-                        request.IdempotencyKey, actor, NormalizeXeroPolicy(request.XeroPolicy)), context.RequestAborted);
+                        request.IdempotencyKey, actor, NormalizeXeroPolicy(request.XeroPolicy), request.FullRetest), context.RequestAborted);
             });
         });
 
@@ -114,6 +146,28 @@ public sealed class ControlledTestPrepareApiRequest
     public string Reason { get; set; } = "";
     public string IdempotencyKey { get; set; } = "";
     public string XeroPolicy { get; set; } = "retain_existing";
+    public bool FullRetest { get; set; }
+}
+
+public sealed class ControlledTestBaselineAcceptApiRequest
+{
+    public Guid TenantId { get; set; }
+    public int ExpectedApprovedVersion { get; set; }
+    public string ExpectedPendingFingerprint { get; set; } = "";
+    public bool Confirmed { get; set; }
+    public string ConfirmationText { get; set; } = "";
+    public string Reason { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
+}
+
+public sealed class ControlledCalendarDiscoveryApiRequest
+{
+    public Guid TenantId { get; set; }
+    public int ExpectedApprovedVersion { get; set; }
+    public bool Confirmed { get; set; }
+    public string ConfirmationText { get; set; } = "";
+    public string Reason { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
 }
 
 public sealed class ControlledTestReconcileApiRequest
@@ -135,4 +189,5 @@ public sealed class ControlledTestStartApiRequest
     public string Reason { get; set; } = "";
     public string IdempotencyKey { get; set; } = "";
     public string XeroPolicy { get; set; } = "retain_existing";
+    public bool FullRetest { get; set; }
 }

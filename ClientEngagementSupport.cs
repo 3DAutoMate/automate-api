@@ -26,6 +26,13 @@ public static class ClientEngagementSupport
             updated_by text NOT NULL DEFAULT '',
             updated_at timestamptz NOT NULL DEFAULT NOW()
         );
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS introduction_text text NOT NULL DEFAULT 'Hello {{CLIENT_SALUTATION}}. Here are the approved details for your inspection.';
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS payment_instruction text NOT NULL DEFAULT 'Your invoice will be sent to {{CLIENT_EMAIL}}. Payment is required to secure your booking time.';
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS bank_account_name text NOT NULL DEFAULT '';
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS bank_account_number text NOT NULL DEFAULT '';
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS payment_reference_instruction text NOT NULL DEFAULT '';
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS show_bank_with_accounting boolean NOT NULL DEFAULT false;
+        ALTER TABLE public.client_engagement_settings ADD COLUMN IF NOT EXISTS brand_colour text NOT NULL DEFAULT '#0b5f86';
 
         CREATE TABLE IF NOT EXISTS public.client_engagement_setting_commands
         (
@@ -172,13 +179,14 @@ public static class ClientEngagementSupport
             await ensure.ExecuteNonQueryAsync(cancellationToken);
         }
         await using var command = new NpgsqlCommand("""
-            SELECT page_enabled,pixel_enabled,version,updated_at
+            SELECT page_enabled,pixel_enabled,version,updated_at,introduction_text,payment_instruction,
+                   bank_account_name,bank_account_number,payment_reference_instruction,show_bank_with_accounting,brand_colour
             FROM public.client_engagement_settings WHERE tenant_id=@tenant;
             """, connection);
         command.Parameters.AddWithValue("tenant", tenantId);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         await reader.ReadAsync(cancellationToken);
-        return new(tenantId, reader.GetBoolean(0), reader.GetBoolean(1), reader.GetInt32(2), reader.GetDateTime(3));
+        return new(tenantId,reader.GetBoolean(0),reader.GetBoolean(1),reader.GetInt32(2),reader.GetDateTime(3),reader.GetString(4),reader.GetString(5),reader.GetString(6),reader.GetString(7),reader.GetString(8),reader.GetBoolean(9),reader.GetString(10));
     }
 
     public static async Task<ClientEngagementSettingsSaveResult> SaveSettingsAsync(NpgsqlConnection connection,
@@ -192,7 +200,7 @@ public static class ClientEngagementSupport
         await EnsureAsync(connection, cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
         var requestHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
-            $"{request.TenantId:N}|{request.PageEnabled}|{request.PixelEnabled}|{request.ExpectedVersion}"))).ToLowerInvariant();
+            $"{request.TenantId:N}|{request.PageEnabled}|{request.PixelEnabled}|{request.ExpectedVersion}|{request.IntroductionText}|{request.PaymentInstruction}|{request.BankAccountName}|{request.BankAccountNumber}|{request.PaymentReferenceInstruction}|{request.ShowBankWithAccounting}|{request.BrandColour}"))).ToLowerInvariant();
         await using (var claim = new NpgsqlCommand("""
             INSERT INTO public.client_engagement_setting_commands(tenant_id,idempotency_key,request_hash)
             VALUES(@tenant,@key,@hash) ON CONFLICT DO NOTHING;
@@ -248,14 +256,16 @@ public static class ClientEngagementSupport
         ClientEngagementSettingsSaveResult result;
         if (currentVersion != request.ExpectedVersion)
         {
-            result = new("conflict", new(request.TenantId, previousPage, previousPixel, currentVersion, DateTime.UtcNow),
+            result = new("conflict", await LoadSettingsAsync(connection,request.TenantId,cancellationToken),
                 "Engagement settings changed. Reload and try again.");
         }
         else
         {
         const string sql = """
             UPDATE public.client_engagement_settings
-            SET page_enabled=@page,pixel_enabled=@pixel,version=version+1,updated_by=@actor,updated_at=NOW()
+            SET page_enabled=@page,pixel_enabled=@pixel,introduction_text=@intro,payment_instruction=@payment,
+                bank_account_name=@bank_name,bank_account_number=@bank_number,payment_reference_instruction=@reference,
+                show_bank_with_accounting=@show_bank,brand_colour=@brand,version=version+1,updated_by=@actor,updated_at=NOW()
             WHERE tenant_id=@tenant AND version=@expected
             RETURNING page_enabled,pixel_enabled,version,updated_at;
             """;
@@ -263,13 +273,19 @@ public static class ClientEngagementSupport
         {
             command.Parameters.AddWithValue("page", request.PageEnabled);
             command.Parameters.AddWithValue("pixel", request.PixelEnabled);
+            command.Parameters.AddWithValue("intro", CleanSetting(request.IntroductionText,500));
+            command.Parameters.AddWithValue("payment", CleanSetting(request.PaymentInstruction,500));
+            command.Parameters.AddWithValue("bank_name", CleanSetting(request.BankAccountName,120));
+            command.Parameters.AddWithValue("bank_number", CleanSetting(request.BankAccountNumber,80));
+            command.Parameters.AddWithValue("reference", CleanSetting(request.PaymentReferenceInstruction,200));
+            command.Parameters.AddWithValue("show_bank",request.ShowBankWithAccounting);
+            command.Parameters.AddWithValue("brand",ValidBrand(request.BrandColour));
             command.Parameters.AddWithValue("actor", request.Actor.Trim());
             command.Parameters.AddWithValue("tenant", request.TenantId);
             command.Parameters.AddWithValue("expected", request.ExpectedVersion);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             await reader.ReadAsync(cancellationToken);
-            var settings = new ClientEngagementSettings(request.TenantId, reader.GetBoolean(0), reader.GetBoolean(1),
-                reader.GetInt32(2), reader.GetDateTime(3));
+            var settings=new ClientEngagementSettings(request.TenantId,reader.GetBoolean(0),reader.GetBoolean(1),reader.GetInt32(2),reader.GetDateTime(3),CleanSetting(request.IntroductionText,500),CleanSetting(request.PaymentInstruction,500),CleanSetting(request.BankAccountName,120),CleanSetting(request.BankAccountNumber,80),CleanSetting(request.PaymentReferenceInstruction,200),request.ShowBankWithAccounting,ValidBrand(request.BrandColour));
             result = new("saved", settings, "Client engagement settings saved.");
         }
         await using var audit = new NpgsqlCommand("""
@@ -573,7 +589,6 @@ public static class ClientEngagementSupport
         Guid tenantId, Guid jobId, CancellationToken cancellationToken = default)
     {
         if (tenantId == Guid.Empty || jobId == Guid.Empty) throw new ArgumentException("Tenant and job IDs are required.");
-        await EnsureAsync(connection, cancellationToken);
         const string sql = """
             SELECT c.communication_id,c.publication_id,c.recipient_key,c.purpose,c.delivery_state,
                    c.issued_at,c.expires_at,c.accepted_at,c.failed_at,c.provider,c.connector_version,
@@ -814,7 +829,7 @@ public static class ClientEngagementSupport
     private static string NormalizeEvent(string value)
     {
         var normalized = (value ?? "").Trim().ToLowerInvariant();
-        return normalized is "pixel" or "view" or "confirm" or "calendar" ? normalized :
+        return normalized is "pixel" or "view" or "confirm" or "calendar" or "terms" or "terms_status" or "payment_status" or "booking_complete" ? normalized :
             throw new ArgumentException("Unsupported engagement event.");
     }
 
@@ -910,6 +925,14 @@ public static class ClientEngagementSupport
             if (text.Contains(marker, StringComparison.OrdinalIgnoreCase)) return "[REDACTED DELIVERY ERROR]";
         return text;
     }
+
+    private static string CleanSetting(string? value,int maximum)
+    {
+        var text=WebUtility.HtmlDecode(value??"").Replace("<","").Replace(">","");
+        text=new string(text.Where(c=>!char.IsControl(c)||c is '\r' or '\n' or '\t').ToArray()).Trim();
+        return text[..Math.Min(maximum,text.Length)];
+    }
+    private static string ValidBrand(string? value)=>System.Text.RegularExpressions.Regex.IsMatch(value??"", "^#[0-9a-fA-F]{6}$")?value!.ToLowerInvariant():"#0b5f86";
 }
 
 public sealed record ClientPageToken(string Secret, string Hash);
@@ -927,9 +950,9 @@ public sealed record ClientEngagementCommand(Guid CommunicationId, Guid TenantId
     string EventKey, string? IpAddress, string? UserAgent, string? Referrer, string? MetadataJson);
 public sealed record ClientEngagementResult(Guid EventId, string EventType, DateTime OccurredAt, bool Replayed);
 public sealed record RevokeClientPageCommand(Guid TenantId, Guid JobId, string Reason, string Actor);
-public sealed record ClientEngagementSettings(Guid TenantId, bool PageEnabled, bool PixelEnabled, int Version, DateTime UpdatedAt);
+public sealed record ClientEngagementSettings(Guid TenantId,bool PageEnabled,bool PixelEnabled,int Version,DateTime UpdatedAt,string IntroductionText,string PaymentInstruction,string BankAccountName,string BankAccountNumber,string PaymentReferenceInstruction,bool ShowBankWithAccounting,string BrandColour);
 public sealed record SaveClientEngagementSettingsCommand(Guid TenantId, bool PageEnabled, bool PixelEnabled,
-    int ExpectedVersion, string IdempotencyKey, bool Confirmed, string Actor);
+    int ExpectedVersion,string IdempotencyKey,bool Confirmed,string Actor,string IntroductionText="Hello {{CLIENT_SALUTATION}}. Here are the approved details for your inspection.",string PaymentInstruction="Your invoice will be sent to {{CLIENT_EMAIL}}. Payment is required to secure your booking time.",string BankAccountName="",string BankAccountNumber="",string PaymentReferenceInstruction="",bool ShowBankWithAccounting=false,string BrandColour="#0b5f86");
 public sealed record ClientEngagementSettingsSaveResult(string Status, ClientEngagementSettings? Settings, string Message);
 public sealed record MarkClientDeliveryCommand(Guid TenantId, Guid JobId, Guid CommunicationId, bool Accepted,
     string? Provider, string? ConnectorVersion, string? RedactedError, string Actor);

@@ -32,6 +32,9 @@ ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS approved_snapshot_finge
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS approved_snapshot_version integer NOT NULL DEFAULT 0;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS current_snapshot_json jsonb NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS current_snapshot_fingerprint text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS current_snapshot_captured_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS current_snapshot_source_modified_at timestamptz NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS live_baseline_updated_at timestamptz NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS change_review_pending boolean NOT NULL DEFAULT false;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS pending_change_json jsonb NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS pending_change_fingerprint text NULL;
@@ -79,9 +82,31 @@ WHERE approved_snapshot_json IS NULL AND COALESCE(raw_payload_json,'') <> ''", c
             if (payload == null) continue;
             string snapshot = BuildSnapshot(payload), fingerprint = Fingerprint(snapshot);
             await using var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET approved_snapshot_json=CAST(@snapshot AS jsonb),approved_snapshot_fingerprint=@fingerprint,
-approved_snapshot_version=1,current_snapshot_json=CAST(@snapshot AS jsonb),current_snapshot_fingerprint=@fingerprint WHERE job_id=@job AND approved_snapshot_json IS NULL", conn);
+approved_snapshot_version=1,current_snapshot_json=CAST(@snapshot AS jsonb),current_snapshot_fingerprint=@fingerprint,
+current_snapshot_captured_at=NOW(),current_snapshot_source_modified_at=source_updated_at,live_baseline_updated_at=NOW()
+WHERE job_id=@job AND approved_snapshot_json IS NULL", conn);
             update.Parameters.AddWithValue("job", row.JobId); update.Parameters.AddWithValue("snapshot", snapshot); update.Parameters.AddWithValue("fingerprint", fingerprint); await update.ExecuteNonQueryAsync();
         }
+    }
+
+    public static async Task<int> AdoptInactiveLiveBaselinesAsync(NpgsqlConnection conn, string actor, CancellationToken cancellationToken = default)
+    {
+        await EnsureAsync(conn);
+        var rows = new List<(Guid JobId, Guid TenantId, string Fingerprint)>();
+        await using (var select = new NpgsqlCommand(@"SELECT job_id,tenant_id::text,COALESCE(current_snapshot_fingerprint,'')
+FROM public.jobs_staging
+WHERE change_review_pending=true AND automate_status IN ('Unscheduled','Cancelled','Complete')
+  AND current_snapshot_json IS NOT NULL AND COALESCE(current_snapshot_fingerprint,'')<>''", conn))
+        await using (var reader = await select.ExecuteReaderAsync(cancellationToken))
+            while (await reader.ReadAsync(cancellationToken))
+                if (Guid.TryParse(reader.GetString(1), out var tenant)) rows.Add((reader.GetGuid(0), tenant, reader.GetString(2)));
+        var adopted = 0;
+        foreach (var row in rows)
+        {
+            await AutoMateApi.JobReconciliationSupport.AcceptCurrentAsync(conn,row.TenantId,row.JobId,row.Fingerprint,actor,cancellationToken);
+            adopted++;
+        }
+        return adopted;
     }
 
     public static async Task RepairPendingChangesAsync(NpgsqlConnection conn)
@@ -118,11 +143,13 @@ pending_change_fingerprint=@fingerprint WHERE job_id=@job AND change_review_pend
         static string Money(string? value) => decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var amount) ? amount.ToString("0.00", CultureInfo.InvariantCulture) : T(value);
         var fields = new SortedDictionary<string, object?>(StringComparer.Ordinal)
         {
+            ["snapshotSchemaVersion"] = 2,
             ["address"] = T(payload.Job?.SiteAddress), ["jobDate"] = T(payload.Job?.JobDate),
+            ["inspectorId"] = T(payload.Job?.InspectorId), ["inspectorName"] = T(payload.Job?.InspectorName),
             ["durationMinutes"] = payload.Job?.InspectionDurationMinutes ?? 0, ["invoiceTotal"] = Money(payload.Job?.InvoiceTotal),
             ["notes"] = T(payload.Job?.Notes), ["directions"] = T(payload.Job?.Directions), ["instructions"] = T(payload.Job?.Instructions),
             ["primaryService"] = T(payload.Services?.Primary), ["additionalService1"] = T(payload.Services?.Additional1), ["additionalService2"] = T(payload.Services?.Additional2),
-            ["buildingType"] = T(payload.JobDetails?.BuildingType), ["stories"] = T(payload.JobDetails?.Stories),
+            ["buildingType"] = T(payload.JobDetails?.BuildingType), ["stories"] = T(payload.JobDetails?.Stories), ["floorArea"] = T(payload.JobDetails?.FloorArea),
             ["outbuilding"] = T(payload.JobDetails?.Outbuilding), ["occupied"] = T(payload.JobDetails?.Occupied),
             ["attachedFlat"] = T(payload.JobDetails?.AttachedFlat), ["travelFee"] = T(payload.JobDetails?.TravelFee),
             ["hhsBedrooms"] = T(payload.JobDetails?.HhsBedrooms), ["methSamples"] = T(payload.JobDetails?.MethSamples),
@@ -130,8 +157,7 @@ pending_change_fingerprint=@fingerprint WHERE job_id=@job AND change_review_pend
             ["foundationSpace"] = T(payload.JobDetails?.FoundationSpace), ["weathertightness"] = T(payload.JobDetails?.Weathertightness),
             ["hhsReinspectDate"] = T(payload.JobDetails?.HhsReinspectDate), ["accessBy"] = T(payload.JobDetails?.AccessBy),
             ["hhsCompliance"] = T(payload.JobDetails?.HhsCompliance),
-            ["clientName"] = T(string.Join(" ", new[] { payload.Contact1?.FirstName, payload.Contact1?.LastName }.Where(v => !string.IsNullOrWhiteSpace(v)))),
-            ["clientDisplayName"] = T(payload.Contact1?.DisplayName), ["clientSalutation"] = T(payload.Contact1?.Salutation),
+            ["clientFirstName"] = T(payload.Contact1?.FirstName), ["clientLastName"] = T(payload.Contact1?.LastName),
             ["clientEmail"] = T(payload.Contact1?.Email).ToLowerInvariant(), ["clientPhone"] = T(payload.Contact1?.Cellular),
             ["agentName"] = T(string.Join(" ", new[] { payload.Contact2?.FirstName, payload.Contact2?.LastName }.Where(v => !string.IsNullOrWhiteSpace(v)))),
             ["agentDisplayName"] = T(payload.Contact2?.DisplayName), ["agentSalutation"] = T(payload.Contact2?.Salutation),
@@ -230,6 +256,20 @@ FROM public.jobs_staging WHERE job_id=@job FOR UPDATE", conn, transaction))
                 return;
             }
 
+            using (var approvedDocument = JsonDocument.Parse(approvedJson))
+            {
+                if (!approvedDocument.RootElement.TryGetProperty("snapshotSchemaVersion", out var schema) ||
+                    !schema.TryGetInt32(out var schemaVersion) || schemaVersion < 2)
+                {
+                    // Schema migration only: capture the same live THREED state using
+                    // First/Last Name and inspector identity without firing providers.
+                    await UpdateBaselineAsync(conn, transaction, jobId, change.SnapshotJson, fingerprint, Math.Max(1, approvedVersion + 1));
+                    await AuditAsync(conn, jobId, tenantId, Math.Max(1, approvedVersion + 1), "snapshot_schema_upgraded", fingerprint, "[]", "representation_only", "AutoMate migration", transaction);
+                    await transaction.CommitAsync();
+                    return;
+                }
+            }
+
             var differences = Diff(approvedJson, change.SnapshotJson);
             if (differences.Count == 0)
             {
@@ -295,6 +335,7 @@ current_snapshot_fingerprint=@fingerprint,source_missing=false,source_missing_at
 
             await using (var update = new NpgsqlCommand(@"UPDATE public.jobs_staging SET
 current_snapshot_json=CAST(@snapshot AS jsonb),current_snapshot_fingerprint=@fingerprint,
+current_snapshot_captured_at=NOW(),current_snapshot_source_modified_at=source_updated_at,
 change_review_pending=true,pending_change_json=CAST(@changes AS jsonb),pending_change_fingerprint=@fingerprint,
 pending_change_reasons=@reasons,change_detected_at=CASE WHEN change_review_pending THEN COALESCE(change_detected_at,NOW()) ELSE NOW() END,
 xero_review_required=@xero,xero_review_change_owned=@xero_owned,
@@ -328,6 +369,7 @@ WHERE job_id=@job", conn, transaction))
         await using var cmd = new NpgsqlCommand(@"UPDATE public.jobs_staging SET
 approved_snapshot_json=CAST(@snapshot AS jsonb),approved_snapshot_fingerprint=@fingerprint,approved_snapshot_version=@version,
 current_snapshot_json=CAST(@snapshot AS jsonb),current_snapshot_fingerprint=@fingerprint,
+current_snapshot_captured_at=NOW(),current_snapshot_source_modified_at=source_updated_at,live_baseline_updated_at=NOW(),
 change_review_pending=false,pending_change_json=NULL,pending_change_fingerprint=NULL,pending_change_reasons=NULL,change_detected_at=NULL,
 xero_review_required=CASE WHEN xero_review_change_owned THEN false ELSE xero_review_required END,
 report_review_required=CASE WHEN report_review_change_owned THEN false ELSE report_review_required END,
@@ -337,6 +379,24 @@ xero_review_change_owned=false,report_review_change_owned=false,source_missing=f
         cmd.Parameters.AddWithValue("fingerprint", fingerprint);
         cmd.Parameters.AddWithValue("version", version);
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    public static async Task<int> AcceptForAutomaticRunAsync(NpgsqlConnection conn,Guid jobId,Guid tenantId,string snapshot,string fingerprint,string changes,string reasons)
+    {
+        await using var transaction=await conn.BeginTransactionAsync();
+        var version=1;
+        await using(var select=new NpgsqlCommand("SELECT approved_snapshot_version FROM public.jobs_staging WHERE job_id=@job AND tenant_id::text=@tenant FOR UPDATE",conn,transaction))
+        {
+            select.Parameters.AddWithValue("job",jobId);select.Parameters.AddWithValue("tenant",tenantId.ToString());
+            var value=await select.ExecuteScalarAsync();if(value==null){await transaction.RollbackAsync();throw new KeyNotFoundException("The synchronized job was not found.");}
+            version=Math.Max(1,Convert.ToInt32(value)+1);
+        }
+        // Advancing the THREED baseline must not reset or rewrite any provider
+        // evidence. The durable change-run ledger owns every follow-up action.
+        await UpdateBaselineAsync(conn,transaction,jobId,snapshot,fingerprint,version);
+        await AuditAsync(conn,jobId,tenantId,version,"automatic_change_run_prepared",fingerprint,changes,reasons,"THREED sync",transaction);
+        await transaction.CommitAsync();
+        return version;
     }
 
     public static async Task AuditAsync(NpgsqlConnection conn, Guid jobId, Guid tenantId, int version, string eventType, string fingerprint, string changes, string reasons, string actor, NpgsqlTransaction? transaction = null)
@@ -397,7 +457,7 @@ VALUES(@job,@tenant,@version,@event,@fingerprint,CAST(@changes AS jsonb),@reason
             return field switch
             {
                 "address" => NormalizeAddress(value),
-                "invoiceTotal" or "travelFee" => NormalizeDecimal(value, 2),
+                "invoiceTotal" or "travelFee" => NormalizeDecimal(value, 2), "floorArea" => NormalizeDecimal(value, 4),
                 "durationMinutes" => NormalizeDecimal(value, 0),
                 "jobDate" or "hhsReinspectDate" => NormalizeDate(value),
                 "clientEmail" or "agentEmail" => NormalizeText(value, ignoreCase: true),
@@ -446,8 +506,11 @@ VALUES(@job,@tenant,@version,@event,@fingerprint,CAST(@changes AS jsonb),@reason
 
     private static string NormalizeDate(string value)
     {
+        // THREED appointment fields are New Zealand wall-clock values. An offset was
+        // added to the wire format in 2026; that representation change must not look
+        // like the appointment itself moved by twelve hours.
         if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeLocal, out var date))
-            return date.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+            return date.DateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff", CultureInfo.InvariantCulture);
         return NormalizeText(value, ignoreCase: true);
     }
 
@@ -461,7 +524,8 @@ VALUES(@job,@tenant,@version,@event,@fingerprint,CAST(@changes AS jsonb),@reason
     {
         "address" => "address", "primaryService" or "additionalService1" or "additionalService2" => "services",
         "invoiceTotal" or "invoiceLines" => "price", "jobDate" or "durationMinutes" => "schedule",
-        "clientName" or "clientDisplayName" or "clientSalutation" or "clientEmail" or "clientPhone" => "customer", "agentName" or "agentDisplayName" or "agentSalutation" or "agentEmail" or "agentPhone" or "notes" or "directions" or "instructions" or "accessBy" => "operational",
+        "inspectorId" or "inspectorName" => "inspector",
+        "clientFirstName" or "clientLastName" or "clientEmail" or "clientPhone" => "customer", "agentName" or "agentDisplayName" or "agentSalutation" or "agentEmail" or "agentPhone" or "notes" or "directions" or "instructions" or "accessBy" => "operational",
         _ => "scope"
     };
 }

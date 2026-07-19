@@ -193,8 +193,10 @@ public static class CanonicalSyncGate
             return CanonicalSyncGateResult.Block("mapping_profile_invalid", "The active tenant mapping profile is not valid.");
         if (activeProfile.ContractVersion != envelope.ContractVersion)
             return CanonicalSyncGateResult.Block("mapping_contract_mismatch", "The sync and active profile use different mapping contracts.");
-        if (activeProfile.ProfileVersion != envelope.ProfileVersion || !FixedEquals(activeProfile.ProfileFingerprint, envelope.ProfileFingerprint))
-            return CanonicalSyncGateResult.Block("mapping_profile_mismatch", "The job was mapped with a different profile version. Re-sync it before workflow approval.");
+        // The fingerprint is the mapping-content identity. An internal revision change with the
+        // same fingerprint must not make every job stale or require a pointless re-sync.
+        if (!FixedEquals(activeProfile.ProfileFingerprint, envelope.ProfileFingerprint))
+            return CanonicalSyncGateResult.Block("mapping_profile_mismatch", "The job was mapped with different field assignments. Re-sync it before workflow approval.");
         if (!string.IsNullOrWhiteSpace(activeProfile.DiscoveryFingerprint) &&
             !string.IsNullOrWhiteSpace(envelope.DiscoveryFingerprint) &&
             !FixedEquals(activeProfile.DiscoveryFingerprint, envelope.DiscoveryFingerprint))
@@ -214,6 +216,11 @@ public static class CanonicalSyncGate
         {
             if (!TenantMappingProfileSupport.CanonicalFields.TryGetValue(property.Name, out var definition))
                 continue; // additive transport metadata remains forward compatible within contract v1
+            if (property.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                if (!definition.Required) continue;
+                return CanonicalSyncGateResult.Block("canonical_required_value_missing", $"Canonical field '{property.Name}' is required.");
+            }
             var valid = definition.ValueType switch
             {
                 "contact" => property.Value.ValueKind == JsonValueKind.Object,
@@ -276,7 +283,7 @@ public sealed class CanonicalSyncAccessors
             decimal.TryParse(Field(item, "unitPrice"), NumberStyles.Any, CultureInfo.InvariantCulture, out var unitPrice);
             decimal.TryParse(Field(item, "amount"), NumberStyles.Any, CultureInfo.InvariantCulture, out var amount);
             if (amount == 0m) amount = quantity * unitPrice;
-            lines.Add(new(index, Field(item, "description"), quantity, unitPrice, amount));
+            lines.Add(new(Field(item,"itemId","ItemId"),index, Field(item, "description"), quantity, unitPrice, amount));
         }
         return lines.OrderBy(x => x.LineIndex).ToArray();
     }
@@ -299,11 +306,12 @@ public sealed class CanonicalSyncAccessors
         payload.Job.AgeOfBuilding = Text("property.year_built", payload.Job.GetAgeOfBuilding());
         payload.JobDetails.Bedrooms = Integer("property.bedrooms")?.ToString(CultureInfo.InvariantCulture) ?? payload.JobDetails.Bedrooms;
         payload.JobDetails.Bathrooms = Integer("property.bathrooms")?.ToString(CultureInfo.InvariantCulture) ?? payload.JobDetails.Bathrooms;
+        payload.JobDetails.FloorArea = Decimal("property.floor_area")?.ToString("0.####", CultureInfo.InvariantCulture) ?? payload.JobDetails.FloorArea;
         payload.JobDetails.Stories = Integer("property.levels")?.ToString(CultureInfo.InvariantCulture) ?? payload.JobDetails.Stories;
         payload.JobDetails.BuildingType = Text("property.wall_roof", payload.JobDetails.BuildingType);
         ApplyContact(payload.Contact1, Contact(1), 0); ApplyContact(payload.Contact2, Contact(2), 1);
         payload.InvoiceLines = InvoiceLines().Select(x => new InvoiceLineSection
-        { LineIndex = x.LineIndex, Description = x.Description, Quantity = x.Quantity, UnitPrice = x.UnitPrice }).ToList();
+        { ItemId=x.ItemId, LineIndex = x.LineIndex, Description = x.Description, Quantity = x.Quantity, UnitPrice = x.UnitPrice, Amount = x.Amount }).ToList();
         if (Decimal("invoice.total") is { } total) payload.Job.InvoiceTotal = total.ToString("0.00", CultureInfo.InvariantCulture);
     }
 
@@ -323,7 +331,12 @@ public sealed class CanonicalSyncAccessors
     }
     private static string Field(JsonElement item, params string[] names)
     {
-        foreach (var name in names) if (item.TryGetProperty(name, out var value)) return ScalarText(value, "");
+        foreach (var name in names)
+        {
+            if (item.TryGetProperty(name, out var value)) return ScalarText(value, "");
+            foreach (var property in item.EnumerateObject())
+                if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) return ScalarText(property.Value, "");
+        }
         return "";
     }
     private string YesNo(string key) => Boolean(key) switch { true => "Yes", false => "No", _ => Text(key) };
@@ -381,7 +394,7 @@ public sealed record CanonicalSyncGateResult(bool Allowed, string Code, bool Com
     public static CanonicalSyncGateResult Block(string code, string message) => new(false, code, false, message);
 }
 public sealed record CanonicalContact(string FirstName, string LastName, string DisplayName, string Salutation, string Email, string Phone);
-public sealed record CanonicalInvoiceLine(int LineIndex, string Description, decimal Quantity, decimal UnitPrice, decimal Amount);
+public sealed record CanonicalInvoiceLine(string ItemId,int LineIndex, string Description, decimal Quantity, decimal UnitPrice, decimal Amount);
 
 public static class CanonicalSyncResolver
 {
@@ -426,9 +439,9 @@ public static class CanonicalSyncProjection
         SetBool(values,"scope.occupied",v=>payload.JobDetails.Occupied=v);SetBool(values,"scope.attached_flat",v=>payload.JobDetails.AttachedFlat=v);SetBool(values,"scope.travel_fee",v=>payload.JobDetails.TravelFee=v);
         SetBool(values,"scope.healthy_homes_reinspection",v=>payload.JobDetails.HhsReinspect=v);SetBool(values,"scope.property_file_review",v=>payload.JobDetails.CouncilFiles=v);SetBool(values,"scope.foundation_space",v=>payload.JobDetails.FoundationSpace=v);
         SetText(values,"scope.healthy_homes_bedrooms",v=>payload.JobDetails.HhsBedrooms=v);SetText(values,"scope.meth_samples",v=>payload.JobDetails.MethSamples=v);SetText(values,"scope.healthy_homes_reinspection_date",v=>payload.JobDetails.HhsReinspectDate=v);
-        SetText(values,"property.year_built",v=>payload.JobDetails.AgeOfBuilding=v);SetText(values,"property.bedrooms",v=>payload.JobDetails.Bedrooms=v);SetText(values,"property.bathrooms",v=>payload.JobDetails.Bathrooms=v);SetText(values,"property.levels",v=>payload.JobDetails.Stories=v);SetText(values,"property.wall_roof",v=>payload.JobDetails.BuildingType=v);
+        SetText(values,"property.year_built",v=>payload.JobDetails.AgeOfBuilding=v);SetText(values,"property.floor_area",v=>payload.JobDetails.FloorArea=v);SetText(values,"property.bedrooms",v=>payload.JobDetails.Bedrooms=v);SetText(values,"property.bathrooms",v=>payload.JobDetails.Bathrooms=v);SetText(values,"property.levels",v=>payload.JobDetails.Stories=v);SetText(values,"property.wall_roof",v=>payload.JobDetails.BuildingType=v);
         var contact1=values.Contact(1);if(contact1!=null)payload.Contact1=Contact(contact1,0,payload.Contact1?.RoleLabel??"Client");var contact2=values.Contact(2);if(contact2!=null)payload.Contact2=Contact(contact2,1,payload.Contact2?.RoleLabel??"Buyers Agent");
-        var lines=values.InvoiceLines();if(lines.Count>0)payload.InvoiceLines=lines.Select(x=>new InvoiceLineSection{LineIndex=x.LineIndex,Description=x.Description,Quantity=x.Quantity,UnitPrice=x.UnitPrice}).ToList();
+        var lines=values.InvoiceLines();if(lines.Count>0)payload.InvoiceLines=lines.Select(x=>new InvoiceLineSection{ItemId=x.ItemId,LineIndex=x.LineIndex,Description=x.Description,Quantity=x.Quantity,UnitPrice=x.UnitPrice,Amount=x.Amount}).ToList();
         var total=values.Decimal("invoice.total");if(total.HasValue)payload.Job.InvoiceTotal=total.Value.ToString("0.00",CultureInfo.InvariantCulture);
     }
     private static void SetBool(CanonicalSyncAccessors values,string key,Action<string> set){var value=values.Boolean(key);if(value.HasValue)set(value.Value?"Yes":"No");}

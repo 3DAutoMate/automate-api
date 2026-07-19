@@ -30,6 +30,7 @@ public static class StructuredAddressResolver
                 var label = Text(suggestion, "suggestion");
                 var suggestedStreet = NormalizeStreet(label.Split(',')[0]);
                 if (!suggestedStreet.Equals(street, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!IsAcceptableMatch(address, label)) continue;
                 var pageUrl = Text(suggestion, "url");
                 if (pageUrl.Length == 0) continue;
                 if (pageUrl.StartsWith('/')) pageUrl = "https://www.propertyvalue.co.nz" + pageUrl;
@@ -43,6 +44,15 @@ public static class StructuredAddressResolver
         return null;
     }
 
+    public static bool IsAcceptableMatch(string requestedAddress, string candidateAddress)
+    {
+        var requested = Parts(requestedAddress); var candidate = Parts(candidateAddress);
+        if (requested.Street.Length == 0 || !requested.Street.Equals(candidate.Street, StringComparison.OrdinalIgnoreCase)) return false;
+        if (requested.Postcode.Length > 0 && !requested.Postcode.Equals(candidate.Postcode, StringComparison.OrdinalIgnoreCase)) return false;
+        if (requested.Localities.Count > 0 && !requested.Localities.Overlaps(candidate.Localities)) return false;
+        return true;
+    }
+
     private static IEnumerable<string> BuildCandidates(string address)
     {
         var normalized = Regex.Replace(address.Trim(), "\\s+", " ");
@@ -54,6 +64,18 @@ public static class StructuredAddressResolver
     }
 
     private static string NormalizeStreet(string value) => Regex.Replace(value.Trim().ToUpperInvariant(), "[^A-Z0-9]", "");
+    private static AddressParts Parts(string value)
+    {
+        var pieces=(value??"").Split(',').Select(x=>x.Trim()).Where(x=>x.Length>0).ToArray();
+        var postcode=Regex.Match(value??"", @"\b\d{4}\b").Value;
+        var localities=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach(var piece in pieces.Skip(1))
+        {
+            var normalized=Regex.Replace(piece, @"\b\d{4}\b", "");
+            foreach(var token in Tokens(normalized)) localities.Add(token);
+        }
+        return new AddressParts(pieces.Length==0?"":NormalizeStreet(pieces[0]),postcode,localities);
+    }
     private static HashSet<string> Tokens(string value) => Regex.Matches(value.ToUpperInvariant(), "[A-Z0-9]+")
         .Select(match => match.Value).Where(token => token.Length > 1).ToHashSet(StringComparer.OrdinalIgnoreCase);
     private static string Text(JsonElement value, string name) => value.TryGetProperty(name, out var child) && child.ValueKind == JsonValueKind.String ? child.GetString() ?? "" : "";
@@ -73,4 +95,5 @@ public static class StructuredAddressResolver
         client.DefaultRequestHeaders.Accept.ParseAdd("application/json,text/html;q=0.9,*/*;q=0.8");
         return client;
     }
+    private sealed record AddressParts(string Street,string Postcode,HashSet<string> Localities);
 }

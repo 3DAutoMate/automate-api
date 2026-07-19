@@ -193,6 +193,7 @@ public static class BasicTemplateCommandSupport
         await AddAddressAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
         await AddPropertyAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
         await AddAutomationAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
+        await AddControlledTestAuditAsync(connection, tenantId, jobId, limit, entries, cancellationToken);
         return entries.OrderByDescending(x => x.CreatedAt).Take(limit).ToArray();
     }
 
@@ -430,6 +431,20 @@ public static class BasicTemplateCommandSupport
             FROM public.automation_foundation_audit WHERE job_id=@job AND tenant_id=@tenant ORDER BY created_at DESC LIMIT @source_limit;
             """;
         await ReadJobEntriesAsync(connection, sql, tenantId, jobId, sourceLimit, "Automation", target, cancellationToken);
+    }
+
+    private static async Task AddControlledTestAuditAsync(NpgsqlConnection connection, Guid tenantId, Guid jobId, int sourceLimit,
+        List<JobAuditEntry> target, CancellationToken cancellationToken)
+    {
+        if (!await TableExistsAsync(connection, "controlled_test_cycle_audit", cancellationToken)) return;
+        const string sql = """
+            SELECT audit_id::text,event_type,COALESCE(actor,''),
+                   CONCAT(COALESCE(reason,''),CASE WHEN COALESCE(details_json::text,'{}')='{}' THEN '' ELSE ' | '||details_json::text END),
+                   created_at,'',COALESCE((details_json->>'approvedVersion')::integer,0)
+            FROM public.controlled_test_cycle_audit
+            WHERE job_id=@job AND tenant_id=@tenant ORDER BY created_at DESC LIMIT @source_limit;
+            """;
+        await ReadJobEntriesAsync(connection, sql, tenantId, jobId, sourceLimit, "Controlled test", target, cancellationToken);
     }
 
     private static async Task ReadJobEntriesAsync(NpgsqlConnection connection, string sql, Guid tenantId,

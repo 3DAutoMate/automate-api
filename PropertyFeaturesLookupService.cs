@@ -59,6 +59,8 @@ public static class PropertyFeaturesLookupService
                 Number(core, "landArea"), Number(additional, "floorArea"), Text(additional, "yearBuilt"), Text(additional, "decadeBuilt"),
                 Text(additional, "roofMaterial"), Text(additional, "wallMaterial"), totalFloors, legal,
                 Text(location, "councilArea"), Text(Child(location, "postcode"), "name"));
+            if (!StructuredAddressResolver.IsAcceptableMatch(address, result.FormattedAddress))
+                return Failed(fingerprint, $"PropertyValue returned a different locality: {result.FormattedAddress}. THREED address: {address}.");
             Cache[fingerprint] = result;
             return result;
         }

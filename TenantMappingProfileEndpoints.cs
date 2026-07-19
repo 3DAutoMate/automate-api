@@ -46,12 +46,21 @@ public static class TenantMappingProfileEndpoints
             await using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync(ct);
             await TenantMappingProfileSupport.EnsureAsync(connection, ct);
-            var result = await TenantMappingProfileSupport.SaveVersionAsync(connection, tenantId, request.ExpectedVersion, request.Profile, actor, ct);
+            var result = await TenantMappingProfileSupport.SaveCurrentAsync(connection, tenantId, request.ExpectedVersion, request.Profile, actor, ct);
+            if(result.Status!="conflict")
+            {
+                if(result.Validation.IsValid)
+                    await AutoMateApi.AuthoritativeAttentionSupport.ResolveTenantReasonAsync(connection,tenantId,"mapping_review",ct);
+                await AutoMateApi.AuthoritativeAttentionSupport.ReconcileAsync(connection,tenantId,ct);
+            }
             return result.Status == "conflict"
                 ? Results.Json(new { success = false, code = result.Status, result.Message, result.CurrentVersion, result.Validation }, statusCode: 409)
                 : Results.Ok(new { success = true, result.Status, result.CurrentVersion, result.ProfileFingerprint, result.Validation, result.Message });
         });
 
+        endpoints.MapTenantServiceCatalogueEndpoints(connectionString, authorizeTenant, resolveActor);
+        endpoints.MapTenantContactConfigurationEndpoints(connectionString, authorizeTenant, resolveActor);
+        endpoints.MapTenantAgreementPolicyEndpoints(connectionString, authorizeTenant, resolveActor);
         return endpoints;
     }
 }

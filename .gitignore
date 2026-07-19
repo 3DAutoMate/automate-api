@@ -1,22 +1,6 @@
-# Build outputs
-bin/
-obj/
-
-# User-specific files
-*.user
-*.suo
-
-# Logs
-*.log
-
-# VS Code / Visual Studio
-.vs/
-.vscode/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Local config (CRITICAL)
 appsettings.Local.json
 appsettings.Development.json
+.vs/
+bin/
+obj/
+*.user

@@ -5,9 +5,10 @@ using Npgsql;
 using NpgsqlTypes;
 
 /// <summary>
-/// Tenant-owned, immutable mapping profile versions. This is deliberately independent from the
-/// legacy inspector_field_mappings tables so existing connector releases remain compatible while
-/// consumers migrate to canonical fields.
+/// Tenant-owned current mapping. Internal revision numbers provide optimistic concurrency,
+/// while only the Current complete mapping payload is retained.
+/// This remains independent from the legacy inspector_field_mappings tables while consumers
+/// migrate to canonical fields.
 /// </summary>
 public static class TenantMappingProfileSupport
 {
@@ -95,6 +96,12 @@ CREATE TABLE IF NOT EXISTS public.tenant_mapping_profile_audit
 
 CREATE INDEX IF NOT EXISTS idx_mapping_profile_audit_tenant_created
 ON public.tenant_mapping_profile_audit(tenant_id, created_at DESC);
+
+DELETE FROM public.tenant_mapping_profile_versions v
+USING public.tenant_mapping_profiles p
+WHERE v.tenant_id=p.tenant_id
+  AND v.profile_version<>p.current_version;
+
 DO $$ BEGIN
  IF to_regclass('public.jobs_staging') IS NOT NULL THEN
   ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS mapping_contract_version integer NULL;
@@ -110,6 +117,25 @@ DO $$ BEGIN
   ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS mapping_review_required boolean NOT NULL DEFAULT false;
   ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS mapping_attention_reason text NULL;
   ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS mapping_synced_at timestamptz NULL;
+
+  UPDATE public.jobs_staging j
+  SET mapping_contract_version=v.contract_version,
+      mapping_profile_version=p.current_version,
+      mapping_validation_status='valid',
+      mapping_compatibility_mode=false,
+      mapping_workflow_ready=true,
+      mapping_review_required=false,
+      mapping_attention_reason=NULL
+  FROM public.tenant_mapping_profiles p
+  JOIN public.tenant_mapping_profile_versions v
+    ON v.tenant_id=p.tenant_id AND v.profile_version=p.current_version
+  WHERE j.tenant_id::text=p.tenant_id::text
+    AND v.validation_status='valid'
+    AND COALESCE(j.mapping_profile_fingerprint,'')=v.profile_fingerprint
+    AND COALESCE(j.mapping_discovery_fingerprint,'')=COALESCE(v.discovery_fingerprint,'')
+    AND (COALESCE(j.mapping_profile_version,0)<>p.current_version
+      OR NOT COALESCE(j.mapping_workflow_ready,false)
+      OR COALESCE(j.mapping_review_required,false));
  END IF;
 END $$;
 """;
@@ -191,7 +217,7 @@ WHERE p.tenant_id=@tenant;
         return await reader.ReadAsync(cancellationToken) ? ReadVersion(tenantId, reader) : null;
     }
 
-    public static async Task<MappingSaveResult> SaveVersionAsync(
+    public static async Task<MappingSaveResult> SaveCurrentAsync(
         NpgsqlConnection connection, Guid tenantId, int expectedVersion, TenantMappingProfileDraft draft,
         string actor, CancellationToken cancellationToken = default)
     {
@@ -207,11 +233,30 @@ WHERE p.tenant_id=@tenant;
         await using (var seed = new NpgsqlCommand("INSERT INTO public.tenant_mapping_profiles(tenant_id) VALUES(@tenant) ON CONFLICT DO NOTHING", connection, transaction))
         { seed.Parameters.AddWithValue("tenant", tenantId); await seed.ExecuteNonQueryAsync(cancellationToken); }
 
-        int current;
-        await using (var load = new NpgsqlCommand("SELECT current_version FROM public.tenant_mapping_profiles WHERE tenant_id=@tenant FOR UPDATE", connection, transaction))
-        { load.Parameters.AddWithValue("tenant", tenantId); current = Convert.ToInt32(await load.ExecuteScalarAsync(cancellationToken)); }
+        int current; string currentFingerprint; string currentStatus;
+        await using (var load = new NpgsqlCommand("""
+SELECT p.current_version,COALESCE(v.profile_fingerprint,''),COALESCE(v.validation_status,'')
+FROM public.tenant_mapping_profiles p
+LEFT JOIN public.tenant_mapping_profile_versions v
+  ON v.tenant_id=p.tenant_id AND v.profile_version=p.current_version
+WHERE p.tenant_id=@tenant
+FOR UPDATE OF p;
+""", connection, transaction))
+        {
+            load.Parameters.AddWithValue("tenant", tenantId);
+            await using var reader = await load.ExecuteReaderAsync(cancellationToken);
+            await reader.ReadAsync(cancellationToken);
+            current = reader.GetInt32(0); currentFingerprint = reader.GetString(1); currentStatus = reader.GetString(2);
+        }
         if (current != expectedVersion)
         { await transaction.RollbackAsync(cancellationToken); return new("conflict", current, null, validation, "Mapping profile changed; reload before saving."); }
+
+        if (current > 0 && !RequiresSnapshot(currentFingerprint, fingerprint, currentStatus, validation.Status))
+        {
+            await PruneSnapshotsAsync(connection, transaction, tenantId, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return new("unchanged", current, currentFingerprint, validation, "Current mapping is already saved. No new snapshot was created.");
+        }
 
         var next = current + 1;
         const string insertSql = """
@@ -222,7 +267,7 @@ UPDATE public.tenant_mapping_profiles SET current_version=@version,
 validated_version=CASE WHEN @status='valid' THEN @version ELSE validated_version END,updated_at=NOW() WHERE tenant_id=@tenant;
 INSERT INTO public.tenant_mapping_profile_audit
 (tenant_id,profile_version,action_key,actor,profile_fingerprint,detail_json)
-VALUES(@tenant,@version,'mapping_profile.version_created',@actor,@fingerprint,CAST(@validation AS jsonb));
+VALUES(@tenant,@version,'mapping_profile.current_replaced',@actor,@fingerprint,CAST(@validation AS jsonb));
 """;
         await using var insert = new NpgsqlCommand(insertSql, connection, transaction);
         insert.Parameters.AddWithValue("tenant", tenantId); insert.Parameters.AddWithValue("version", next);
@@ -243,7 +288,7 @@ SET mapping_workflow_ready=false,
       THEN 'MAPPING CHANGED - re-sync and review required'
       ELSE 'THREED MAPPING INVALID - workflow blocked' END
 WHERE tenant_id::text=@tenant_text
-  AND (@status<>'valid' OR COALESCE(mapping_profile_version,0)<>@version OR COALESCE(mapping_profile_fingerprint,'')<>@fingerprint);
+  AND (@status<>'valid' OR COALESCE(mapping_profile_fingerprint,'')<>@fingerprint);
 """;
             await using var invalidate = new NpgsqlCommand(invalidateSql, connection, transaction);
             invalidate.Parameters.AddWithValue("status", validation.Status);
@@ -252,8 +297,28 @@ WHERE tenant_id::text=@tenant_text
             invalidate.Parameters.AddWithValue("fingerprint", fingerprint);
             await invalidate.ExecuteNonQueryAsync(cancellationToken);
         }
+        await PruneSnapshotsAsync(connection, transaction, tenantId, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
-        return new("saved", next, fingerprint, validation, validation.IsValid ? "Mapping profile validated and saved." : "Mapping profile saved but cannot be used by workflows.");
+        return new("saved", next, fingerprint, validation, validation.IsValid ? "Current mapping validated and saved." : "Current mapping saved but cannot be used by workflows.");
+    }
+
+    public static bool RequiresSnapshot(string? currentFingerprint, string proposedFingerprint, string? currentStatus, string proposedStatus) =>
+        !string.Equals(currentFingerprint, proposedFingerprint, StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(currentStatus, proposedStatus, StringComparison.OrdinalIgnoreCase);
+
+    public static IReadOnlyList<int> RetainedSnapshotVersions(IEnumerable<int> versions) =>
+        versions.Where(x => x > 0).Distinct().OrderByDescending(x => x).Take(1).ToArray();
+
+    private static async Task PruneSnapshotsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid tenantId, CancellationToken cancellationToken)
+    {
+        await using var prune = new NpgsqlCommand("""
+DELETE FROM public.tenant_mapping_profile_versions
+WHERE tenant_id=@tenant AND profile_version<>(
+  SELECT current_version FROM public.tenant_mapping_profiles WHERE tenant_id=@tenant
+);
+""", connection, transaction);
+        prune.Parameters.AddWithValue("tenant", tenantId);
+        await prune.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public static TenantMappingProfileDraft CreateProSpectCompatibilityDraft(string discoveryFingerprint = "") => new(

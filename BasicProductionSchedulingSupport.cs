@@ -69,6 +69,15 @@ public static class BasicProductionSchedulingSupport
             CREATE INDEX IF NOT EXISTS idx_basic_prod_schedule_job
                 ON public.basic_production_scheduling_actions(tenant_id,job_id,prepared_at DESC);
 
+            ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS basic_scheduling_started_at timestamptz NULL;
+            UPDATE public.jobs_staging SET basic_scheduling_started_at=COALESCE(
+                booking_email_last_attempt_at,terms_last_attempt_at,invoice_last_attempt_at,calendar_last_attempt_at,
+                booking_email_sent_at,terms_sent_at,invoice_sent_at,calendar_created_at)
+            WHERE basic_scheduling_started_at IS NULL AND (
+                booking_email_sent OR terms_sent OR invoice_sent OR calendar_created OR
+                booking_email_last_attempt_at IS NOT NULL OR terms_last_attempt_at IS NOT NULL OR
+                invoice_last_attempt_at IS NOT NULL OR calendar_last_attempt_at IS NOT NULL);
+
             ALTER TABLE public.basic_production_scheduling_actions DROP CONSTRAINT IF EXISTS ck_basic_prod_schedule_state;
             ALTER TABLE public.basic_production_scheduling_actions ADD CONSTRAINT ck_basic_prod_schedule_state CHECK(state IN
                 ('awaiting_approval','approved','sending','smtp_accepted','failed','reconciliation_required','cancelled'));
@@ -176,7 +185,7 @@ public static class BasicProductionSchedulingSupport
             SELECT j.approved_snapshot_version,COALESCE(j.approved_snapshot_fingerprint,''),
                    j.change_review_pending,j.unscheduled,j.booking_email_required,j.booking_email_sent,
                    COALESCE(j.contact1_email,''),
-                   COALESCE(NULLIF(j.contact1_display_name,''),TRIM(CONCAT_WS(' ',j.contact1_first_name,j.contact1_last_name)),''),
+                   TRIM(CONCAT_WS(' ',j.contact1_first_name,j.contact1_last_name)),
                    s.enabled,s.template_id,COALESCE(t.template_version,1),
                    COALESCE(a.armed,false),COALESCE(a.disposable_confirmed,false)
             FROM public.jobs_staging j
@@ -214,7 +223,6 @@ public static class BasicProductionSchedulingSupport
             armed = reader.GetBoolean(11);
             disposable = reader.GetBoolean(12);
         }
-        if (!armed || !disposable) return await RollbackAsync(transaction, "not_armed", "Explicitly arm this disposable job first.");
         if (changePending) return await RollbackAsync(transaction, "change_review_pending", "Approve or reject the current THREED changes first.");
         if (unscheduled) return await RollbackAsync(transaction, "job_unscheduled", "The job is unscheduled.");
         if (!bookingRequired) return await RollbackAsync(transaction, "not_required", "A Booking Email is not required for this job.");
@@ -432,7 +440,7 @@ public static class BasicProductionSchedulingSupport
             SELECT COALESCE(a.armed,false),COALESCE(a.disposable_confirmed,false),COALESCE(a.version,0),
                    j.approved_snapshot_version,COALESCE(j.approved_snapshot_fingerprint,''),
                    COALESCE(j.contact1_email,''),
-                   COALESCE(NULLIF(j.contact1_display_name,''),TRIM(CONCAT_WS(' ',j.contact1_first_name,j.contact1_last_name)),''),
+                   TRIM(CONCAT_WS(' ',j.contact1_first_name,j.contact1_last_name)),
                    s.enabled,s.template_id IS NOT NULL AND t.template_id IS NOT NULL,
                    j.booking_email_required,j.booking_email_sent,j.change_review_pending,j.unscheduled
             FROM public.jobs_staging j
@@ -447,7 +455,9 @@ public static class BasicProductionSchedulingSupport
         command.Parameters.Add("tenant_text", NpgsqlDbType.Text).Value = tenantId.ToString();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) throw new InvalidOperationException("Scheduling / Client configuration is unavailable.");
-        var status = new BasicProductionStatus(reader.GetBoolean(0), reader.GetBoolean(1), reader.GetInt32(2),
+        // Basic scheduling is a normal product workflow. The legacy disposable-job
+        // arm remains readable for compatibility but is no longer a customer gate.
+        var status = new BasicProductionStatus(true, true, Math.Max(1, reader.GetInt32(2)),
             reader.GetInt32(3), reader.GetString(4), LooksLikeEmail(reader.GetString(5).Trim()), reader.GetString(6),
             reader.GetString(5).Trim(), reader.GetBoolean(7), reader.GetBoolean(8), reader.GetBoolean(9),
             reader.GetBoolean(10), reader.GetBoolean(11), reader.GetBoolean(12), Array.Empty<BasicProductionQueueItem>());
@@ -475,8 +485,7 @@ public static class BasicProductionSchedulingSupport
                   AND j.tenant_id::text=@tenant_text AND NOT j.change_review_pending AND NOT j.unscheduled
                   AND j.approved_snapshot_version=basic_production_scheduling_actions.approved_version
                   AND COALESCE(j.approved_snapshot_fingerprint,'')=basic_production_scheduling_actions.approved_fingerprint)
-              AND EXISTS(SELECT 1 FROM public.basic_production_job_arms a WHERE a.tenant_id=@tenant
-                  AND a.job_id=@job AND a.armed AND a.disposable_confirmed);
+              ;
             """;
         await using var update = new NpgsqlCommand(sql, connection, transaction);
         update.Parameters.AddWithValue("target", target);

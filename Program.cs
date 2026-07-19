@@ -7,10 +7,15 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
+using System.Globalization;
 using Npgsql;
 using AutoMateApi;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Threading.RateLimiting;
+
+var newZealandCulture=CultureInfo.GetCultureInfo("en-NZ");
+CultureInfo.DefaultThreadCurrentCulture=newZealandCulture;
+CultureInfo.DefaultThreadCurrentUICulture=newZealandCulture;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
@@ -130,6 +135,12 @@ app.MapControlledTestCycleEndpoints(
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         return await LoadAuthenticatedAutomationActorAsync(connection, tenantId, GetAuthenticatedInspectorId(context));
+    },
+    async (context, tenantId, jobId, cancellationToken) =>
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        return await DiscoverExistingGoogleCalendarEventsAsync(connection, tenantId, jobId, builder.Configuration, cancellationToken);
     });
 const string FoundersTrialAccessCode = "PILOT";
 var clientTokenPepper = builder.Configuration["AUTOMATE_CLIENT_PAGE_TOKEN_KEY"] ?? "";
@@ -267,6 +278,47 @@ app.MapPost("/accounts/ensure-tables", async () =>
 // =============================
 // CLIENT INSPECTION PAGE / EMAIL ENGAGEMENT
 // =============================
+app.MapGet("/automation/quotes",async(HttpContext context,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;return Results.Ok(await AutoMateApi.QuoteWorkflowSupport.ListAsync(conn,tenantId,context.RequestAborted));}
+    catch(Exception ex){return Results.Problem(title:"Load quotes failed",detail:ex.Message,statusCode:500);}
+});
+app.MapGet("/automation/quotes/catalogue",async(HttpContext context,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;return Results.Ok(await AutoMateApi.QuoteWorkflowSupport.CatalogueAsync(conn,tenantId,context.RequestAborted));}
+    catch(Exception ex){return Results.Problem(title:"Load quote catalogue failed",detail:ex.Message,statusCode:500);}
+});
+app.MapGet("/automation/quotes/{quoteId:guid}",async(HttpContext context,Guid tenantId,Guid quoteId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var quote=await AutoMateApi.QuoteWorkflowSupport.LoadAsync(conn,tenantId,quoteId,context.RequestAborted);return quote==null?Results.NotFound(new{success=false,message="Quote not found for this company."}):Results.Ok(new{quote,conversionPreview=new{enabled=false,status="pilot_required",message="THREED conversion remains disabled until a disposable write/read-back pilot passes.",jobState="Unscheduled",inspector="Unassigned",providerActions=false}});}
+    catch(Exception ex){return Results.Problem(title:"Load quote failed",detail:ex.Message,statusCode:500);}
+});
+app.MapPost("/automation/quotes/enrich-address",async(HttpContext context,AutoMateApi.QuoteAddressEnrichmentRequest request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;if(string.IsNullOrWhiteSpace(request.CanonicalAddress))return Results.BadRequest(new{success=false,status="confirmed_address_required",message="Confirm a canonical address first."});var property=await PropertyFeaturesLookupService.LookupAsync(request.CanonicalAddress);var lat=property.Latitude??request.Latitude;var lng=property.Longitude??request.Longitude;var imagery=lat.HasValue&&lng.HasValue?new{status="review_available",streetViewUrl=$"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat.Value.ToString(CultureInfo.InvariantCulture)},{lng.Value.ToString(CultureInfo.InvariantCulture)}",satelliteUrl=$"https://www.google.com/maps/search/?api=1&query={lat.Value.ToString(CultureInfo.InvariantCulture)},{lng.Value.ToString(CultureInfo.InvariantCulture)}",aiReviewStatus="disabled_pending_licensing",message="Visual evidence requires office review. Google imagery is not submitted to external AI."}:new{status="unavailable",streetViewUrl="",satelliteUrl="",aiReviewStatus="disabled_pending_licensing",message="Coordinates were unavailable; continue with manual property review."};return Results.Ok(new{address=new{canonicalAddress=request.CanonicalAddress,placeId=request.PlaceId??"",latitude=lat,longitude=lng,confirmed=true},property=new{property.Status,source="PropertyValue",fields=property,warnings=string.IsNullOrWhiteSpace(property.Error)?Array.Empty<string>():new[]{property.Error}},imagery,suggestions=Array.Empty<object>(),manualReviewAvailable=true});}
+    catch(Exception ex){return Results.Problem(ex.Message,statusCode:500,title:"Enrich quote address failed");}
+});
+app.MapPost("/automation/quotes/drafts",async(HttpContext context,AutoMateApi.QuoteDraftSaveRequest request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var result=await AutoMateApi.QuoteWorkflowSupport.SaveAsync(conn,request,actor,clientTokenPepper??"",context.RequestAborted);return Results.Ok(new{quote=result,publicPath=string.IsNullOrWhiteSpace(result.PublicToken)?null:$"/quote/{result.PublicToken}"});}
+    catch(AutoMateApi.QuoteVersionConflictException ex){return Results.Conflict(new{success=false,status="version_conflict",message=ex.Message});}
+    catch(InvalidOperationException ex){return Results.Conflict(new{success=false,status="quote_review_required",message=ex.Message});}
+    catch(Exception ex){return Results.Problem(ex.Message,statusCode:500,title:"Save quote draft failed");}
+});
+app.MapPost("/automation/quotes/{quoteId:guid}/delivery",async(HttpContext context,Guid quoteId,AutoMateApi.QuoteDeliveryRequest request)=>
+{
+    try{if(quoteId!=request.QuoteId)return Results.BadRequest(new{success=false,message="Quote identity mismatch."});await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;return await AutoMateApi.QuoteWorkflowSupport.MarkSentAsync(conn,request,context.RequestAborted)?Results.Ok(new{success=true,status="Sent"}):Results.Conflict(new{success=false,message="The quote was not in the expected Ready version."});}
+    catch(Exception ex){return Results.Problem(ex.Message,statusCode:500,title:"Record quote delivery failed");}
+});
+app.MapGet("/quote/{token}",async(HttpContext context,string token)=>
+{
+    if(string.IsNullOrWhiteSpace(clientTokenPepper))return Results.NotFound();try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var access=await AutoMateApi.QuoteWorkflowSupport.ResolvePublicAsync(conn,token,clientTokenPepper,true,context.RequestAborted);return access==null?Results.Content("Quote unavailable or expired.","text/plain",Encoding.UTF8,404):Results.Content(AutoMateApi.QuoteWorkflowSupport.RenderPublic(access,token),"text/html",Encoding.UTF8);}catch{return Results.Content("Quote unavailable or expired.","text/plain",Encoding.UTF8,404);}
+}).RequireRateLimiting("public-inspection");
+app.MapPost("/quote/{token}/decision",async(HttpContext context,string token)=>
+{
+    if(string.IsNullOrWhiteSpace(clientTokenPepper))return Results.NotFound();try{var form=await context.Request.ReadFormAsync(context.RequestAborted);var decision=form["decision"].ToString();await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var access=await AutoMateApi.QuoteWorkflowSupport.ResolvePublicAsync(conn,token,clientTokenPepper,false,context.RequestAborted);if(access==null)return Results.NotFound();var network=context.Connection.RemoteIpAddress?.ToString()??"";var ipHash=Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(clientTokenPepper),Encoding.UTF8.GetBytes(network))).ToLowerInvariant();await AutoMateApi.QuoteWorkflowSupport.DecideAsync(conn,access,decision,ipHash,context.RequestAborted);return Results.Redirect($"/quote/{Uri.EscapeDataString(token)}");}catch{return Results.NotFound();}
+}).DisableAntiforgery().RequireRateLimiting("public-inspection");
+
 app.MapGet("/inspection/{token}", async (HttpContext context, string token) =>
 {
     if (string.IsNullOrWhiteSpace(clientTokenPepper)) return Results.Problem(statusCode: 503, title: "Inspection page unavailable");
@@ -277,6 +329,7 @@ app.MapGet("/inspection/{token}", async (HttpContext context, string token) =>
         if (access == null) return Results.Content(ExpiredClientPageHtml(), "text/html", Encoding.UTF8, 404);
         await AutoMateApi.ClientEngagementSupport.RecordViewAsync(conn, EngagementCommand(context, access, "view", EngagementEventKey(context, "view")), clientTokenPepper, context.RequestAborted);
         var display = await LoadClientInspectionDisplayAsync(conn, access, context.RequestAborted);
+        try{var progress=AutoMateApi.ClientInspectionPageRenderer.Progress(access,display);await AutoMateApi.ClientEngagementSupport.RecordEventAsync(conn,EngagementCommand(context,access,"terms_status","terms:"+progress.TermsState),clientTokenPepper,context.RequestAborted);await AutoMateApi.ClientEngagementSupport.RecordEventAsync(conn,EngagementCommand(context,access,"payment_status",$"payment:{progress.Balance:0.00}"),clientTokenPepper,context.RequestAborted);if(progress.Complete)await AutoMateApi.ClientEngagementSupport.RecordEventAsync(conn,EngagementCommand(context,access,"booking_complete","booking-requirements-complete"),clientTokenPepper,context.RequestAborted);}catch{}
         return Results.Content(AutoMateApi.ClientInspectionPageRenderer.Render(access, display, token), "text/html", Encoding.UTF8);
     }
     catch { return Results.Content(ExpiredClientPageHtml(), "text/html", Encoding.UTF8, 404); }
@@ -328,6 +381,12 @@ app.MapGet("/inspection/{token}/calendar.ics", async (HttpContext context, strin
     catch { return Results.NotFound(); }
 }).RequireRateLimiting("public-inspection");
 
+app.MapGet("/inspection/{token}/terms",async(HttpContext context,string token)=>
+{
+    if(string.IsNullOrWhiteSpace(clientTokenPepper))return Results.NotFound();
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var access=await AutoMateApi.ClientEngagementSupport.ResolveAsync(conn,token,"inspection_page",clientTokenPepper,context.RequestAborted);if(access==null)return Results.NotFound();var display=await LoadClientInspectionDisplayAsync(conn,access,context.RequestAborted);if(!display.TermsRequired||display.TermsSigned||!Uri.TryCreate(display.TermsSigningLink,UriKind.Absolute,out var link)||link.Scheme!=Uri.UriSchemeHttps)return Results.Redirect($"/inspection/{Uri.EscapeDataString(token)}");await AutoMateApi.ClientEngagementSupport.RecordEventAsync(conn,EngagementCommand(context,access,"terms",EngagementEventKey(context,"terms")),clientTokenPepper,context.RequestAborted);return Results.Redirect(link.ToString());}catch{return Results.NotFound();}
+}).RequireRateLimiting("public-inspection");
+
 app.MapGet("/automation/engagement/settings", async (HttpContext context, Guid tenantId) =>
 {
     try
@@ -335,7 +394,7 @@ app.MapGet("/automation/engagement/settings", async (HttpContext context, Guid t
         await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync();
         var owner=await RequireAutomationOwnerAsync(context,conn,tenantId); if(!owner.Allowed)return owner.Error!;
         var settings=await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn,tenantId,context.RequestAborted);
-        return Results.Ok(new { success=true,openTrackingEnabled=settings.PixelEnabled,clientPageEnabled=settings.PageEnabled,expiresAfterDays=90,settings.Version,settings.UpdatedAt });
+        return Results.Ok(new { success=true,openTrackingEnabled=settings.PixelEnabled,clientPageEnabled=settings.PageEnabled,expiresAfterDays=90,settings.Version,settings.UpdatedAt,settings.IntroductionText,settings.PaymentInstruction,settings.BankAccountName,settings.BankAccountNumber,settings.PaymentReferenceInstruction,settings.ShowBankWithAccounting,settings.BrandColour });
     }
     catch(Exception ex){return Results.Problem(title:"Load engagement settings failed",detail:ex.Message,statusCode:500);}
 });
@@ -365,12 +424,870 @@ app.MapPut("/automation/engagement/settings", async (HttpContext context, Client
         await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
         var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
         var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
-        var result=await AutoMateApi.ClientEngagementSupport.SaveSettingsAsync(conn,new(request.TenantId,request.ClientPageEnabled,request.OpenTrackingEnabled,request.ExpectedVersion,request.IdempotencyKey,request.Confirmed,actor),context.RequestAborted);
+        var result=await AutoMateApi.ClientEngagementSupport.SaveSettingsAsync(conn,new(request.TenantId,request.ClientPageEnabled,request.OpenTrackingEnabled,request.ExpectedVersion,request.IdempotencyKey,request.Confirmed,actor,request.IntroductionText,request.PaymentInstruction,request.BankAccountName,request.BankAccountNumber,request.PaymentReferenceInstruction,request.ShowBankWithAccounting,request.BrandColour),context.RequestAborted);
         if(result.Status is "conflict" or "idempotency_conflict" or "confirmation_required")return Results.Json(new{success=false,status=result.Status,message=result.Message,settings=result.Settings},statusCode:409);
         return Results.Ok(new{success=true,status=result.Status,message=result.Message,settings=result.Settings,expiresAfterDays=90});
     }
     catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
     catch(Exception ex){return Results.Problem(title:"Save engagement settings failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/hub", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var inspectorId=GetAuthenticatedInspectorId(context);
+        var hub=await AutoMateApi.IntegrationHubSupport.LoadAsync(conn,tenantId,inspectorId,context.RequestAborted);
+        return Results.Ok(new{success=true,hub});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Load integrations failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/integrations/hub", async (HttpContext context, AutoMateApi.IntegrationHubSaveRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
+        var hub=await AutoMateApi.IntegrationHubSupport.SaveAsync(conn,request.TenantId,inspectorId,request,actor,context.RequestAborted);
+        return Results.Ok(new{success=true,message="Integration defaults and Xero options saved. No workflow action was run.",hub});
+    }
+    catch(AutoMateApi.IntegrationHubException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Save integrations failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/automation/integrations/{provider}/disconnect", async (HttpContext context, string provider, AutoMateApi.ProviderDisconnectRequest request) =>
+{
+    try
+    {
+        var key=(provider??"").Trim().ToLowerInvariant().Replace('-','_');
+        if(key is not ("google_drive" or "adobe_sign" or "docusign" or "microsoft_calendar"))
+            return Results.NotFound(new{success=false,status="provider_unavailable",message="This provider does not use the new AutoMate disconnect lifecycle."});
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm provider disconnection."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        await AutoMateApi.IntegrationHubSupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var selected=new NpgsqlCommand("SELECT action_type FROM public.tenant_integration_action_defaults WHERE tenant_id=@tenant AND provider_key=@provider LIMIT 1",conn))
+        {
+            selected.Parameters.AddWithValue("tenant",request.TenantId);selected.Parameters.AddWithValue("provider",key);
+            var action=await selected.ExecuteScalarAsync(context.RequestAborted) as string;
+            if(!string.IsNullOrWhiteSpace(action))return Results.Json(new{success=false,status="provider_is_company_default",message=$"Choose and save another {action.Replace('_',' ')} default before disconnecting this provider."},statusCode:409);
+        }
+        var inspectorId=GetAuthenticatedInspectorId(context);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);
+        var removed=await AutoMateApi.ProviderIntegrationSupport.DisconnectAsync(conn,request.TenantId,key,actor,context.RequestAborted);
+        if(!removed)return Results.NotFound(new{success=false,status="provider_account_not_found",message="No connected provider account was found."});
+        return Results.Ok(new{success=true,status="disconnected",providerKey=key,message="AutoMate removed the stored provider credentials. Provider-side consent may remain until it is revoked in the provider account."});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Disconnect provider failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/google_drive/connect-url", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        var required=new[]{"GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET","GOOGLE_DRIVE_REDIRECT_URI","AUTOMATE_INTEGRATION_SECRET_KEY"};
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,required))return Results.Json(new{success=false,status="provider_configuration_required",message="Google Drive is ready for its provider values. Add the Google Drive client ID, client secret and redirect URI in Railway."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var inspectorId=GetAuthenticatedInspectorId(context);var state=await AutoMateApi.ProviderIntegrationSupport.CreateOAuthStateAsync(conn,tenantId,inspectorId,"google_drive","",null,builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);
+        var scope="openid email https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly";var url="https://accounts.google.com/o/oauth2/v2/auth?client_id="+Uri.EscapeDataString(builder.Configuration["GOOGLE_DRIVE_CLIENT_ID"]!)+"&response_type=code&redirect_uri="+Uri.EscapeDataString(builder.Configuration["GOOGLE_DRIVE_REDIRECT_URI"]!)+"&scope="+Uri.EscapeDataString(scope)+"&access_type=offline&prompt=consent&include_granted_scopes=false&state="+Uri.EscapeDataString(state.State);
+        return Results.Ok(new{success=true,providerKey="google_drive",url,stateExpiresAt=state.ExpiresAt,message="Google Drive uses app-limited write access plus read-only metadata access to verify files and folders created by Google Drive for desktop."});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="google_drive_connect_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/api/integrations/google-drive/callback", async (HttpContext context) =>
+{
+    try
+    {
+        var error=context.Request.Query["error"].ToString();var code=context.Request.Query["code"].ToString();var rawState=context.Request.Query["state"].ToString();
+        if(!string.IsNullOrWhiteSpace(error))return Results.Content(ProviderCallbackHtml("Google Drive was not connected","Google returned "+WebUtility.HtmlEncode(error)+". No AutoMate setting was changed."),"text/html",statusCode:400);
+        if(string.IsNullOrWhiteSpace(code)||string.IsNullOrWhiteSpace(rawState))return Results.Content(ProviderCallbackHtml("Google Drive was not connected","The callback did not include a valid authorisation code and state."),"text/html",statusCode:400);
+        var required=new[]{"GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET","GOOGLE_DRIVE_REDIRECT_URI","AUTOMATE_INTEGRATION_SECRET_KEY"};
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,required))return Results.Content(ProviderCallbackHtml("Google Drive configuration is incomplete","Add the Google Drive provider values in Railway, then reconnect."),"text/html",statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var oauth=await AutoMateApi.ProviderIntegrationSupport.ConsumeOAuthStateAsync(conn,rawState,"google_drive",builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);
+        if(oauth is null)return Results.Content(ProviderCallbackHtml("Google Drive authorisation expired","Return to AutoMate and start Connect again. OAuth links are single-use and expire after ten minutes."),"text/html",statusCode:400);
+        using var client=new HttpClient();using var tokenResponse=await client.PostAsync("https://oauth2.googleapis.com/token",new FormUrlEncodedContent(new Dictionary<string,string>{{"client_id",builder.Configuration["GOOGLE_DRIVE_CLIENT_ID"]!},{"client_secret",builder.Configuration["GOOGLE_DRIVE_CLIENT_SECRET"]!},{"code",code},{"redirect_uri",builder.Configuration["GOOGLE_DRIVE_REDIRECT_URI"]!},{"grant_type","authorization_code"}}),context.RequestAborted);var tokenJson=await tokenResponse.Content.ReadAsStringAsync(context.RequestAborted);
+        if(!tokenResponse.IsSuccessStatusCode)return Results.Content(ProviderCallbackHtml("Google Drive token exchange failed","Google rejected the authorisation code. Return to AutoMate and reconnect."),"text/html",statusCode:400);
+        using var tokenDocument=JsonDocument.Parse(tokenJson);var token=tokenDocument.RootElement;var accessToken=GetJsonString(token,"access_token");var refreshToken=GetJsonString(token,"refresh_token");var tokenType=GetJsonString(token,"token_type");var scope=GetJsonString(token,"scope");var expiresIn=token.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;if(string.IsNullOrWhiteSpace(accessToken))throw new InvalidOperationException("Google did not return an access token.");
+        client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",accessToken);var accountEmail="";using(var userResponse=await client.GetAsync("https://www.googleapis.com/oauth2/v2/userinfo",context.RequestAborted)){if(userResponse.IsSuccessStatusCode){var userJson=await userResponse.Content.ReadAsStringAsync(context.RequestAborted);using var userDocument=JsonDocument.Parse(userJson);accountEmail=GetJsonString(userDocument.RootElement,"email");}}
+        var root=await EnsureGoogleDriveRootAsync(client,context.RequestAborted);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,oauth.TenantId,oauth.InspectorId);
+        await AutoMateApi.ProviderIntegrationSupport.UpsertAccountAsync(conn,oauth.TenantId,oauth.InspectorId,new("google_drive",accessToken,refreshToken,tokenType,scope,DateTime.UtcNow.AddSeconds(expiresIn),accountEmail,root.Id,"https://www.googleapis.com/drive/v3",new Dictionary<string,string>{{"rootFolderId",root.Id},{"rootFolderName",root.Name},{"rootWebUrl",root.WebUrl}}),builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,actor,context.RequestAborted);
+        await AutoMateApi.GoogleDriveArchiveSupport.BindRootAsync(conn,oauth.TenantId,root.Id,root.Name,root.WebUrl,actor,context.RequestAborted);
+        return Results.Content(ProviderCallbackHtml("Google Drive connected successfully","Connected account: <strong>"+WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(accountEmail)?"Google account":accountEmail)+"</strong><br>AutoMate Reports is ready. Return to AutoMate to map its Google Drive for desktop folder."),"text/html");
+    }
+    catch(Exception ex){return Results.Content(ProviderCallbackHtml("Google Drive connection failed",WebUtility.HtmlEncode(ex.Message)),"text/html",statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/adobe_sign/connect-url",async(HttpContext context,Guid tenantId)=>
+{
+    try
+    {
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,"ADOBE_SIGN_CLIENT_ID","ADOBE_SIGN_CLIENT_SECRET","ADOBE_SIGN_REDIRECT_URI","ADOBE_SIGN_WEBHOOK_URL","AUTOMATE_INTEGRATION_SECRET_KEY"))return Results.Json(new{success=false,status="provider_configuration_required",message="Adobe Acrobat Sign is ready for its provider values. Add the client ID, client secret, redirect URI and webhook URL in Railway."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var state=await AutoMateApi.ProviderIntegrationSupport.CreateOAuthStateAsync(conn,tenantId,GetAuthenticatedInspectorId(context),"adobe_sign","",null,builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);
+        var scopes="agreement_read:account agreement_write:account library_read:account webhook_read:account webhook_write:account user_read:account";var authorize=AutoMateApi.ProviderIntegrationSupport.IsRealValue(builder.Configuration["ADOBE_SIGN_AUTHORIZE_URL"])?builder.Configuration["ADOBE_SIGN_AUTHORIZE_URL"]!:AutoMateApi.AdobeOAuthContract.GlobalAuthorizeUrl;var url=authorize+"?redirect_uri="+Uri.EscapeDataString(builder.Configuration["ADOBE_SIGN_REDIRECT_URI"]!)+"&response_type=code&client_id="+Uri.EscapeDataString(builder.Configuration["ADOBE_SIGN_CLIENT_ID"]!)+"&scope="+Uri.EscapeDataString(scopes)+"&state="+Uri.EscapeDataString(state.State);
+        return Results.Ok(new{success=true,providerKey="adobe_sign",url,stateExpiresAt=state.ExpiresAt});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="adobe_sign_connect_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/api/integrations/adobe-sign/callback",async(HttpContext context)=>
+{
+    try
+    {
+        var error=context.Request.Query["error"].ToString();var code=context.Request.Query["code"].ToString();var rawState=context.Request.Query["state"].ToString();if(!string.IsNullOrWhiteSpace(error))return Results.Content(ProviderCallbackHtml("Adobe Acrobat Sign was not connected",WebUtility.HtmlEncode(error)),"text/html",statusCode:400);
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,"ADOBE_SIGN_CLIENT_ID","ADOBE_SIGN_CLIENT_SECRET","ADOBE_SIGN_REDIRECT_URI","AUTOMATE_INTEGRATION_SECRET_KEY"))return Results.Content(ProviderCallbackHtml("Adobe Acrobat Sign configuration is incomplete","Add the provider values in Railway, then reconnect."),"text/html",statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var oauth=await AutoMateApi.ProviderIntegrationSupport.ConsumeOAuthStateAsync(conn,rawState,"adobe_sign",builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);if(oauth is null)return Results.Content(ProviderCallbackHtml("Adobe Acrobat Sign authorisation expired","Return to AutoMate and start Connect again."),"text/html",statusCode:400);
+        var callbackApiBase=AutoMateApi.AdobeOAuthContract.ResolveApiBase(context.Request.Query["api_access_point"].ToString());var tokenUrl=AutoMateApi.ProviderIntegrationSupport.IsRealValue(builder.Configuration["ADOBE_SIGN_TOKEN_URL"])?builder.Configuration["ADOBE_SIGN_TOKEN_URL"]!:callbackApiBase+"/oauth/v2/token";using var client=new HttpClient();using var tokenResponse=await client.PostAsync(tokenUrl,new FormUrlEncodedContent(new Dictionary<string,string>{{"code",code},{"client_id",builder.Configuration["ADOBE_SIGN_CLIENT_ID"]!},{"client_secret",builder.Configuration["ADOBE_SIGN_CLIENT_SECRET"]!},{"redirect_uri",builder.Configuration["ADOBE_SIGN_REDIRECT_URI"]!},{"grant_type","authorization_code"}}),context.RequestAborted);var tokenJson=await tokenResponse.Content.ReadAsStringAsync(context.RequestAborted);if(!tokenResponse.IsSuccessStatusCode)return Results.Content(ProviderCallbackHtml("Adobe Acrobat Sign token exchange failed","Adobe rejected the authorisation code. Return to AutoMate and reconnect."),"text/html",statusCode:400);
+        using var tokenDocument=JsonDocument.Parse(tokenJson);var token=tokenDocument.RootElement;var access=GetJsonString(token,"access_token");var refresh=GetJsonString(token,"refresh_token");var tokenType=GetJsonString(token,"token_type");var expiresIn=token.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",access);
+        var tokenApiBase=AutoMateApi.AdobeOAuthContract.ResolveApiBase(FirstNonEmptyJsonString(token,"api_access_point","apiAccessPoint"),callbackApiBase);using var baseResponse=await client.GetAsync(tokenApiBase+"/api/rest/v6/baseUris",context.RequestAborted);var baseJson=await baseResponse.Content.ReadAsStringAsync(context.RequestAborted);if(!baseResponse.IsSuccessStatusCode)throw new InvalidOperationException("Adobe connected but did not return the account API base URI.");using var baseDocument=JsonDocument.Parse(baseJson);var apiBase=AutoMateApi.AdobeOAuthContract.ResolveApiBase(GetJsonString(baseDocument.RootElement,"apiAccessPoint"),tokenApiBase);
+        var email="";var externalId="";using(var userResponse=await client.GetAsync(apiBase+"/api/rest/v6/users/me",context.RequestAborted)){if(userResponse.IsSuccessStatusCode){var userJson=await userResponse.Content.ReadAsStringAsync(context.RequestAborted);using var userDocument=JsonDocument.Parse(userJson);email=GetJsonString(userDocument.RootElement,"email");externalId=GetJsonString(userDocument.RootElement,"id");}}
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,oauth.TenantId,oauth.InspectorId);await AutoMateApi.ProviderIntegrationSupport.UpsertAccountAsync(conn,oauth.TenantId,oauth.InspectorId,new("adobe_sign",access,refresh,tokenType,"agreement_read:account agreement_write:account library_read:account webhook_read:account webhook_write:account user_read:account",DateTime.UtcNow.AddSeconds(expiresIn),email,externalId,apiBase,new Dictionary<string,string>{{"trackingMode","resource_webhook"}}),builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,actor,context.RequestAborted);return Results.Content(ProviderCallbackHtml("Adobe Acrobat Sign connected successfully","Connected account: <strong>"+WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(email)?"Adobe account":email)+"</strong>. Return to AutoMate to map library documents and signer roles."),"text/html");
+    }
+    catch(Exception ex){return Results.Content(ProviderCallbackHtml("Adobe Acrobat Sign connection failed",WebUtility.HtmlEncode(ex.Message)),"text/html",statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/docusign/connect-url",async(HttpContext context,Guid tenantId)=>
+{
+    try
+    {
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,"DOCUSIGN_CLIENT_ID","DOCUSIGN_CLIENT_SECRET","DOCUSIGN_REDIRECT_URI","DOCUSIGN_WEBHOOK_URL","DOCUSIGN_CONNECT_HMAC_SECRET","AUTOMATE_INTEGRATION_SECRET_KEY"))return Results.Json(new{success=false,status="provider_configuration_required",message="DocuSign is ready for its provider values. Add the integration key, secret, redirect URI and Connect HMAC secret in Railway."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var state=await AutoMateApi.ProviderIntegrationSupport.CreateOAuthStateAsync(conn,tenantId,GetAuthenticatedInspectorId(context),"docusign","",null,builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);var authBase=DocuSignAuthBase(builder.Configuration);var url=authBase+"/oauth/auth?response_type=code&scope="+Uri.EscapeDataString("signature extended")+"&client_id="+Uri.EscapeDataString(builder.Configuration["DOCUSIGN_CLIENT_ID"]!)+"&redirect_uri="+Uri.EscapeDataString(builder.Configuration["DOCUSIGN_REDIRECT_URI"]!)+"&state="+Uri.EscapeDataString(state.State);return Results.Ok(new{success=true,providerKey="docusign",url,stateExpiresAt=state.ExpiresAt,environment=(builder.Configuration["DOCUSIGN_ENVIRONMENT"]??"demo")});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="docusign_connect_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/api/integrations/docusign/callback",async(HttpContext context)=>
+{
+    try
+    {
+        var error=context.Request.Query["error"].ToString();var code=context.Request.Query["code"].ToString();var rawState=context.Request.Query["state"].ToString();if(!string.IsNullOrWhiteSpace(error))return Results.Content(ProviderCallbackHtml("DocuSign was not connected",WebUtility.HtmlEncode(error)),"text/html",statusCode:400);if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,"DOCUSIGN_CLIENT_ID","DOCUSIGN_CLIENT_SECRET","DOCUSIGN_REDIRECT_URI","AUTOMATE_INTEGRATION_SECRET_KEY"))return Results.Content(ProviderCallbackHtml("DocuSign configuration is incomplete","Add the provider values in Railway, then reconnect."),"text/html",statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var oauth=await AutoMateApi.ProviderIntegrationSupport.ConsumeOAuthStateAsync(conn,rawState,"docusign",builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);if(oauth is null)return Results.Content(ProviderCallbackHtml("DocuSign authorisation expired","Return to AutoMate and start Connect again."),"text/html",statusCode:400);var authBase=DocuSignAuthBase(builder.Configuration);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Basic",Convert.ToBase64String(Encoding.UTF8.GetBytes(builder.Configuration["DOCUSIGN_CLIENT_ID"]+":"+builder.Configuration["DOCUSIGN_CLIENT_SECRET"])));using var tokenResponse=await client.PostAsync(authBase+"/oauth/token",new FormUrlEncodedContent(new Dictionary<string,string>{{"grant_type","authorization_code"},{"code",code}}),context.RequestAborted);var tokenJson=await tokenResponse.Content.ReadAsStringAsync(context.RequestAborted);if(!tokenResponse.IsSuccessStatusCode)return Results.Content(ProviderCallbackHtml("DocuSign token exchange failed","DocuSign rejected the authorisation code. Return to AutoMate and reconnect."),"text/html",statusCode:400);using var tokenDocument=JsonDocument.Parse(tokenJson);var token=tokenDocument.RootElement;var access=GetJsonString(token,"access_token");var refresh=GetJsonString(token,"refresh_token");var expiresIn=token.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;
+        client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",access);using var userResponse=await client.GetAsync(authBase+"/oauth/userinfo",context.RequestAborted);var userJson=await userResponse.Content.ReadAsStringAsync(context.RequestAborted);if(!userResponse.IsSuccessStatusCode)throw new InvalidOperationException("DocuSign connected but account discovery failed.");using var userDocument=JsonDocument.Parse(userJson);var user=userDocument.RootElement;var email=GetJsonString(user,"email");JsonElement selected=default;if(user.TryGetProperty("accounts",out var accounts)&&accounts.ValueKind==JsonValueKind.Array){foreach(var item in accounts.EnumerateArray()){if(selected.ValueKind==JsonValueKind.Undefined)selected=item.Clone();if(item.TryGetProperty("is_default",out var isDefault)&&isDefault.ValueKind==JsonValueKind.True){selected=item.Clone();break;}}}if(selected.ValueKind==JsonValueKind.Undefined)throw new InvalidOperationException("DocuSign returned no usable account.");var accountId=GetJsonString(selected,"account_id");var baseUri=GetJsonString(selected,"base_uri").TrimEnd('/');
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,oauth.TenantId,oauth.InspectorId);await AutoMateApi.ProviderIntegrationSupport.UpsertAccountAsync(conn,oauth.TenantId,oauth.InspectorId,new("docusign",access,refresh,"Bearer","signature extended",DateTime.UtcNow.AddSeconds(expiresIn),email,accountId,baseUri,new Dictionary<string,string>{{"accountName",GetJsonString(selected,"account_name")},{"environment",builder.Configuration["DOCUSIGN_ENVIRONMENT"]??"demo"},{"trackingMode","per_envelope_hmac"}}),builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,actor,context.RequestAborted);return Results.Content(ProviderCallbackHtml("DocuSign connected successfully","Connected account: <strong>"+WebUtility.HtmlEncode(GetJsonString(selected,"account_name"))+"</strong>. Return to AutoMate to map templates and signer roles."),"text/html");
+    }
+    catch(Exception ex){return Results.Content(ProviderCallbackHtml("DocuSign connection failed",WebUtility.HtmlEncode(ex.Message)),"text/html",statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/microsoft_calendar/connect-url",async(HttpContext context,Guid tenantId)=>
+{
+    try{if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,"MS_CALENDAR_CLIENT_ID","MS_CALENDAR_CLIENT_SECRET","MS_CALENDAR_REDIRECT_URI","AUTOMATE_INTEGRATION_SECRET_KEY"))return Results.Json(new{success=false,status="provider_configuration_required",message="Microsoft Calendar is ready for its separate Entra app values. Add the client ID, client secret and redirect URI in Railway."},statusCode:409);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var state=await AutoMateApi.ProviderIntegrationSupport.CreateOAuthStateAsync(conn,tenantId,GetAuthenticatedInspectorId(context),"microsoft_calendar","",null,builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);var microsoftTenant=AutoMateApi.ProviderIntegrationSupport.IsRealValue(builder.Configuration["MS_CALENDAR_TENANT"])?builder.Configuration["MS_CALENDAR_TENANT"]!:"common";var scope="openid profile email offline_access User.Read Calendars.ReadWrite";var url="https://login.microsoftonline.com/"+Uri.EscapeDataString(microsoftTenant)+"/oauth2/v2.0/authorize?client_id="+Uri.EscapeDataString(builder.Configuration["MS_CALENDAR_CLIENT_ID"]!)+"&response_type=code&redirect_uri="+Uri.EscapeDataString(builder.Configuration["MS_CALENDAR_REDIRECT_URI"]!)+"&response_mode=query&scope="+Uri.EscapeDataString(scope)+"&state="+Uri.EscapeDataString(state.State)+"&prompt=select_account";return Results.Ok(new{success=true,providerKey="microsoft_calendar",url,stateExpiresAt=state.ExpiresAt,message="This grant is separate from SharePoint and can only manage calendars for the connected company account."});}catch(Exception ex){return Results.Json(new{success=false,status="microsoft_calendar_connect_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/api/integrations/microsoft-calendar/callback",async(HttpContext context)=>
+{
+    try{var error=context.Request.Query["error"].ToString();var code=context.Request.Query["code"].ToString();var rawState=context.Request.Query["state"].ToString();if(!string.IsNullOrWhiteSpace(error))return Results.Content(ProviderCallbackHtml("Microsoft Calendar was not connected",WebUtility.HtmlEncode(error)),"text/html",statusCode:400);if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(builder.Configuration,"MS_CALENDAR_CLIENT_ID","MS_CALENDAR_CLIENT_SECRET","MS_CALENDAR_REDIRECT_URI","AUTOMATE_INTEGRATION_SECRET_KEY"))return Results.Content(ProviderCallbackHtml("Microsoft Calendar configuration is incomplete","Add the separate Entra application values in Railway, then reconnect."),"text/html",statusCode:409);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var oauth=await AutoMateApi.ProviderIntegrationSupport.ConsumeOAuthStateAsync(conn,rawState,"microsoft_calendar",builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,context.RequestAborted);if(oauth is null)return Results.Content(ProviderCallbackHtml("Microsoft Calendar authorisation expired","Return to AutoMate and start Connect again."),"text/html",statusCode:400);var microsoftTenant=AutoMateApi.ProviderIntegrationSupport.IsRealValue(builder.Configuration["MS_CALENDAR_TENANT"])?builder.Configuration["MS_CALENDAR_TENANT"]!:"common";using var client=new HttpClient();using var response=await client.PostAsync("https://login.microsoftonline.com/"+Uri.EscapeDataString(microsoftTenant)+"/oauth2/v2.0/token",new FormUrlEncodedContent(new Dictionary<string,string>{{"client_id",builder.Configuration["MS_CALENDAR_CLIENT_ID"]!},{"client_secret",builder.Configuration["MS_CALENDAR_CLIENT_SECRET"]!},{"code",code},{"redirect_uri",builder.Configuration["MS_CALENDAR_REDIRECT_URI"]!},{"grant_type","authorization_code"},{"scope","openid profile email offline_access User.Read Calendars.ReadWrite"}}),context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Content(ProviderCallbackHtml("Microsoft Calendar token exchange failed","Microsoft rejected the authorisation code. Return to AutoMate and reconnect."),"text/html",statusCode:400);using var document=JsonDocument.Parse(json);var token=document.RootElement;var access=GetJsonString(token,"access_token");var refresh=GetJsonString(token,"refresh_token");var scope=GetJsonString(token,"scope");var expires=token.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",access);using var meResponse=await client.GetAsync("https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,userPrincipalName",context.RequestAborted);var meJson=await meResponse.Content.ReadAsStringAsync(context.RequestAborted);if(!meResponse.IsSuccessStatusCode)throw new InvalidOperationException("Microsoft connected but the account profile could not be read.");using var meDocument=JsonDocument.Parse(meJson);var me=meDocument.RootElement;var email=FirstNonEmptyJsonString(me,"mail","userPrincipalName");var actor=await LoadAuthenticatedAutomationActorAsync(conn,oauth.TenantId,oauth.InspectorId);await AutoMateApi.ProviderIntegrationSupport.UpsertAccountAsync(conn,oauth.TenantId,oauth.InspectorId,new("microsoft_calendar",access,refresh,"Bearer",scope,DateTime.UtcNow.AddSeconds(expires),email,GetJsonString(me,"id"),"https://graph.microsoft.com/v1.0",new Dictionary<string,string>{{"displayName",GetJsonString(me,"displayName")}}),builder.Configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]!,actor,context.RequestAborted);return Results.Content(ProviderCallbackHtml("Microsoft Calendar connected successfully","Connected account: <strong>"+WebUtility.HtmlEncode(email)+"</strong>. This grant is separate from SharePoint."),"text/html");}catch(Exception ex){return Results.Content(ProviderCallbackHtml("Microsoft Calendar connection failed",WebUtility.HtmlEncode(ex.Message)),"text/html",statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/microsoft-calendar/settings",async(HttpContext context,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var account=await GetMicrosoftCalendarAccountAsync(conn,tenantId,builder.Configuration,context.RequestAborted);var settings=await AutoMateApi.MicrosoftCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted);var inspectors=(await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted)).Inspectors.Select(x=>new{x.InspectorId,x.Name,x.Email,x.Phone});var calendars=new List<object>();if(account.Success){using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);using var response=await client.GetAsync("https://graph.microsoft.com/v1.0/me/calendars?$select=id,name,canEdit,canShare,owner&$top=100",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(response.IsSuccessStatusCode){using var document=JsonDocument.Parse(json);if(document.RootElement.TryGetProperty("value",out var rows))foreach(var row in rows.EnumerateArray())calendars.Add(new{id=GetJsonString(row,"id"),name=GetJsonString(row,"name"),canEdit=row.TryGetProperty("canEdit",out var edit)&&edit.ValueKind==JsonValueKind.True,canShare=row.TryGetProperty("canShare",out var share)&&share.ValueKind==JsonValueKind.True});}}return Results.Ok(new{success=true,connected=account.Success,accountEmail=account.AccountEmail,settings,inspectors,calendars});}catch(Exception ex){return Results.Json(new{success=false,status="microsoft_calendar_settings_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPut("/automation/integrations/microsoft-calendar/settings",async(HttpContext context,AutoMateApi.MicrosoftCalendarSaveRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var account=await GetMicrosoftCalendarAccountAsync(conn,request.TenantId,builder.Configuration,context.RequestAborted);if(!account.Success)return Results.Json(new{success=false,status="microsoft_calendar_not_connected",message=account.Error},statusCode:409);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));await AutoMateApi.MicrosoftCalendarSupport.SaveAsync(conn,request,actor,context.RequestAborted);
+        using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);
+        foreach(var mapping in request.Mappings.Where(x=>x.Enabled&&!string.IsNullOrWhiteSpace(x.InspectorEmail)))
+        {
+            if(string.Equals(mapping.InspectorEmail.Trim(),account.AccountEmail.Trim(),StringComparison.OrdinalIgnoreCase)){await AutoMateApi.MicrosoftCalendarSupport.RecordSharingAsync(conn,request.TenantId,mapping.InspectorId,"owner","",context.RequestAborted);continue;}
+            var baseUrl="https://graph.microsoft.com/v1.0/me/calendars/"+Uri.EscapeDataString(mapping.CalendarId)+"/calendarPermissions";var existingId="";var existingRole="";
+            using(var listResponse=await client.GetAsync(baseUrl+"?$select=id,emailAddress,role&$top=100",context.RequestAborted))if(listResponse.IsSuccessStatusCode)
+            {
+                using var listDocument=JsonDocument.Parse(await listResponse.Content.ReadAsStringAsync(context.RequestAborted));if(listDocument.RootElement.TryGetProperty("value",out var permissions))foreach(var permission in permissions.EnumerateArray())
+                {
+                    var address=permission.TryGetProperty("emailAddress",out var email)?FirstNonEmptyJsonString(email,"address","name"):"";if(!string.Equals(address,mapping.InspectorEmail.Trim(),StringComparison.OrdinalIgnoreCase))continue;existingId=GetJsonString(permission,"id");existingRole=GetJsonString(permission,"role");break;
+                }
+            }
+            var role=mapping.ShareRole=="write"?"write":"read";HttpResponseMessage response;
+            if(existingId.Length>0&&string.Equals(existingRole,role,StringComparison.OrdinalIgnoreCase))response=new HttpResponseMessage(System.Net.HttpStatusCode.OK);
+            else if(existingId.Length>0)response=await client.PatchAsJsonAsync(baseUrl+"/"+Uri.EscapeDataString(existingId),new{role},context.RequestAborted);
+            else response=await client.PostAsJsonAsync(baseUrl,new{emailAddress=new{address=mapping.InspectorEmail.Trim(),name=mapping.InspectorEmail.Trim()},isInsideOrganization=true,role},context.RequestAborted);
+            using(response){var body=response.IsSuccessStatusCode?"":await response.Content.ReadAsStringAsync(context.RequestAborted);await AutoMateApi.MicrosoftCalendarSupport.RecordSharingAsync(conn,request.TenantId,mapping.InspectorId,response.IsSuccessStatusCode?"shared":"share_failed",response.IsSuccessStatusCode?"":TravelRedact(body),context.RequestAborted);}
+        }
+        return Results.Ok(new{success=true,message="Company Microsoft calendar mappings saved.",settings=await AutoMateApi.MicrosoftCalendarSupport.LoadAsync(conn,request.TenantId,context.RequestAborted)});
+    }
+    catch(AutoMateApi.MicrosoftCalendarException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="microsoft_calendar_save_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/automation/integrations/microsoft-calendar/calendars",async(HttpContext context,CompanyGoogleCalendarCreateRequest request)=>
+{
+    try{if(!request.Confirmed||string.IsNullOrWhiteSpace(request.Name))return Results.Json(new{success=false,status="confirmation_required",message="Confirm the new company calendar name."},statusCode:409);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var account=await GetMicrosoftCalendarAccountAsync(conn,request.TenantId,builder.Configuration,context.RequestAborted);if(!account.Success)return Results.Json(new{success=false,status="microsoft_calendar_not_connected",message=account.Error},statusCode:409);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);using var response=await client.PostAsJsonAsync("https://graph.microsoft.com/v1.0/me/calendars",new{name=request.Name.Trim()},context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="microsoft_calendar_create_failed",message=TravelRedact(json)},statusCode:409);using var document=JsonDocument.Parse(json);return Results.Ok(new{success=true,id=GetJsonString(document.RootElement,"id"),name=GetJsonString(document.RootElement,"name")});}catch(Exception ex){return Results.Json(new{success=false,status="microsoft_calendar_create_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/{provider}/agreement-templates",async(HttpContext context,string provider,Guid tenantId)=>
+{
+    try{provider=AutoMateApi.AgreementProviderSupport.NormalizeProvider(provider);if(provider is not ("adobe_sign" or "docusign"))return Results.BadRequest(new{success=false,message="Choose Adobe Acrobat Sign or DocuSign."});await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var account=await GetAgreementProviderAccountAsync(conn,tenantId,provider,builder.Configuration,context.RequestAborted);if(!account.Success)return Results.Json(new{success=false,status=provider+"_not_connected",message=account.Error},statusCode:409);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);var templates=new List<AutoMateApi.AgreementProviderTemplate>();
+        if(provider=="adobe_sign"){using var response=await client.GetAsync(account.ApiBaseUri+"/api/rest/v6/libraryDocuments?pageSize=100",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="adobe_templates_failed",message="Adobe library documents could not be loaded."},statusCode:409);using var document=JsonDocument.Parse(json);if(document.RootElement.TryGetProperty("libraryDocumentList",out var rows))foreach(var row in rows.EnumerateArray()){var id=GetJsonString(row,"id");if(id.Length>0)templates.Add(new(id,GetJsonString(row,"name"),new[]{"SIGNER"}));}}
+        else{using var response=await client.GetAsync(account.ApiBaseUri+"/restapi/v2.1/accounts/"+Uri.EscapeDataString(account.ExternalAccountId)+"/templates?count=100",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="docusign_templates_failed",message="DocuSign templates could not be loaded."},statusCode:409);using var document=JsonDocument.Parse(json);if(document.RootElement.TryGetProperty("envelopeTemplates",out var rows))foreach(var row in rows.EnumerateArray()){var id=GetJsonString(row,"templateId");if(id.Length>0)templates.Add(new(id,GetJsonString(row,"name"),await LoadDocuSignSignerRolesAsync(client,account.ApiBaseUri,account.ExternalAccountId,id,context.RequestAborted)));}}
+        return Results.Ok(new{success=true,provider,templates});}catch(Exception ex){return Results.Json(new{success=false,status="agreement_templates_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/{provider}/agreement-mappings",async(HttpContext context,string provider,Guid tenantId)=>
+{
+    try{provider=AutoMateApi.AgreementProviderSupport.NormalizeProvider(provider);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var mappings=await AutoMateApi.AgreementProviderSupport.LoadMappingsAsync(conn,tenantId,provider,context.RequestAborted);return Results.Ok(new{success=true,provider,mappings});}catch(Exception ex){return Results.Json(new{success=false,status="agreement_mappings_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPut("/automation/integrations/{provider}/agreement-mappings",async(HttpContext context,string provider,AutoMateApi.AgreementProviderMappingsSaveRequest request)=>
+{
+    try{provider=AutoMateApi.AgreementProviderSupport.NormalizeProvider(provider);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var mappings=await AutoMateApi.AgreementProviderSupport.SaveMappingsAsync(conn,request.TenantId,provider,request,actor,context.RequestAborted);return Results.Ok(new{success=true,provider,mappings,message="Agreement template mappings saved. No agreement was sent."});}catch(AutoMateApi.AgreementProviderException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="agreement_mappings_save_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapMethods("/api/integrations/adobe-sign/webhook",new[]{"GET","POST"},async(HttpContext context)=>
+{
+    var configured=builder.Configuration["ADOBE_SIGN_CLIENT_ID"]??"";var presented=context.Request.Headers["X-AdobeSign-ClientId"].FirstOrDefault()??context.Request.Query["clientId"].ToString();if(!AutoMateApi.ProviderIntegrationSupport.IsRealValue(configured)||!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(configured),Encoding.UTF8.GetBytes(presented)))return Results.Unauthorized();context.Response.Headers["X-AdobeSign-ClientId"]=configured;if(HttpMethods.IsGet(context.Request.Method))return Results.Ok(new{xAdobeSignClientId=configured});
+    using var reader=new StreamReader(context.Request.Body,Encoding.UTF8);var body=await reader.ReadToEndAsync(context.RequestAborted);var hash=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body))).ToLowerInvariant();try{var parsed=AutoMateApi.AgreementWebhookContract.ParseAdobe(body);var eventKey=string.IsNullOrWhiteSpace(parsed.EventKey)?hash:parsed.EventKey;await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var result=await ApplyAgreementWebhookAsync(conn,"adobe_sign",parsed.DocumentId,parsed.Status,context.RequestAborted);await AutoMateApi.AgreementProviderSupport.RecordWebhookAsync(conn,"adobe_sign",eventKey,result.TenantId,parsed.DocumentId,true,hash,body,result.Error,context.RequestAborted);return Results.Ok(new{xAdobeSignClientId=configured});}catch(Exception ex){return Results.Json(new{success=false,message=ex.Message,xAdobeSignClientId=configured},statusCode:400);}
+});
+
+app.MapPost("/api/integrations/docusign/webhook",async(HttpContext context)=>
+{
+    var secret=builder.Configuration["DOCUSIGN_CONNECT_HMAC_SECRET"]??"";if(!AutoMateApi.ProviderIntegrationSupport.IsRealValue(secret))return Results.Json(new{success=false,message="DocuSign Connect HMAC is not configured."},statusCode:503);using var stream=new MemoryStream();await context.Request.Body.CopyToAsync(stream,context.RequestAborted);var bytes=stream.ToArray();var presented=context.Request.Headers.Where(header=>header.Key.StartsWith("X-DocuSign-Signature-",StringComparison.OrdinalIgnoreCase)).SelectMany(header=>header.Value.Select(value=>value??""));if(!AutoMateApi.AgreementWebhookContract.VerifyDocuSignHmac(secret,bytes,presented))return Results.Unauthorized();var body=Encoding.UTF8.GetString(bytes);var hash=Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();try{var parsed=AutoMateApi.AgreementWebhookContract.ParseDocuSign(body);var eventKey=hash;await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var result=await ApplyAgreementWebhookAsync(conn,"docusign",parsed.DocumentId,parsed.Status,context.RequestAborted);await AutoMateApi.AgreementProviderSupport.RecordWebhookAsync(conn,"docusign",eventKey,result.TenantId,parsed.DocumentId,true,hash,body,result.Error,context.RequestAborted);return Results.Ok(new{success=true});}catch(Exception ex){return Results.Json(new{success=false,message=ex.Message},statusCode:400);}
+});
+
+app.MapPost("/automation/integrations/agreements/reconcile",async(HttpContext context,Guid tenantId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.AgreementProviderSupport.EnsureAsync(conn,context.RequestAborted);var rows=new List<(string Provider,string DocumentId)>();await using(var command=new NpgsqlCommand("SELECT DISTINCT provider_key,external_document_id FROM public.job_agreement_items WHERE tenant_id=@tenant AND provider_key IN ('adobe_sign','docusign') AND status='invited' AND external_document_id<>'' ORDER BY provider_key,external_document_id LIMIT 250",conn)){command.Parameters.AddWithValue("tenant",tenantId);await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);while(await reader.ReadAsync(context.RequestAborted))rows.Add((reader.GetString(0),reader.GetString(1)));}
+        var checkedCount=0;var updatedCount=0;var errors=new List<string>();foreach(var group in rows.GroupBy(x=>x.Provider)){var account=await GetAgreementProviderAccountAsync(conn,tenantId,group.Key,builder.Configuration,context.RequestAborted);if(!account.Success){errors.Add(account.Error);continue;}using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);foreach(var row in group){var url=group.Key=="adobe_sign"?account.ApiBaseUri+"/api/rest/v6/agreements/"+Uri.EscapeDataString(row.DocumentId):account.ApiBaseUri+"/restapi/v2.1/accounts/"+Uri.EscapeDataString(account.ExternalAccountId)+"/envelopes/"+Uri.EscapeDataString(row.DocumentId);using var response=await client.GetAsync(url,context.RequestAborted);checkedCount++;if(!response.IsSuccessStatusCode){errors.Add($"{group.Key} status failed for {row.DocumentId}.");continue;}var json=await response.Content.ReadAsStringAsync(context.RequestAborted);using var document=JsonDocument.Parse(json);var status=FirstNonEmptyJsonString(document.RootElement,"status","state");var applied=await ApplyAgreementWebhookAsync(conn,group.Key,row.DocumentId,status,context.RequestAborted);if(string.IsNullOrWhiteSpace(applied.Error))updatedCount++;}}
+        return Results.Ok(new{success=true,checkedCount,updatedCount,errors,message="Agreement status reconciliation completed. No agreement was created, cancelled or resent."});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="agreement_reconciliation_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/google-drive-archive",async(HttpContext context,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var settings=await AutoMateApi.GoogleDriveArchiveSupport.LoadAsync(conn,tenantId,context.RequestAborted);return Results.Ok(new{success=true,settings,provider="google_drive",purpose="report_detection_and_sync_verification"});}
+    catch(Exception ex){return Results.Problem(title:"Load Google Drive archive failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/google-drive-archive/destination",async(HttpContext context,AutoMateApi.GoogleDriveArchiveSaveRequest request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var settings=await AutoMateApi.GoogleDriveArchiveSupport.SaveAsync(conn,request.TenantId,request,actor,context.RequestAborted);return Results.Ok(new{success=true,message="Google Drive for desktop folder saved. Access and local sync tests are required before report detection.",settings});}
+    catch(AutoMateApi.GoogleDriveArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Problem(title:"Save Google Drive archive failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/automation/google-drive-archive/test-access",async(HttpContext context,AutoMateApi.SharePointArchiveTestRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the read-only Google Drive access test."},statusCode:409);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var settings=await AutoMateApi.GoogleDriveArchiveSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);if(settings.Version!=request.ExpectedVersion)return Results.Json(new{success=false,status="version_conflict",message="The Google Drive destination changed. Reload before testing."},statusCode:409);
+        var account=await GetGoogleDriveAccountAsync(conn,request.TenantId,builder.Configuration,context.RequestAborted);if(!account.Success)return Results.Json(new{success=false,status="google_drive_not_connected",message=account.Error},statusCode:409);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);using var response=await client.GetAsync("https://www.googleapis.com/drive/v3/files/"+Uri.EscapeDataString(settings.RootFolderId)+"?fields=id,name,mimeType,webViewLink&supportsAllDrives=true",context.RequestAborted);var passed=response.IsSuccessStatusCode;var message=passed?"Google Drive access verified without moving or sharing files.":"AutoMate could not read its AutoMate Reports folder. Reconnect Google Drive.";var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var updated=await AutoMateApi.GoogleDriveArchiveSupport.RecordTestAsync(conn,request.TenantId,request.ExpectedVersion,"permission",passed,false,actor,passed?"":message,context.RequestAborted);return passed?Results.Ok(new{success=true,outcome="success",severity="information",message,settings=updated}):Results.Json(new{success=false,status="google_drive_access_test_failed",message,settings=updated},statusCode:409);
+    }
+    catch(AutoMateApi.GoogleDriveArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="google_drive_access_test_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/automation/google-drive-archive/test-folder-mapping-observation",async(HttpContext context,AutoMateApi.SharePointMappingObservationRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the reversible Google Drive folder mapping test."},statusCode:409);var marker=(request.MarkerName??"").Trim();if(request.TestId==Guid.Empty||marker.Length is <20 or >100||!marker.StartsWith("AutoMate-sync-test-",StringComparison.Ordinal)||marker.IndexOfAny(new[]{'\\','/',':','*','?','\"','<','>','|'})>=0)return Results.Json(new{success=false,status="invalid_mapping_marker",message="The folder mapping marker is invalid."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var settings=await AutoMateApi.GoogleDriveArchiveSupport.BindConnectorIfMissingAsync(conn,request.TenantId,request.ExpectedVersion,request.ConnectorId,actor,context.RequestAborted);var account=await GetGoogleDriveAccountAsync(conn,request.TenantId,builder.Configuration,context.RequestAborted);if(!account.Success)return Results.Json(new{success=false,status="google_drive_not_connected",message=account.Error},statusCode:409);
+        using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);var q=$"'{settings.RootFolderId.Replace("'","\\'")}' in parents and name = '{marker.Replace("'","\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false";using var response=await client.GetAsync("https://www.googleapis.com/drive/v3/files?q="+Uri.EscapeDataString(q)+"&fields=files(id,name)&spaces=drive&pageSize=10",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="google_drive_mapping_observation_failed",message="The configured Google Drive root could not be checked."},statusCode:409);var present=false;using(var document=JsonDocument.Parse(json))present=document.RootElement.TryGetProperty("files",out var files)&&files.ValueKind==JsonValueKind.Array&&files.GetArrayLength()>0;var matched=present==request.ExpectedPresent;if(matched&&request.ExpectedPresent)await AutoMateApi.GoogleDriveArchiveSupport.RecordMarkerSeenAsync(conn,request.TenantId,request.ExpectedVersion,request.TestId,marker,actor,context.RequestAborted);var updated=matched&&!request.ExpectedPresent?await AutoMateApi.GoogleDriveArchiveSupport.CompleteMappingAsync(conn,request.TenantId,request.ExpectedVersion,request.TestId,marker,true,actor,context.RequestAborted):await AutoMateApi.GoogleDriveArchiveSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);return Results.Ok(new{success=true,outcome=matched&&!request.ExpectedPresent?"success":"pending",severity="information",observed=matched,present,phase=request.ExpectedPresent?"appearance":"cleanup",message=matched?(request.ExpectedPresent?"Temporary folder appeared in the exact Google Drive root.":"Temporary folder cleanup was verified. Google Drive mapping is ready."):"Waiting for Google Drive for desktop sync.",settings=updated});
+    }
+    catch(AutoMateApi.GoogleDriveArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="google_drive_mapping_test_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/automation/google-drive-archive/test-folder-mapping-manual-cleanup",async(HttpContext context,AutoMateApi.SharePointMappingObservationRequest request)=>
+{
+    try{if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the Google Drive folder mapping test."},statusCode:409);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var updated=await AutoMateApi.GoogleDriveArchiveSupport.CompleteMappingAsync(conn,request.TenantId,request.ExpectedVersion,request.TestId,(request.MarkerName??"").Trim(),false,actor,context.RequestAborted);return Results.Ok(new{success=true,outcome="manual_cleanup_required",severity="information",message="Folder creation was verified. AutoMate does not have permission to delete the test folder. Remove it manually.",settings=updated});}
+    catch(AutoMateApi.GoogleDriveArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="google_drive_mapping_test_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/xero/branding-themes",async(HttpContext context,Guid tenantId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var account=await GetXeroAccountAsync(conn,GetAuthenticatedInspectorId(context),builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="xero_not_connected",message=account.ErrorMessage??"Connect Xero before choosing a branding theme."},statusCode:409);
+        using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);client.DefaultRequestHeaders.Add("xero-tenant-id",account.TenantId);client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        using var response=await client.GetAsync("https://api.xero.com/api.xro/2.0/BrandingThemes",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="xero_branding_themes_failed",message="Xero branding themes could not be loaded."},statusCode:409);
+        var themes=new List<object>();using(var document=JsonDocument.Parse(json))if(document.RootElement.TryGetProperty("BrandingThemes",out var rows)&&rows.ValueKind==JsonValueKind.Array)foreach(var row in rows.EnumerateArray()){var id=GetJsonString(row,"BrandingThemeID");var name=GetJsonString(row,"Name");if(id.Length>0)themes.Add(new{id,name});}
+        return Results.Ok(new{success=true,themes});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="xero_branding_themes_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/google-calendar/settings",async(HttpContext context,Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var accountInspector=GetAuthenticatedInspectorId(context);var account=await GetGoogleCalendarAccountAsync(conn,accountInspector,builder.Configuration);var settings=await AutoMateApi.CompanyGoogleCalendarSupport.LoadAsync(conn,tenantId,accountInspector,context.RequestAborted);var calendars=new List<object>();var accountEmail=account.AccountName??"";
+        if(account.Success){using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);accountEmail=await ResolveGoogleConnectedEmailAsync(client,accountEmail,context.RequestAborted);using var response=await client.GetAsync("https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=writer",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(response.IsSuccessStatusCode){using var document=JsonDocument.Parse(json);if(document.RootElement.TryGetProperty("items",out var items))foreach(var item in items.EnumerateArray()){var id=GetJsonString(item,"id");var primary=item.TryGetProperty("primary",out var primaryValue)&&primaryValue.ValueKind==JsonValueKind.True;if(primary&&string.IsNullOrWhiteSpace(accountEmail)&&id.Contains('@'))accountEmail=id;if(id.Length>0)calendars.Add(new{id,name=GetJsonString(item,"summary"),primary,accessRole=GetJsonString(item,"accessRole")});}}}
+        var inspectors=(await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted)).Inspectors.Select(x=>new{x.InspectorId,x.Name,x.Email,x.Phone});return Results.Ok(new{success=true,connected=account.Success,accountEmail,settings,inspectors,calendars});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="google_calendar_settings_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/document-archive",async(HttpContext context,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var settings=await AutoMateApi.SharePointArchiveSupport.LoadAsync(conn,tenantId,context.RequestAborted);return Results.Ok(new{success=true,settings,provider="microsoft_sharepoint",purpose="report_storage_and_publishing"});}
+    catch(Exception ex){return Results.Problem(title:"Load SharePoint archive failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/document-archive/destination",async(HttpContext context,AutoMateApi.SharePointArchiveSaveRequest request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var settings=await AutoMateApi.SharePointArchiveSupport.SaveAsync(conn,request.TenantId,request,actor,context.RequestAborted);return Results.Ok(new{success=true,message="SharePoint report destination saved. Permission and local sync tests are required before use.",settings});}
+    catch(AutoMateApi.SharePointArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Save SharePoint archive failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/automation/document-archive/test-microsoft-access",async(HttpContext context,AutoMateApi.SharePointArchiveTestRequest request)=>
+{
+    try{if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the read-only Microsoft access test."},statusCode:409);await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var settings=await AutoMateApi.SharePointArchiveSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);if(settings.Version!=request.ExpectedVersion)return Results.Json(new{success=false,status="version_conflict",message="The destination changed. Reload before testing."},statusCode:409);var token=await LoadMicrosoftDocumentTokenAsync(conn,GetAuthenticatedInspectorId(context),context.RequestAborted);if(!token.Success)return Results.Json(new{success=false,status="microsoft_not_connected",message=token.Error},statusCode:409);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",token.AccessToken);var itemPath=settings.RootItemId=="root"?"root":"items/"+Uri.EscapeDataString(settings.RootItemId);using var response=await client.GetAsync("https://graph.microsoft.com/v1.0/drives/"+Uri.EscapeDataString(settings.DriveId)+"/"+itemPath+"?$select=id,name,webUrl",context.RequestAborted);var passed=response.IsSuccessStatusCode;var error=passed?"":"The configured SharePoint root could not be read. Check the site grant and selected library.";var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var updated=await AutoMateApi.SharePointArchiveSupport.RecordTestAsync(conn,request.TenantId,request.ExpectedVersion,"permission",passed,false,actor,error,context.RequestAborted);return passed?Results.Ok(new{success=true,message="Microsoft access verified without changing SharePoint.",settings=updated}):Results.Json(new{success=false,status="sharepoint_permission_test_failed",message=error,settings=updated},statusCode:409);}
+    catch(AutoMateApi.SharePointArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="sharepoint_access_test_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/automation/document-archive/test-folder-mapping-observation",async(HttpContext context,AutoMateApi.SharePointMappingObservationRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the reversible local and SharePoint folder mapping test."},statusCode:409);
+        var marker=(request.MarkerName??"").Trim();if(request.TestId==Guid.Empty||marker.Length is < 20 or > 100||!marker.StartsWith("AutoMate-sync-test-",StringComparison.Ordinal)||marker.IndexOfAny(new[]{'\\','/',':','*','?','\"','<','>','|'})>=0)return Results.Json(new{success=false,status="invalid_mapping_marker",message="The folder mapping marker is invalid."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var settings=await AutoMateApi.SharePointArchiveSupport.BindConnectorIfMissingAsync(conn,request.TenantId,request.ExpectedVersion,(request.ConnectorId??"").Trim(),actor,context.RequestAborted);
+        var token=await LoadMicrosoftDocumentTokenAsync(conn,GetAuthenticatedInspectorId(context),context.RequestAborted);if(!token.Success)return Results.Json(new{success=false,status="microsoft_not_connected",message=token.Error},statusCode:409);
+        var parent=settings.RootItemId=="root"?"root":"items/"+Uri.EscapeDataString(settings.RootItemId);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",token.AccessToken);using var response=await client.GetAsync("https://graph.microsoft.com/v1.0/drives/"+Uri.EscapeDataString(settings.DriveId)+"/"+parent+"/children?$select=id,name,folder&$top=999",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="sharepoint_mapping_observation_failed",message="The configured SharePoint root could not be checked."},statusCode:409);
+        var present=false;using(var document=JsonDocument.Parse(json))if(document.RootElement.TryGetProperty("value",out var values))foreach(var item in values.EnumerateArray())if(item.TryGetProperty("folder",out _)&&string.Equals(GetJsonString(item,"name"),marker,StringComparison.Ordinal)){present=true;break;}
+        var matched=present==request.ExpectedPresent;
+        if(matched&&request.ExpectedPresent)await AutoMateApi.SharePointArchiveSupport.RecordMappingMarkerSeenAsync(conn,request.TenantId,request.ExpectedVersion,request.TestId,marker,actor,context.RequestAborted);
+        var updated=matched&&!request.ExpectedPresent?await AutoMateApi.SharePointArchiveSupport.CompleteMappingTestAsync(conn,request.TenantId,request.ExpectedVersion,request.TestId,marker,actor,context.RequestAborted):await AutoMateApi.SharePointArchiveSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);
+        return Results.Ok(new{success=true,outcome=matched&&!request.ExpectedPresent?"success":"pending",severity="information",observed=matched,present,phase=request.ExpectedPresent?"appearance":"cleanup",message=matched?(request.ExpectedPresent?"Temporary folder appeared in the exact SharePoint root.":"Temporary folder cleanup was verified. Folder mapping is ready."):"Waiting for SharePoint sync.",settings=updated});
+    }
+    catch(AutoMateApi.SharePointArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="sharepoint_mapping_test_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/automation/document-archive/test-folder-mapping-manual-cleanup",async(HttpContext context,AutoMateApi.SharePointMappingObservationRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the local and SharePoint folder mapping test."},statusCode:409);
+        var marker=(request.MarkerName??"").Trim();if(request.TestId==Guid.Empty||marker.Length is < 20 or > 100||!marker.StartsWith("AutoMate-sync-test-",StringComparison.Ordinal)||marker.IndexOfAny(new[]{'\\','/',':','*','?','\"','<','>','|'})>=0)return Results.Json(new{success=false,status="invalid_mapping_marker",message="The folder mapping marker is invalid."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var updated=await AutoMateApi.SharePointArchiveSupport.CompleteMappingTestWithManualCleanupAsync(conn,request.TenantId,request.ExpectedVersion,request.TestId,marker,actor,context.RequestAborted);
+        return Results.Ok(new{success=true,outcome="manual_cleanup_required",severity="information",message="Folder creation was verified. AutoMate does not have permission to delete the test folder. Remove it manually.",settings=updated});
+    }
+    catch(AutoMateApi.SharePointArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="sharepoint_mapping_test_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/document-archive/destinations",async(HttpContext context,Guid tenantId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var inspectorId=GetAuthenticatedInspectorId(context);var token=await LoadMicrosoftDocumentTokenAsync(conn,inspectorId,context.RequestAborted);if(!token.Success)return Results.Json(new{success=false,status="microsoft_not_connected",message=token.Error},statusCode:409);
+        using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",token.AccessToken);using var response=await client.GetAsync("https://graph.microsoft.com/v1.0/sites?search=*",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="selected_site_grant_required",message="No granted SharePoint site could be discovered. Ask a Microsoft administrator to grant AutoMate Sites.Selected access, then retry.",providerStatus=(int)response.StatusCode},statusCode:409);
+        using var document=JsonDocument.Parse(json);var sites=new List<object>();if(document.RootElement.TryGetProperty("value",out var values))foreach(var item in values.EnumerateArray())sites.Add(new{id=GetJsonString(item,"id"),name=GetJsonString(item,"displayName"),webUrl=GetJsonString(item,"webUrl")});return Results.Ok(new{success=true,sites,permissionModel="Sites.Selected"});
+    }
+    catch(Exception ex){return Results.Problem(title:"Discover granted SharePoint sites failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/automation/document-archive/sites/{siteId}/drives",async(HttpContext context,string siteId,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var token=await LoadMicrosoftDocumentTokenAsync(conn,GetAuthenticatedInspectorId(context),context.RequestAborted);if(!token.Success)return Results.Json(new{success=false,status="microsoft_not_connected",message=token.Error},statusCode:409);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",token.AccessToken);using var response=await client.GetAsync("https://graph.microsoft.com/v1.0/sites/"+Uri.EscapeDataString(siteId)+"/drives",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="sharepoint_drives_failed",message="The granted site's document libraries could not be read."},statusCode:409);using var document=JsonDocument.Parse(json);var drives=new List<object>();if(document.RootElement.TryGetProperty("value",out var values))foreach(var item in values.EnumerateArray())drives.Add(new{id=GetJsonString(item,"id"),name=GetJsonString(item,"name"),webUrl=GetJsonString(item,"webUrl")});return Results.Ok(new{success=true,drives});}
+    catch(Exception ex){return Results.Problem(title:"Discover SharePoint libraries failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/automation/document-archive/drives/{driveId}/folders",async(HttpContext context,string driveId,Guid tenantId,string? parentItemId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var token=await LoadMicrosoftDocumentTokenAsync(conn,GetAuthenticatedInspectorId(context),context.RequestAborted);if(!token.Success)return Results.Json(new{success=false,status="microsoft_not_connected",message=token.Error},statusCode:409);var parent=string.IsNullOrWhiteSpace(parentItemId)?"root":"items/"+Uri.EscapeDataString(parentItemId);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",token.AccessToken);using var response=await client.GetAsync("https://graph.microsoft.com/v1.0/drives/"+Uri.EscapeDataString(driveId)+"/"+parent+"/children?$select=id,name,webUrl,folder",context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="sharepoint_folders_failed",message="SharePoint folders could not be read."},statusCode:409);using var document=JsonDocument.Parse(json);var folders=new List<object>();if(document.RootElement.TryGetProperty("value",out var values))foreach(var item in values.EnumerateArray())if(item.TryGetProperty("folder",out _))folders.Add(new{id=GetJsonString(item,"id"),name=GetJsonString(item,"name"),webUrl=GetJsonString(item,"webUrl")});return Results.Ok(new{success=true,parentItemId=parentItemId??"root",folders});}
+    catch(Exception ex){return Results.Problem(title:"Discover SharePoint folders failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/{jobId}/reports/archive",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;return Results.Ok(new{success=true,items=await AutoMateApi.SharePointArchiveSupport.LoadReportsAsync(conn,tenantId,jobId,context.RequestAborted)});
+});
+
+app.MapPost("/jobs/{jobId}/reports/detected",async(HttpContext context,Guid jobId,AutoMateApi.ReportDetectedRequest request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await using(var ownership=new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job)",conn)){ownership.Parameters.AddWithValue("tenant",request.TenantId.ToString());ownership.Parameters.AddWithValue("job",jobId);if(!Convert.ToBoolean(await ownership.ExecuteScalarAsync(context.RequestAborted)))return Results.Json(new{success=false,status="job_not_found",message="The report job does not belong to this tenant."},statusCode:404);}var inspectorId=GetAuthenticatedInspectorId(context);var hub=await AutoMateApi.IntegrationHubSupport.LoadAsync(conn,request.TenantId,inspectorId,context.RequestAborted);var provider=hub.Defaults.TryGetValue("document_storage",out var selected)?selected:"microsoft_documents";if(!string.Equals(request.ProviderKey,provider,StringComparison.OrdinalIgnoreCase))return Results.Json(new{success=false,status="document_storage_changed",message="The company document storage provider changed. Reload archive settings before registering this report."},statusCode:409);if(provider=="google_drive"){var drive=await AutoMateApi.GoogleDriveArchiveSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);if(!drive.PermissionTested||!drive.SyncMappingTested||drive.Status!="healthy")return Results.Json(new{success=false,status="google_drive_archive_not_ready",message="Complete the Google Drive access and local sync mapping tests before report detection."},statusCode:409);}else{var archive=await AutoMateApi.SharePointArchiveSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);if(!archive.PermissionTested||!archive.SyncMappingTested||archive.Status!="healthy")return Results.Json(new{success=false,status="sharepoint_archive_not_ready",message="Complete the SharePoint permission and local sync mapping tests before report detection."},statusCode:409);}var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,inspectorId);request.ProviderKey=provider;var item=await AutoMateApi.SharePointArchiveSupport.RegisterAsync(conn,request.TenantId,jobId,request,actor,context.RequestAborted);return Results.Ok(new{success=true,provider,message=$"Stable report detected and queued for {(provider=="google_drive"?"Google Drive":"SharePoint")} sync verification. Nothing was published.",item});}
+    catch(AutoMateApi.SharePointArchiveException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+});
+
+app.MapGet("/automation/attention-v2",async(HttpContext context,Guid tenantId)=>
+{
+    context.Response.Headers.CacheControl="no-store, no-cache, must-revalidate";
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+    var actionVersion=await AutoMateApi.AuthoritativeAttentionSupport.LoadVersionAsync(conn,tenantId,context.RequestAborted);
+    var items=new List<object>();
+    foreach(var item in await AutoMateApi.AuthoritativeAttentionSupport.LoadCurrentAsync(conn,tenantId,context.RequestAborted))items.Add(new{contractVersion=AutoMateApi.AuthoritativeAttentionSupport.ContractVersion,attentionId=item.AttentionId,jobId=item.JobId,jobName=item.JobName,owner=item.Owner,actionKey=item.ActionKey,kind=item.Kind,title=item.Title,detail=item.Detail,recommendedAction=item.RecommendedAction,detectedAt=item.DetectedAt,severity=item.Severity,route=item.Route,tab=item.Tab,section=item.Section,status=item.Status,state=item.Status=="open"?"required":item.Status,templateSlot=item.TemplateSlot,technicalReferenceId=item.TechnicalReferenceId,changes=item.Changes,providerStatus=item.ProviderStatus,externalId=item.ExternalId,resolvedAt=item.ResolvedAt,supersededAt=item.SupersededAt,actionVersion=item.ActionVersion,evidenceFingerprint=item.EvidenceFingerprint});
+    await using(var actionCommand=new NpgsqlCommand("""
+      SELECT r.job_id,a.action_id,a.action_key,a.status,COALESCE(NULLIF(a.error_message,''),NULLIF(a.review_reason,''),'This workflow action needs review.'),
+             r.detected_at,COALESCE(NULLIF(j.site_address,''),NULLIF(j.job_name,''),r.job_id::text),COALESCE(j.inspector_name,'')
+      FROM public.basic_job_change_runs r JOIN public.basic_job_change_run_actions a ON a.run_id=r.run_id
+      LEFT JOIN public.jobs_staging j ON j.job_id=r.job_id AND j.tenant_id::text=r.tenant_id::text
+      WHERE r.tenant_id=@tenant AND r.status IN ('prepared','running','attention') AND a.status IN ('pending','review_required','failed')
+      """,conn))
+    {actionCommand.Parameters.AddWithValue("tenant",tenantId);await using var actionReader=await actionCommand.ExecuteReaderAsync(context.RequestAborted);while(await actionReader.ReadAsync(context.RequestAborted)){var actionId=actionReader.GetGuid(1);var actionKey=actionReader.GetString(2);var status=actionReader.GetString(3);var jobId=actionReader.GetGuid(0);items.Add(new{contractVersion=AutoMateApi.AuthoritativeAttentionSupport.ContractVersion,attentionId=actionId,jobId,jobName=actionReader.GetString(6),owner=actionReader.GetString(7),actionKey,kind=status=="failed"?"technical_failure":"workflow_action",title=$"{actionKey.Replace('_',' ')} needs action",detail=actionReader.GetString(4),recommendedAction="Open the job and complete only this action.",detectedAt=DatabaseTimeSupport.ReadRequired(actionReader,5),severity=status=="failed"?"high":"medium",route=$"/jobs/{jobId:D}",tab=actionKey=="invoice"?"Payments":"Overview",section=actionKey=="invoice"?"invoice-reconciliation":$"schedule-action-{actionKey}",status="open",state=status,error=status=="failed"?actionReader.GetString(4):""});}}
+    foreach(var report in await AutoMateApi.SharePointArchiveSupport.LoadReportsAsync(conn,tenantId,null,context.RequestAborted)){if(report.State is "published")continue;if(report.State is not ("release_blocked" or "ready_for_review" or "failed" or "waiting_for_sync"))continue;items.Add(new{contractVersion=1,attentionId=report.ReportId,jobId=report.JobId,actionId=report.ReportId,actionKey="report",kind="report_"+report.State,title=report.State=="ready_for_review"?"Completed report ready to publish":"Report storage needs attention",detail=string.IsNullOrWhiteSpace(report.LastError)?"Review the detected report and its selected document-storage status.":report.LastError,recommendedAction="Open Documents and review this exact report.",detectedAt=report.DetectedAt,severity=report.State=="failed"?"high":"medium",route="/jobs/"+report.JobId.ToString("D"),tab="Documents",section="report-status",status=report.State});}
+    await using(var quoteCommand=new NpgsqlCommand("SELECT quote_id,quote_number,canonical_address,accepted_at FROM public.quotes WHERE tenant_id=@tenant AND status='Accepted' AND converted_at IS NULL ORDER BY accepted_at DESC",conn)){quoteCommand.Parameters.AddWithValue("tenant",tenantId);await using var quoteReader=await quoteCommand.ExecuteReaderAsync(context.RequestAborted);while(await quoteReader.ReadAsync(context.RequestAborted)){var quoteId=quoteReader.GetGuid(0);items.Add(new{contractVersion=1,attentionId=quoteId,jobId=(Guid?)null,actionId=quoteId,actionKey="quote_conversion",kind="accepted_quote",title="Accepted quote ready for conversion review",detail=$"{quoteReader.GetString(1)} · {quoteReader.GetString(2)}",recommendedAction="Review the disabled THREED conversion preview.",detectedAt=quoteReader.GetDateTime(3),severity="medium",route="/quotes/"+quoteId.ToString("D"),tab="Conversion review",section="threed-preview",status="review_required"});}}
+    return Results.Ok(new{success=true,contractVersion=AutoMateApi.AuthoritativeAttentionSupport.ContractVersion,actionVersion,items});
+});
+
+app.MapPost("/admin/action-ledger/migrate",async(HttpContext context,ActionLedgerMigrationRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the internal action-ledger migration."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync(context.RequestAborted);
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(await AutoMateApi.AuthoritativeAttentionSupport.HasMigrationAsync(conn,request.TenantId,context.RequestAborted))
+        {
+            var current=await AutoMateApi.AuthoritativeAttentionSupport.LoadCurrentAsync(conn,request.TenantId,context.RequestAborted);
+            var existingVersion=await AutoMateApi.AuthoritativeAttentionSupport.LoadVersionAsync(conn,request.TenantId,context.RequestAborted);
+            return Results.Ok(new{success=true,status="already_migrated",contractVersion=AutoMateApi.AuthoritativeAttentionSupport.ContractVersion,
+                actionVersion=existingVersion,openActions=current.Count,providerActions=false,threedMutation=false,
+                message="The required-action ledger migration was already completed. No legacy state was replayed."});
+        }
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        await ResolveCoveredXeroAttentionAsync(conn,request.TenantId,builder.Configuration,context.RequestAborted);
+        await using(var retireLegacyWorkflow=new NpgsqlCommand("UPDATE public.job_attention_reviews SET status='superseded',superseded_at=COALESCE(superseded_at,NOW()),updated_at=NOW(),action_version=nextval('public.job_required_action_version_seq') WHERE tenant_id=@tenant AND status='open' AND reason_key IN ('workflow_action','technical_failure')",conn)){retireLegacyWorkflow.Parameters.AddWithValue("tenant",request.TenantId);await retireLegacyWorkflow.ExecuteNonQueryAsync(context.RequestAborted);}
+        await AutoMateApi.AuthoritativeAttentionSupport.ReconcileAsync(conn,request.TenantId,context.RequestAborted,migrateLegacyFlags:true);
+        var items=await AutoMateApi.AuthoritativeAttentionSupport.LoadCurrentAsync(conn,request.TenantId,context.RequestAborted);
+        await using(var clearFlags=new NpgsqlCommand("UPDATE public.jobs_staging SET xero_review_required=false,change_template_setup_required=false,mapping_review_required=false,report_review_required=false,change_review_pending=false,address_change_pending=false WHERE tenant_id::text=@tenant",conn))
+        {clearFlags.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));await clearFlags.ExecuteNonQueryAsync(context.RequestAborted);}
+        await AutoMateApi.AuthoritativeAttentionSupport.MarkMigrationAsync(conn,request.TenantId,actor,items.Count,context.RequestAborted);
+        var version=await AutoMateApi.AuthoritativeAttentionSupport.LoadVersionAsync(conn,request.TenantId,context.RequestAborted);
+        return Results.Ok(new{success=true,contractVersion=AutoMateApi.AuthoritativeAttentionSupport.ContractVersion,actionVersion=version,openActions=items.Count,
+            providerActions=false,threedMutation=false,message="Required-action ledger migrated and invariant-checked. Legacy flags are no longer presentation inputs."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Migrate required-action ledger failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/{jobId:guid}/workflow-summary",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    try
+    {
+        context.Response.Headers.CacheControl="no-store, no-cache, must-revalidate";
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        const string sql="""
+        SELECT automate_status,unscheduled,workflow_updated_at,lifecycle_version,threed_record_state,threed_complete,job_date,
+          booking_email_required,booking_email_sent,booking_email_sent_at,booking_email_last_attempt_at,COALESCE(booking_email_last_error,''),
+          terms_required,terms_sent,terms_sent_at,terms_signed,terms_signed_at,terms_last_attempt_at,COALESCE(terms_last_error,''),
+          invoice_required,invoice_sent,invoice_sent_at,COALESCE(xero_invoice_status,''),COALESCE(xero_invoice_number,''),invoice_last_attempt_at,COALESCE(invoice_last_error,''),false AS legacy_xero_review_disabled,
+          paid,COALESCE(amount_paid,0),COALESCE(amount_outstanding,job_total-amount_paid),COALESCE(job_total,0),COALESCE(payment_status,''),
+          calendar_required,calendar_created,calendar_created_at,calendar_last_attempt_at,COALESCE(calendar_last_error,''),
+          report_required,report_workflow_sent,report_workflow_sent_at,report_last_attempt_at,COALESCE(report_last_error,''),COALESCE(report_sent,''),COALESCE(xero_invoice_id,'')
+        FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job
+        """;
+        string jobStatus,threedRecordState;int lifecycleVersion;bool threedComplete;DateTimeOffset? appointmentAt;bool unscheduled;DateTimeOffset? updated;bool emailRequired,emailSent;DateTimeOffset? emailSentAt,emailAttempt;string emailError;bool termsRequired,termsSent,termsSigned;DateTimeOffset? termsSentAt,termsSignedAt,termsAttempt;string termsError;bool invoiceRequired,invoiceSent;DateTimeOffset? invoiceSentAt,invoiceAttempt;string invoiceStatus,invoiceNumber,invoiceId,invoiceError;bool invoiceReview,paid;decimal amountPaid,outstanding,total;string paymentStatus;bool calendarRequired,calendarCreated;DateTimeOffset? calendarCreatedAt,calendarAttempt;string calendarError;bool reportRequired,reportSent;DateTimeOffset? reportSentAt,reportAttempt;string reportError,reportReleased;
+        await using(var command=new NpgsqlCommand(sql,conn)){command.Parameters.AddWithValue("tenant",tenantId.ToString("D"));command.Parameters.AddWithValue("job",jobId);await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);if(!await reader.ReadAsync(context.RequestAborted))return Results.NotFound();DateTimeOffset? D(int i)=>DatabaseTimeSupport.ReadNullable(reader,i);jobStatus=reader.GetString(0);unscheduled=reader.GetBoolean(1);updated=D(2);lifecycleVersion=reader.GetInt32(3);threedRecordState=reader.GetString(4);threedComplete=reader.GetBoolean(5);appointmentAt=D(6);emailRequired=reader.GetBoolean(7);emailSent=reader.GetBoolean(8);emailSentAt=D(9);emailAttempt=D(10);emailError=reader.GetString(11);termsRequired=reader.GetBoolean(12);termsSent=reader.GetBoolean(13);termsSentAt=D(14);termsSigned=reader.GetBoolean(15);termsSignedAt=D(16);termsAttempt=D(17);termsError=reader.GetString(18);invoiceRequired=reader.GetBoolean(19);invoiceSent=reader.GetBoolean(20);invoiceSentAt=D(21);invoiceStatus=reader.GetString(22);invoiceNumber=reader.GetString(23);invoiceAttempt=D(24);invoiceError=reader.GetString(25);invoiceReview=reader.GetBoolean(26);paid=reader.GetBoolean(27);amountPaid=reader.GetDecimal(28);outstanding=reader.GetDecimal(29);total=reader.GetDecimal(30);paymentStatus=reader.GetString(31);calendarRequired=reader.GetBoolean(32);calendarCreated=reader.GetBoolean(33);calendarCreatedAt=D(34);calendarAttempt=D(35);calendarError=reader.GetString(36);reportRequired=reader.GetBoolean(37);reportSent=reader.GetBoolean(38);reportSentAt=D(39);reportAttempt=D(40);reportError=reader.GetString(41);reportReleased=reader.GetString(42);invoiceId=reader.GetString(43);}
+        var communications=await AutoMateApi.ClientEngagementSupport.LoadCommunicationsAsync(conn,tenantId,jobId,context.RequestAborted);var latest=communications.FirstOrDefault();var manual=await AutoMateApi.JobTrackingSupport.LoadManualPaymentAsync(conn,tenantId,jobId,context.RequestAborted);
+        var currentRun=await AutoMateApi.BasicChangeRunSupport.LoadCurrentAsync(conn,tenantId,jobId,context.RequestAborted);
+        var jobIssues=(await AutoMateApi.AuthoritativeAttentionSupport.LoadCurrentAsync(conn,tenantId,context.RequestAborted)).Where(value=>value.JobId==jobId).ToArray();
+        var invoiceIssue=jobIssues.FirstOrDefault(value=>value.ActionKey.Equals("invoice",StringComparison.OrdinalIgnoreCase));
+        var runInvoiceRequired=currentRun?.Actions.Any(value=>value.ActionKey=="invoice"&&value.Status is "review_required" or "pending" or "failed")==true;
+        invoiceReview=invoiceIssue is not null||runInvoiceRequired;
+        var attentionCount=jobIssues.Length+(currentRun?.Actions.Count(value=>value.Status is "review_required" or "pending" or "failed"&&!jobIssues.Any(issue=>issue.ActionKey.Equals(value.ActionKey,StringComparison.OrdinalIgnoreCase)))??0);
+        object Step(string key,string label,string status,DateTimeOffset? at,string detail,string action,string tone)=>new{key,label,status,lastActivityAt=at,detail,action,tone};
+        var inactive=jobStatus is "Unscheduled" or "Cancelled" or "Complete";
+        var emailState=!emailRequired?"Not required":emailError.Length>0?"Failed":latest?.PixelCount>0?"Possible open":emailSent?"Sent":jobStatus=="Cancelled"?"Cancelled":inactive?"Not started":"Ready";
+        var termsState=!termsRequired?"Not required":termsError.Length>0?"Failed":termsSigned?"Signed":termsSent?"Sent":jobStatus=="Cancelled"?"Cancelled":inactive?"Not started":"Ready";
+        var invoiceReviewKind=!invoiceReview?"none":jobStatus=="Cancelled"?"cancellation_review":jobStatus=="Unscheduled"?"unscheduled_invoice_decision":"adjustment_review";
+        var invoiceState=!invoiceRequired?"Not required":invoiceError.Length>0?"Failed":invoiceReviewKind switch{"cancellation_review"=>"Cancellation review needed","unscheduled_invoice_decision"=>"Decision needed","adjustment_review"=>"Invoice adjustment needed",_=>invoiceSent?(invoiceStatus.Length>0?invoiceStatus[..1]+invoiceStatus[1..].ToLowerInvariant():"Sent"):inactive?"Not started":"Ready"};
+        var effectiveOutstanding=manual is null?Math.Max(0,outstanding):Math.Max(0,total-amountPaid-manual.Amount);
+        var paymentState=jobStatus=="Cancelled"&&manual is not null?"Cancellation payment review required":manual is not null&&effectiveOutstanding<=0.005m?"Manually marked paid in AutoMate":paid||effectiveOutstanding<=0.005m?"Paid":amountPaid>0||manual is not null?"Part-paid":"Awaiting payment";
+        var calendarState=!calendarRequired?"Not required":jobStatus=="Cancelled"?"Cancelled":calendarError.Length>0?"Failed":calendarCreated?"Added":inactive?"Not started":"Ready";
+        var released=reportReleased.Equals("true",StringComparison.OrdinalIgnoreCase)||reportReleased.Equals("sent",StringComparison.OrdinalIgnoreCase);var reportState=!reportRequired?"Not required":reportError.Length>0?"Failed":released?"Sent":reportSent?"Published":threedComplete&&jobStatus!="Scheduled"?"Review required":"Awaiting report";
+        var emailAction=emailError.Length>0&&jobStatus=="Scheduled"?"Retry":emailSent?"View history":jobStatus=="Scheduled"?"Send":"";
+        var termsAction=termsError.Length>0&&jobStatus=="Scheduled"?"Retry":termsSent?"View history":jobStatus=="Scheduled"&&termsRequired?"Send":"";
+        var invoiceAction=invoiceReview?"Open Payments":invoiceError.Length>0&&jobStatus=="Scheduled"?"Retry":invoiceSent?"Open Payments":jobStatus=="Scheduled"?"Create":"";
+        var calendarAction=jobStatus=="Cancelled"?"":calendarError.Length>0&&jobStatus=="Scheduled"?"Retry":calendarCreated?"View history":jobStatus=="Scheduled"&&calendarRequired?"Create":"";
+        var reportAction=reportState is "Published" or "Sent"?"Open Documents":reportError.Length>0||reportState=="Review required"?"Review":"Open Documents";
+        var pageState=latest is null?"Not available":latest.RevokedAt.HasValue?"Revoked":latest.ExpiresAt<=DateTimeOffset.UtcNow?"Expired":latest.ConfirmedAt.HasValue?"Receipt confirmed":latest.ViewCount==0?"Not opened":latest.ViewCount==1?"Opened once":$"Opened {latest.ViewCount} times";
+        var pageDetail=latest is null?"No Inspection Details link has been issued.":latest.ConfirmedAt.HasValue?"The client explicitly confirmed receipt. This does not prove every detail was read.":latest.ViewCount>0?$"First visit {latest.FirstViewAt?.ToString("g")}; latest visit {latest.LastViewAt?.ToString("g")}. Page visits are not proof of reading.":"No Inspection Details visit has been recorded.";
+        var invoiceDetail=invoiceReviewKind switch{"unscheduled_invoice_decision"=>"This job is Unscheduled and already has an invoice. Choose whether to keep it for rescheduling or cancel the job.","cancellation_review"=>"The job was cancelled after invoicing. Xero remains unchanged until you record an accounting decision.","adjustment_review"=>"Open Payments to review the exact invoice difference or correction.",_=>invoiceError};
+        var steps=new[]{Step("email","Booking email",emailState,latest?.LastPixelAt??emailSentAt??emailAttempt,emailState=="Possible open"?"Estimated from the tracking image; this is not proof of reading.":"",emailAction,emailError.Length>0?"danger":emailSent?"success":"neutral"),Step("client_page","Client page opens",pageState,latest?.ConfirmedAt??latest?.LastViewAt??latest?.IssuedAt,pageDetail,latest is null?"":"View history",latest?.ConfirmedAt.HasValue==true?"success":"neutral"),Step("terms","Terms",termsState,termsSignedAt??termsSentAt??termsAttempt,termsError,termsAction,"neutral"),Step("invoice","Invoice",invoiceState,invoiceSentAt??invoiceAttempt,invoiceDetail,invoiceAction,"neutral"),Step("payment","Payment",paymentState,manual?.CreatedAt??updated,$"{amountPaid:C} provider-paid · {effectiveOutstanding:C} outstanding"+(manual is not null&&effectiveOutstanding>0.005m?" · The earlier manual mark no longer covers the increased total.":""),"Open Payments",effectiveOutstanding<=0.005m?"success":"neutral"),Step("calendar","Calendar",calendarState,calendarCreatedAt??calendarAttempt,calendarError,calendarAction,"neutral"),Step("report","Report",reportState,reportSentAt??reportAttempt,reportError,reportAction,"neutral")};
+        var requiredActions=new List<object>();var requiredActionKeys=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if(jobStatus==AutoMateApi.JobLifecycleSupport.Scheduled&&currentRun is not null)
+        {
+            foreach(var action in currentRun.Actions.Where(value=>value.Status is "review_required" or "pending" or "failed"))
+            {
+                var message=action.ErrorMessage??action.ReviewReason??"This workflow step needs action.";
+                var friendly=action.ActionKey switch{"booking_email"=>"booking email","terms"=>"Terms","invoice"=>"invoice action","calendar"=>"calendar event",_=>"action"};
+                var button=action.Status=="failed"?$"Retry {friendly}":action.ActionKey switch{"booking_email"=>"Send rescheduling email","terms"=>"Resend Terms","invoice"=>message.Contains("decreased",StringComparison.OrdinalIgnoreCase)?"Review credit in Payments":message.Contains("increased",StringComparison.OrdinalIgnoreCase)?"Create additional Xero invoice":"Review invoice in Payments","calendar"=>"Update calendar event",_=>"Review action"};
+                requiredActionKeys.Add(action.ActionKey);requiredActions.Add(new{actionId=action.ActionId,runId=currentRun.RunId,actionKey=action.ActionKey,status=action.Status,message,buttonLabel=button,targetFingerprint=currentRun.SourceSnapshotFingerprint,detectedAt=updated,targetTab=action.ActionKey=="invoice"?"Payments":"Overview",externalId=action.ExternalId??"",error=action.ErrorMessage??""});
+            }
+        }
+        foreach(var issue in jobIssues)
+        {
+            if(!requiredActionKeys.Add(issue.ActionKey))continue;
+            var button=issue.ActionKey switch{"mapping_review"=>"Fix data mapping","template_setup"=>"Configure required template","invoice"=>"Review invoice in Payments","report"=>"Open Documents",_=>"Open repair"};
+            requiredActions.Add(new{actionId=issue.AttentionId,runId=Guid.Empty,actionKey=issue.ActionKey,status=issue.Kind.Contains("failure",StringComparison.OrdinalIgnoreCase)?"failed":"blocked",message=issue.Detail,buttonLabel=button,targetFingerprint="",detectedAt=issue.DetectedAt,targetTab=issue.Tab,route=issue.Route,externalId=issue.ExternalId??"",error=issue.TechnicalReferenceId is null?"":$"Technical reference {issue.TechnicalReferenceId}"});
+        }
+        var actionVersion=await AutoMateApi.AuthoritativeAttentionSupport.LoadVersionAsync(conn,tenantId,context.RequestAborted);
+        return Results.Ok(new{success=true,contractVersion=4,actionVersion,jobId,automateStatus=jobStatus,jobStatus,legacyStatus=new{unscheduled},lifecycleVersion,threedRecordState,threedComplete,appointmentAt,attentionCount=requiredActions.Count,updatedAt=updated,steps,requiredActions,invoice=new{invoiceId,invoiceNumber,status=invoiceStatus,reviewKind=invoiceReviewKind},payment=new{total,providerPaid=amountPaid,outstanding=effectiveOutstanding,paymentStatus=paymentState,manualOverride=manual}});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load workflow summary failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/lifecycle-status",async(HttpContext context,Guid tenantId)=>
+{
+    context.Response.Headers.CacheControl="no-store, no-cache, must-revalidate";
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var registrationCutoff=await AutoMateApi.JobImportPolicySupport.LoadCutoffAsync(conn,tenantId,context.RequestAborted);var actionVersion=await AutoMateApi.AuthoritativeAttentionSupport.LoadVersionAsync(conn,tenantId,context.RequestAborted);
+    var items=new List<object>();
+    await using var command=new NpgsqlCommand("""
+    SELECT j.job_id,j.automate_status,j.lifecycle_version,j.threed_record_state,j.threed_complete,j.job_date,j.lifecycle_updated_at,
+      COALESCE(NULLIF(j.site_address,''),NULLIF(j.job_name,''),j.job_id::text),COALESCE(j.contact1_display_name,''),
+      COALESCE(NULLIF(j.primary_service,''),'Inspection'),COALESCE(j.inspector_name,''),COALESCE(j.job_total,0),
+      ((SELECT COUNT(*)::int FROM public.job_attention_reviews a WHERE a.tenant_id::text=j.tenant_id::text AND a.job_id=j.job_id AND a.status='open')+
+       (SELECT COUNT(*)::int FROM public.basic_job_change_runs r JOIN public.basic_job_change_run_actions ca ON ca.run_id=r.run_id
+        WHERE r.tenant_id::text=j.tenant_id::text AND r.job_id=j.job_id AND r.status IN ('prepared','running','attention') AND ca.status IN ('pending','review_required','failed'))) attention_count
+    FROM public.jobs_staging j WHERE j.tenant_id::text=@tenant AND j.threed_record_state<>'removed' ORDER BY j.lifecycle_updated_at DESC
+    """,conn);
+    command.Parameters.AddWithValue("tenant",tenantId.ToString("D"));await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);
+    while(await reader.ReadAsync(context.RequestAborted))items.Add(new{jobId=reader.GetGuid(0),automateStatus=reader.GetString(1),lifecycleVersion=reader.GetInt32(2),threedRecordState=reader.GetString(3),threedComplete=reader.GetBoolean(4),appointmentAt=DatabaseTimeSupport.ReadNullable(reader,5),updatedAt=DatabaseTimeSupport.ReadRequired(reader,6),address=reader.GetString(7),client=reader.GetString(8),service=reader.GetString(9),inspector=reader.GetString(10),total=reader.GetDecimal(11),attentionCount=reader.GetInt32(12)});
+    return Results.Ok(new{success=true,contractVersion=AutoMateApi.JobLifecycleSupport.ContractVersion,actionVersion,importPolicy=new{contractVersion=AutoMateApi.JobImportPolicySupport.ContractVersion,registrationCutoff,rule=AutoMateApi.JobImportPolicySupport.RuleText},items});
+});
+
+app.MapPost("/admin/jobs/historic-cleanup/preview",async(HttpContext context,AutoMateApi.HistoricJobCleanupCommand request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var preview=await AutoMateApi.JobImportPolicySupport.PreviewCleanupAsync(conn,request.TenantId,request.KeepJobIds,context.RequestAborted);
+        return Results.Ok(new{success=true,providerActions=false,threedMutation=false,cleanupAdvancesRegistrationBoundary=true,preview});
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="cleanup_preview_conflict",message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Preview historic AutoMate job cleanup failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/admin/jobs/historic-cleanup/execute",async(HttpContext context,AutoMateApi.HistoricJobCleanupCommand request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var result=await AutoMateApi.JobImportPolicySupport.ExecuteCleanupAsync(conn,request,actor,context.RequestAborted);
+        return Results.Ok(new{success=true,providerActions=false,threedMutation=false,result,message=$"Removed {result.RemovedJobCount} historic AutoMate jobs and retained {result.RetainedJobCount}. The universal registration-time import rule is active."});
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="cleanup_conflict",message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Execute historic AutoMate job cleanup failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/{jobId:guid}/lifecycle/preview",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var state=await AutoMateApi.JobLifecycleSupport.LoadAsync(conn,tenantId,jobId,context.RequestAborted);if(state is null)return Results.NotFound();
+    return Results.Ok(new{success=true,contractVersion=AutoMateApi.JobLifecycleSupport.ContractVersion,state,impacts=new[]{"THREED is not changed.","Completed communications, Terms and provider identifiers remain in Workflow history.","Pending unsent actions are superseded when the job is unscheduled or cancelled.",state.InvoiceExists?"Existing Xero invoices remain unchanged and require a separate accounting decision.":"No issued Xero invoice is recorded.",state.CalendarExists?"The existing Calendar event is unchanged; cancellation is a separate explicit action.":"No Calendar event is recorded.","Inspection Details access is unchanged; revocation is a separate explicit action."}});
+});
+
+app.MapPost("/jobs/{jobId:guid}/lifecycle/{commandKey}",async(HttpContext context,Guid jobId,string commandKey,AutoMateApi.JobLifecycleCommand request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var target=commandKey.Trim().ToLowerInvariant() switch{"unschedule"=>AutoMateApi.JobLifecycleSupport.Unscheduled,"cancel"=>AutoMateApi.JobLifecycleSupport.Cancelled,"reopen"=>AutoMateApi.JobLifecycleSupport.Unscheduled,_=>""};
+        if(target.Length==0)return Results.BadRequest(new{success=false,status="invalid_lifecycle_command",message="Use unschedule, cancel or reopen."});
+        var state=await AutoMateApi.JobLifecycleSupport.TransitionAsync(conn,request.TenantId,jobId,target,request,actor,context.RequestAborted);
+        if(state.AutomateStatus is AutoMateApi.JobLifecycleSupport.Unscheduled or AutoMateApi.JobLifecycleSupport.Cancelled)
+            await AutoMateApi.AuthoritativeAttentionSupport.RecordLifecycleInvoiceReviewAsync(conn,request.TenantId,jobId,state.AutomateStatus,state.LifecycleVersion,context.RequestAborted);
+        return Results.Ok(new{success=true,contractVersion=AutoMateApi.JobLifecycleSupport.ContractVersion,state,message=commandKey.Equals("cancel",StringComparison.OrdinalIgnoreCase)?"Job cancelled in AutoMate. THREED and providers were not changed.":commandKey.Equals("reopen",StringComparison.OrdinalIgnoreCase)?"Cancelled job reopened as Unscheduled. No provider records were recreated.":"Job returned to AutoMate's Unscheduled list. THREED and providers were not changed."});
+    }
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="lifecycle_conflict",message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Change AutoMate lifecycle failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/reconciliation/keep-current",async(HttpContext context,Guid jobId,AutoMateApi.KeepCurrentJobCommand request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.Reason)||string.IsNullOrWhiteSpace(request.ExpectedThreedFingerprint))return Results.Json(new{success=false,status="confirmation_required",message="Enter a reason and confirm the exact THREED version to ignore."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.JobLifecycleSupport.EnsureAsync(conn,context.RequestAborted);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        await using var tx=await conn.BeginTransactionAsync(context.RequestAborted);string current;
+        await using(var read=new NpgsqlCommand("SELECT COALESCE(current_snapshot_fingerprint,'') FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job FOR UPDATE",conn,tx)){read.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));read.Parameters.AddWithValue("job",jobId);current=Convert.ToString(await read.ExecuteScalarAsync(context.RequestAborted))??"";}
+        if(!string.Equals(current,request.ExpectedThreedFingerprint,StringComparison.Ordinal))return Results.Json(new{success=false,status="stale_threed_snapshot",message="THREED changed again. Reload before keeping the current AutoMate values."},statusCode:409);
+        await using(var insert=new NpgsqlCommand("INSERT INTO public.job_threed_snapshot_decisions(decision_id,tenant_id,job_id,threed_fingerprint,decision,reason,actor,idempotency_key) VALUES(@id,@tenant,@job,@fingerprint,'keep_automate',@reason,@actor,@key) ON CONFLICT(tenant_id,job_id,threed_fingerprint) DO NOTHING",conn,tx)){insert.Parameters.AddWithValue("id",Guid.NewGuid());insert.Parameters.AddWithValue("tenant",request.TenantId);insert.Parameters.AddWithValue("job",jobId);insert.Parameters.AddWithValue("fingerprint",current);insert.Parameters.AddWithValue("reason",request.Reason.Trim());insert.Parameters.AddWithValue("actor",actor);insert.Parameters.AddWithValue("key",request.IdempotencyKey);await insert.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var update=new NpgsqlCommand("UPDATE public.jobs_staging SET change_review_pending=false,pending_change_json=NULL,pending_change_fingerprint=NULL,pending_change_reasons=NULL,change_detected_at=NULL,change_template_setup_required=false,xero_review_required=CASE WHEN xero_review_change_owned THEN false ELSE xero_review_required END,xero_review_change_owned=false,report_review_required=CASE WHEN report_review_change_owned THEN false ELSE report_review_required END,report_review_change_owned=false,workflow_updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job",conn,tx)){update.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));update.Parameters.AddWithValue("job",jobId);await update.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var runs=new NpgsqlCommand("UPDATE public.basic_job_change_runs SET status='superseded',resolved_at=NOW(),updated_at=NOW() WHERE tenant_id=@tenant AND job_id=@job AND source_snapshot_fingerprint=@fingerprint AND status IN ('prepared','running','attention')",conn,tx)){runs.Parameters.AddWithValue("tenant",request.TenantId);runs.Parameters.AddWithValue("job",jobId);runs.Parameters.AddWithValue("fingerprint",current);await runs.ExecuteNonQueryAsync(context.RequestAborted);}
+        await tx.CommitAsync(context.RequestAborted);return Results.Ok(new{success=true,status="kept_current",message="Current AutoMate values retained for this exact THREED version. No provider or THREED action ran."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Keep current AutoMate values failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/payments/cancellation-decision",async(HttpContext context,Guid jobId,AutoMateApi.CancellationAccountingDecisionCommand request)=>
+{
+    try
+    {
+        var decision=request.Decision.Trim().ToLowerInvariant();if(!request.Confirmed||string.IsNullOrWhiteSpace(request.Reason)||decision is not ("voided_in_xero" or "retained" or "other"))return Results.Json(new{success=false,status="confirmation_required",message="Choose an accounting outcome, enter a reason and confirm it."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.JobTrackingSupport.EnsureAsync(conn,context.RequestAborted);var state=await AutoMateApi.JobLifecycleSupport.LoadAsync(conn,request.TenantId,jobId,context.RequestAborted);if(state is null)return Results.NotFound();if(state.AutomateStatus!="Cancelled"||state.LifecycleVersion!=request.ExpectedLifecycleVersion)return Results.Json(new{success=false,status="stale_lifecycle",message="The cancelled job state changed. Reload Payments."},statusCode:409);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var outcomes=new{decision,providerMutation=false,threedMutation=false,reason=request.Reason.Trim()};
+        await using(var audit=new NpgsqlCommand("INSERT INTO public.job_lifecycle_audit(audit_id,tenant_id,job_id,action_key,reason,actor,outcomes_json,idempotency_key) VALUES(@id,@tenant,@job,'cancellation_accounting_decision',@reason,@actor,CAST(@outcomes AS jsonb),@key) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING",conn)){audit.Parameters.AddWithValue("id",Guid.NewGuid());audit.Parameters.AddWithValue("tenant",request.TenantId);audit.Parameters.AddWithValue("job",jobId);audit.Parameters.AddWithValue("reason",request.Reason.Trim());audit.Parameters.AddWithValue("actor",actor);audit.Parameters.AddWithValue("outcomes",JsonSerializer.Serialize(outcomes));audit.Parameters.AddWithValue("key",request.IdempotencyKey);await audit.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var update=new NpgsqlCommand("UPDATE public.jobs_staging SET xero_review_required=false,xero_last_error=NULL,workflow_updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job",conn)){update.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));update.Parameters.AddWithValue("job",jobId);await update.ExecuteNonQueryAsync(context.RequestAborted);}
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,request.TenantId,jobId,"xero_review","invoice","resolved",context.RequestAborted);
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,request.TenantId,jobId,"lifecycle_invoice_review","invoice","resolved",context.RequestAborted);
+        return Results.Ok(new{success=true,status="recorded",message="Cancellation accounting decision recorded. AutoMate did not change Xero or THREED."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Record cancellation accounting decision failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/payments/unscheduled-decision",async(HttpContext context,Guid jobId,AutoMateApi.CancellationAccountingDecisionCommand request)=>
+{
+    try
+    {
+        if(!request.Confirmed||request.Decision.Trim().ToLowerInvariant()!="retain" )return Results.Json(new{success=false,status="confirmation_required",message="Choose Keep draft invoice for rescheduling."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.JobTrackingSupport.EnsureAsync(conn,context.RequestAborted);
+        var state=await AutoMateApi.JobLifecycleSupport.LoadAsync(conn,request.TenantId,jobId,context.RequestAborted);if(state is null)return Results.NotFound();if(state.AutomateStatus!="Unscheduled"||!state.InvoiceExists||state.LifecycleVersion!=request.ExpectedLifecycleVersion)return Results.Json(new{success=false,status="stale_lifecycle",message="The job or invoice changed. Reload Payments before recording this decision."},statusCode:409);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var reason=string.IsNullOrWhiteSpace(request.Reason)?"Draft invoice retained for rescheduling.":request.Reason.Trim();var outcomes=new{decision="retain",providerMutation=false,threedMutation=false,reason};
+        await using(var audit=new NpgsqlCommand("INSERT INTO public.job_lifecycle_audit(audit_id,tenant_id,job_id,action_key,reason,actor,outcomes_json,idempotency_key) VALUES(@id,@tenant,@job,'unscheduled_accounting_decision',@reason,@actor,CAST(@outcomes AS jsonb),@key) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING",conn)){audit.Parameters.AddWithValue("id",Guid.NewGuid());audit.Parameters.AddWithValue("tenant",request.TenantId);audit.Parameters.AddWithValue("job",jobId);audit.Parameters.AddWithValue("reason",reason);audit.Parameters.AddWithValue("actor",actor);audit.Parameters.AddWithValue("outcomes",JsonSerializer.Serialize(outcomes));audit.Parameters.AddWithValue("key",request.IdempotencyKey);await audit.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var update=new NpgsqlCommand("UPDATE public.jobs_staging SET xero_review_required=false,xero_last_error=NULL,workflow_updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job",conn)){update.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));update.Parameters.AddWithValue("job",jobId);await update.ExecuteNonQueryAsync(context.RequestAborted);}
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,request.TenantId,jobId,"xero_review","invoice","resolved",context.RequestAborted);
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,request.TenantId,jobId,"lifecycle_invoice_review","invoice","resolved",context.RequestAborted);
+        return Results.Ok(new{success=true,status="recorded",message="Draft invoice retained for rescheduling. AutoMate did not change Xero or THREED."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Record Unscheduled accounting decision failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/source-removal/confirm",async(HttpContext context,Guid jobId,AutoMateApi.SourceRemovalCommand request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.Reason))return Results.Json(new{success=false,status="confirmation_required",message="Enter a reason and confirm removal from active AutoMate data."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.JobTrackingSupport.EnsureAsync(conn,context.RequestAborted);await AutoMateApi.JobLifecycleSupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var replay=new NpgsqlCommand("SELECT job_id FROM public.job_source_tombstones WHERE tenant_id=@tenant AND idempotency_key=@key",conn)){replay.Parameters.AddWithValue("tenant",request.TenantId);replay.Parameters.AddWithValue("key",request.IdempotencyKey);var replayJob=await replay.ExecuteScalarAsync(context.RequestAborted);if(replayJob is Guid replayId)return replayId==jobId?Results.Ok(new{success=true,status="idempotent_replay",message="This missing THREED job was already removed from active AutoMate data."}):Results.Json(new{success=false,status="idempotency_conflict",message="This command key belongs to another job."},statusCode:409);}
+        var state=await AutoMateApi.JobLifecycleSupport.LoadAsync(conn,request.TenantId,jobId,context.RequestAborted);if(state is null)return Results.NotFound();if(state.ThreedRecordState!="missing"||state.LifecycleVersion!=request.ExpectedLifecycleVersion)return Results.Json(new{success=false,status="source_state_changed",message="The THREED source state changed. Reload before removing this job."},statusCode:409);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        string label,providerJson;await using(var evidence=new NpgsqlCommand("SELECT COALESCE(NULLIF(site_address,''),NULLIF(job_name,''),job_id::text),jsonb_build_object('xeroInvoiceId',COALESCE(xero_invoice_id,''),'calendarEventId',COALESCE((SELECT calendar_id FROM public.job_calendar_evidence e WHERE e.tenant_id::text=jobs_staging.tenant_id::text AND e.job_id=jobs_staging.job_id ORDER BY e.last_observed_at DESC LIMIT 1),''),'signNowDocumentId',COALESCE(signnow_document_id,''))::text FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job",conn)){evidence.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));evidence.Parameters.AddWithValue("job",jobId);await using var row=await evidence.ExecuteReaderAsync(context.RequestAborted);await row.ReadAsync(context.RequestAborted);label=row.GetString(0);providerJson=row.GetString(1);}
+        await AutoMateApi.ClientEngagementSupport.EnsureAsync(conn,context.RequestAborted);
+        await using var tx=await conn.BeginTransactionAsync(context.RequestAborted);
+        await using(var tombstone=new NpgsqlCommand("INSERT INTO public.job_source_tombstones(tombstone_id,tenant_id,job_id,lifecycle_status,lifecycle_version,job_label,reason,actor,provider_ids_json,idempotency_key) VALUES(@id,@tenant,@job,@status,@version,@label,@reason,@actor,CAST(@providers AS jsonb),@key) ON CONFLICT(tenant_id,job_id) DO NOTHING",conn,tx)){tombstone.Parameters.AddWithValue("id",Guid.NewGuid());tombstone.Parameters.AddWithValue("tenant",request.TenantId);tombstone.Parameters.AddWithValue("job",jobId);tombstone.Parameters.AddWithValue("status",state.AutomateStatus);tombstone.Parameters.AddWithValue("version",state.LifecycleVersion);tombstone.Parameters.AddWithValue("label",label);tombstone.Parameters.AddWithValue("reason",request.Reason.Trim());tombstone.Parameters.AddWithValue("actor",actor);tombstone.Parameters.AddWithValue("providers",providerJson);tombstone.Parameters.AddWithValue("key",request.IdempotencyKey);await tombstone.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var update=new NpgsqlCommand("UPDATE public.jobs_staging SET threed_record_state='removed',source_removed_at=NOW(),raw_payload_json='',canonical_values_json=NULL,current_snapshot_json=NULL,pending_change_json=NULL,change_review_pending=false,workflow_updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job",conn,tx)){update.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));update.Parameters.AddWithValue("job",jobId);await update.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var actions=new NpgsqlCommand("UPDATE public.job_workflow_actions SET status='superseded',retry_requested=false,updated_at=NOW() WHERE job_id=@job AND status NOT IN ('sent','completed')",conn,tx)){actions.Parameters.AddWithValue("job",jobId);await actions.ExecuteNonQueryAsync(context.RequestAborted);}
+        var revoked=0;
+        const string revokePages="UPDATE public.client_inspection_pages SET revoked_at=COALESCE(revoked_at,NOW()),revoked_by=CASE WHEN revoked_at IS NULL THEN @actor ELSE revoked_by END,revoke_reason=CASE WHEN revoked_at IS NULL THEN @reason ELSE revoke_reason END WHERE tenant_id=@tenant AND job_id=@job AND revoked_at IS NULL";
+        await using(var revoke=new NpgsqlCommand(revokePages,conn,tx)){revoke.Parameters.AddWithValue("actor",actor);revoke.Parameters.AddWithValue("reason","THREED source record removed: "+request.Reason.Trim());revoke.Parameters.AddWithValue("tenant",request.TenantId);revoke.Parameters.AddWithValue("job",jobId);revoked+=await revoke.ExecuteNonQueryAsync(context.RequestAborted);}
+        const string revokeCommunications="UPDATE public.email_communications SET revoked_at=COALESCE(revoked_at,NOW()),revoked_by=CASE WHEN revoked_at IS NULL THEN @actor ELSE revoked_by END,revoke_reason=CASE WHEN revoked_at IS NULL THEN @reason ELSE revoke_reason END WHERE tenant_id=@tenant AND job_id=@job AND revoked_at IS NULL";
+        await using(var revoke=new NpgsqlCommand(revokeCommunications,conn,tx)){revoke.Parameters.AddWithValue("actor",actor);revoke.Parameters.AddWithValue("reason","THREED source record removed: "+request.Reason.Trim());revoke.Parameters.AddWithValue("tenant",request.TenantId);revoke.Parameters.AddWithValue("job",jobId);revoked+=await revoke.ExecuteNonQueryAsync(context.RequestAborted);}
+        await tx.CommitAsync(context.RequestAborted);
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,request.TenantId,jobId,"threed_deleted","remove_job","resolved",context.RequestAborted);
+        return Results.Ok(new{success=true,status="removed",message=$"Job removed from active AutoMate data. {revoked} active client link{(revoked==1?" was":"s were")} revoked; immutable history and provider evidence were retained."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Remove missing THREED job failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/{jobId:guid}/workflow-history",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;if(!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn,tenantId,jobId))return Results.NotFound();await AutoMateApi.JobTrackingSupport.EnsureAsync(conn,context.RequestAborted);
+        Guid StableEventId(string value){var bytes=SHA256.HashData(Encoding.UTF8.GetBytes($"{tenantId:D}|{jobId:D}|{value}"));return new Guid(bytes[..16]);}
+        var events=new List<AutoMateApi.JobWorkflowEvent>();var communications=await AutoMateApi.ClientEngagementSupport.LoadCommunicationsAsync(conn,tenantId,jobId,context.RequestAborted);foreach(var item in communications)
+        {
+            events.Add(new(item.CommunicationId,"Booking email","Customer communication",item.DeliveryState,$"{item.Purpose} · Possible opens {item.PixelCount}. Possible opens are estimates, not proof of reading.","AutoMate",item.IssuedAt,item.Provider,item.CommunicationId.ToString("D"),""));
+            if(item.ViewCount>0&&item.LastViewAt.HasValue)events.Add(new(StableEventId($"communication:{item.CommunicationId:D}:page:{item.LastViewAt.Value:O}:{item.ViewCount}"),"Client page opens",item.ViewCount==1?"Inspection Details opened once":$"Inspection Details opened {item.ViewCount} times","recorded",$"First visit {item.FirstViewAt?.ToString("g")}; latest visit {item.LastViewAt.Value:g}. A visit is not proof the page was read.","Client",item.LastViewAt.Value,item.Provider,item.CommunicationId.ToString("D"),""));
+            if(item.ConfirmedAt.HasValue)events.Add(new(StableEventId($"communication:{item.CommunicationId:D}:confirmed:{item.ConfirmedAt.Value:O}"),"Client page opens","Receipt confirmed","completed","The client explicitly confirmed receipt. This does not prove every detail was read.","Client",item.ConfirmedAt.Value,item.Provider,item.CommunicationId.ToString("D"),""));
+        }
+        string HistoryStep(string action){var key=action.ToLowerInvariant();return key.Contains("invoice")||key.Contains("payment")?"Payment":key.Contains("term")||key.Contains("agreement")?"Terms":key.Contains("calendar")?"Calendar":key.Contains("report")||key.Contains("document")?"Report":key.Contains("email")||key.Contains("communication")?"Booking email":"Job";}var audit=await AutoMateApi.BasicTemplateCommandSupport.LoadJobAuditAsync(conn,tenantId,jobId,300,context.RequestAborted);foreach(var item in audit)events.Add(new(StableEventId($"audit:{item.Source}:{item.SourceId}:{item.Action}:{item.CreatedAt:O}"),HistoryStep(item.Action),item.Action,item.Outcome,"",item.Actor,item.CreatedAt,item.Source,item.SourceId,""));
+        await using(var lifecycle=new NpgsqlCommand("SELECT audit_id,action_key,reason,actor,outcomes_json::text,created_at FROM public.job_lifecycle_audit WHERE tenant_id=@tenant AND job_id=@job ORDER BY created_at DESC",conn)){lifecycle.Parameters.AddWithValue("tenant",tenantId);lifecycle.Parameters.AddWithValue("job",jobId);await using var reader=await lifecycle.ExecuteReaderAsync(context.RequestAborted);while(await reader.ReadAsync(context.RequestAborted))events.Add(new(reader.GetGuid(0),"Job",reader.GetString(1),"completed",reader.GetString(2)+" · "+reader.GetString(4),reader.GetString(3),DatabaseTimeSupport.ReadRequired(reader,5),"AutoMate",reader.GetGuid(0).ToString("D"),""));}
+        await using(var lifecycleEvents=new NpgsqlCommand("SELECT event_id,from_status,to_status,lifecycle_version,reason,actor,created_at FROM public.job_lifecycle_events WHERE tenant_id=@tenant AND job_id=@job ORDER BY created_at DESC",conn)){lifecycleEvents.Parameters.AddWithValue("tenant",tenantId);lifecycleEvents.Parameters.AddWithValue("job",jobId);await using var reader=await lifecycleEvents.ExecuteReaderAsync(context.RequestAborted);while(await reader.ReadAsync(context.RequestAborted))events.Add(new(reader.GetGuid(0),"Job","AutoMate lifecycle changed",reader.GetString(2),$"{reader.GetString(1)} → {reader.GetString(2)} · lifecycle v{reader.GetInt32(3)} · {reader.GetString(4)}",reader.GetString(5),DatabaseTimeSupport.ReadRequired(reader,6),"AutoMate",reader.GetGuid(0).ToString("D"),""));}
+        return Results.Ok(new{success=true,contractVersion=1,jobId,items=events.OrderByDescending(x=>x.OccurredAt).Take(500)});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load workflow history failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/payments/manual-paid",async(HttpContext context,Guid jobId,AutoMateApi.ManualPaymentCommand request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;if(!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn,request.TenantId,jobId))return Results.NotFound();await EnsureJobPaymentColumnsAsync(conn);decimal outstanding;await using(var command=new NpgsqlCommand("SELECT GREATEST(0,COALESCE(amount_outstanding,job_total-amount_paid)) FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job",conn)){command.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));command.Parameters.AddWithValue("job",jobId);outstanding=Convert.ToDecimal(await command.ExecuteScalarAsync(context.RequestAborted));}var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var result=await AutoMateApi.JobTrackingSupport.MarkPaidAsync(conn,request.TenantId,jobId,outstanding,request,actor,context.RequestAborted);return Results.Ok(new{success=true,status="manual_paid",message="Manually marked paid in AutoMate. No Xero payment was created.",manualOverride=result});}catch(InvalidOperationException ex){return Results.Json(new{success=false,status="conflict",message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Problem(title:"Mark manually paid failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/payments/manual-paid/remove",async(HttpContext context,Guid jobId,AutoMateApi.RemoveManualPaymentCommand request)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;if(!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn,request.TenantId,jobId))return Results.NotFound();var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));await AutoMateApi.JobTrackingSupport.RemovePaidAsync(conn,request.TenantId,jobId,request,actor,context.RequestAborted);return Results.Ok(new{success=true,status="manual_paid_removed",message="The manual paid mark was removed. Its audit record was retained."});}catch(InvalidOperationException ex){return Results.Json(new{success=false,status="conflict",message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Problem(title:"Remove manual paid mark failed",detail:ex.Message,statusCode:500);}
+});
+
+// The combined Cancel / Unschedule contract was removed in lifecycle v2. The distinct
+// /lifecycle/unschedule and /lifecycle/cancel commands never mutate providers or THREED.
+
+app.MapGet("/automation/attention-legacy",()=>Results.Json(new
+{
+    success=false,
+    status="legacy_attention_retired",
+    message="Legacy flag-based Attention was retired. Use /automation/attention-v2."
+},statusCode:StatusCodes.Status410Gone));
+
+app.MapGet("/automation/attention-legacy-retired-diagnostics",async(HttpContext context,Guid tenantId)=>
+{
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.BasicChangeRunSupport.EnsureAsync(conn,context.RequestAborted);await AutoMateApi.SharePointArchiveSupport.EnsureAsync(conn,context.RequestAborted);var items=new List<object>();
+    await using(var command=new NpgsqlCommand("""SELECT r.job_id,a.action_id,a.action_key,a.status,COALESCE(NULLIF(a.error_message,''),NULLIF(a.review_reason,''),'Review this changed-job action.'),r.detected_at,COALESCE(NULLIF(j.site_address,''),NULLIF(j.job_name,''),r.job_id::text),COALESCE(j.inspector_name,'') FROM public.basic_job_change_runs r JOIN public.basic_job_change_run_actions a ON a.run_id=r.run_id LEFT JOIN public.jobs_staging j ON j.job_id=r.job_id AND j.tenant_id::text=r.tenant_id::text WHERE r.tenant_id=@tenant AND a.status IN ('pending','failed','review_required') ORDER BY r.detected_at DESC""",conn)){command.Parameters.AddWithValue("tenant",tenantId);await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);while(await reader.ReadAsync(context.RequestAborted)){var jobId=reader.GetGuid(0);var actionId=reader.GetGuid(1);var actionKey=reader.GetString(2);var status=reader.GetString(3);var raw=reader.GetString(4);var technical=status=="failed"&&(raw.Contains("Npgsql",StringComparison.OrdinalIgnoreCase)||raw.Contains("column ",StringComparison.OrdinalIgnoreCase)||raw.Contains("InternalServerError",StringComparison.OrdinalIgnoreCase));var reference=technical?Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw))).Substring(0,12):"";items.Add(new{attentionId=actionId,jobId,jobName=reader.GetString(6),owner=reader.GetString(7),actionId,actionKey,kind=technical?"technical_failure":status=="failed"?"failed_action":"change_review",title=technical?"AutoMate service error — no customer action was completed":AttentionActionTitle(actionKey,status),detail=technical?$"AutoMate could not complete this action. Reference {reference}. Retry only this failed action after the service correction is deployed.":raw,technicalReferenceId=reference,recommendedAction=technical?"Retry this failed action after AutoMate is updated.":"Review this action and its recorded changes.",detectedAt=reader.GetDateTime(5),severity=status=="failed"?"high":"medium",route="/jobs/"+jobId.ToString("D"),tab="Automations",section="scheduling-actions",status});}}
+    await using(var legacy=new NpgsqlCommand("""SELECT job_id,COALESCE(NULLIF(site_address,''),NULLIF(job_name,''),job_id::text),COALESCE(inspector_name,''),COALESCE(change_detected_at,address_change_detected_at,workflow_updated_at,updated_at,NOW()),xero_review_required,change_template_setup_required,mapping_review_required,COALESCE(mapping_attention_reason,''),COALESCE(pending_change_reasons,''),COALESCE(previous_site_address,''),COALESCE(site_address,''),unscheduled FROM public.jobs_staging WHERE tenant_id::text=@tenant AND (xero_review_required OR change_template_setup_required OR mapping_review_required) ORDER BY COALESCE(change_detected_at,address_change_detected_at,workflow_updated_at,updated_at) DESC""",conn)){legacy.Parameters.AddWithValue("tenant",tenantId.ToString());await using var reader=await legacy.ExecuteReaderAsync(context.RequestAborted);while(await reader.ReadAsync(context.RequestAborted)){var jobId=reader.GetGuid(0);var detected=reader.GetDateTime(3);var reasons=reader.GetString(8);if(reader.GetBoolean(4))items.Add(new{attentionId=$"{jobId:D}-xero",jobId,jobName=reader.GetString(1),owner=reader.GetString(2),actionKey="invoice",kind="xero_review",title=reader.GetBoolean(11)?"Cancellation accounting review required":"Xero invoice needs reconciliation",detail=reader.GetBoolean(11)?"This job was unscheduled after an invoice was issued. The invoice remains unchanged; review it in Xero.":"Compare the verified Xero invoice coverage with the current THREED total. AutoMate will show the exact remaining adjustment.",recommendedAction="Open the job, update AutoMate from any displayed THREED differences, then complete the single accounting action shown.",detectedAt=detected,severity="high",route=$"/jobs/{jobId:D}",tab="Automations",section="scheduling-actions",status="review_required"});if(reader.GetBoolean(5)){var eventKey=reasons.Contains("service",StringComparison.OrdinalIgnoreCase)||reasons.Contains("price",StringComparison.OrdinalIgnoreCase)||reasons.Contains("scope",StringComparison.OrdinalIgnoreCase)?"service_change":"rescheduling";items.Add(new{attentionId=$"{jobId:D}-template-{eventKey}",jobId,jobName=reader.GetString(1),owner=reader.GetString(2),actionKey="template_setup",kind="missing_template",title=$"{(eventKey=="service_change"?"Service change":"Rescheduling")} email for Contact 1 is required but has no enabled template",detail=$"The recorded job change requires the {eventKey.Replace('_',' ')} template for Contact 1.",recommendedAction="Save and enable this exact template, or explicitly disable the corresponding automation.",detectedAt=detected,severity="medium",route=$"/automations/templates/{eventKey}/contact_1",tab=eventKey,section="template-editor",templateSlot=$"{eventKey}/contact_1",status="review_required"});}if(reader.GetBoolean(6))items.Add(new{attentionId=$"{jobId:D}-mapping",jobId,jobName=reader.GetString(1),owner=reader.GetString(2),actionKey="mapping_review",kind="mapping_review",title="THREED mapping requires review",detail=string.IsNullOrWhiteSpace(reader.GetString(7))?"The approved mapping fingerprint no longer matches current THREED discovery.":reader.GetString(7),recommendedAction="Rescan THREED, review changed assignments, validate required fields, then approve the new mapping version and re-sync this job without provider actions.",detectedAt=detected,severity="high",route="/mapping",tab="Services",section="mapping-review",status="review_required"});}}
+    foreach(var report in await AutoMateApi.SharePointArchiveSupport.LoadReportsAsync(conn,tenantId,null,context.RequestAborted)){if(report.State is "published")continue;if(report.State is not ("release_blocked" or "ready_for_review" or "failed" or "waiting_for_sync"))continue;items.Add(new{attentionId=report.ReportId,jobId=report.JobId,actionId=report.ReportId,actionKey="report",kind="report_"+report.State,title=report.State=="ready_for_review"?"Completed report ready to publish":"Report storage needs attention",detail=string.IsNullOrWhiteSpace(report.LastError)?"Review the detected report and its SharePoint status.":report.LastError,detectedAt=report.DetectedAt,severity=report.State=="failed"?"high":"medium",route="/jobs/"+report.JobId.ToString("D"),tab="Automations",section="publishing-actions",status=report.State});}
+    await AutoMateApi.QuoteWorkflowSupport.EnsureAsync(conn,context.RequestAborted);await using(var quoteCommand=new NpgsqlCommand("SELECT quote_id,quote_number,canonical_address,accepted_at FROM public.quotes WHERE tenant_id=@tenant AND status='Accepted' AND converted_at IS NULL ORDER BY accepted_at DESC",conn)){quoteCommand.Parameters.AddWithValue("tenant",tenantId);await using var quoteReader=await quoteCommand.ExecuteReaderAsync(context.RequestAborted);while(await quoteReader.ReadAsync(context.RequestAborted)){var quoteId=quoteReader.GetGuid(0);items.Add(new{attentionId=quoteId,jobId=(Guid?)null,actionId=quoteId,actionKey="quote_conversion",kind="accepted_quote",title="Accepted quote ready for conversion review",detail=$"{quoteReader.GetString(1)} · {quoteReader.GetString(2)}",detectedAt=quoteReader.GetDateTime(3),severity="medium",route="/quotes/"+quoteId.ToString("D"),tab="Conversion review",section="threed-preview",status="review_required"});}}
+    return Results.Ok(new{success=true,items});
+});
+
+app.MapGet("/jobs/{jobId:guid}/xero-reference-review",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var job=await LoadXeroInvoiceJobAsync(conn,jobId);if(job==null||job.TenantId!=tenantId)return Results.NotFound(new{success=false,message="The job does not belong to this company."});
+        if(string.IsNullOrWhiteSpace(job.XeroInvoiceId))return Results.Json(new{success=false,status="xero_invoice_not_recorded",message="No stored Xero InvoiceID is available for this job."},statusCode:409);
+        var account=await GetXeroAccountAsync(conn,job.InspectorId,builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="xero_not_connected",message=account.ErrorMessage},statusCode:409);
+        var invoice=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,context.RequestAborted);if(!invoice.Success)return Results.Json(new{success=false,status="xero_invoice_verification_failed",message=invoice.Error},statusCode:409);
+        var totalMatches=AutoMateApi.XeroRepairPolicySupport.TotalsMatch(invoice.Total,job.JobTotal);
+        return Results.Ok(new{success=true,invoiceId=job.XeroInvoiceId,invoiceNumber=invoice.InvoiceNumber,status=invoice.Status,currentReference=invoice.Reference,proposedReference=string.IsNullOrWhiteSpace(job.SiteAddress)?job.JobName:job.SiteAddress,total=invoice.Total,jobTotal=job.JobTotal,totalMatches,verifiedAt=DateTimeOffset.UtcNow,canUpdateReference=totalMatches&&!string.Equals(invoice.Reference,string.IsNullOrWhiteSpace(job.SiteAddress)?job.JobName:job.SiteAddress,StringComparison.Ordinal),canResend=invoice.Status is "AUTHORISED" or "PAID",openUrl="https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID="+Uri.EscapeDataString(job.XeroInvoiceId),message=totalMatches?"The live Xero total matches THREED. Only the Reference can be corrected by this action.":"The live Xero total does not match THREED. Resolve the financial review before changing the Reference."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load Xero reference review failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/xero-reference-review/update",async(HttpContext context,Guid jobId,XeroReferenceUpdateRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the invoice number and old/new Reference before updating Xero."},statusCode:409);if(string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.BadRequest(new{success=false,message="An idempotency key is required."});
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await EnsureXeroRepairAuditAsync(conn,context.RequestAborted);
+        var replay=await LoadXeroRepairReplayAsync(conn,request.TenantId,request.IdempotencyKey,context.RequestAborted);if(replay!=null){if(replay.ActionKey=="reference_updated")return Results.Ok(new{success=true,status="idempotent_replay",previousAction=replay.ActionKey,message="This exact Xero Reference command was already completed and was not repeated."});return Results.Json(new{success=false,status="idempotent_replay",previousAction=replay.ActionKey,message="This exact Xero Reference command was already attempted. Reload the live invoice evidence before retrying with a new command."},statusCode:409);}
+        var job=await LoadXeroInvoiceJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound();if(string.IsNullOrWhiteSpace(job.XeroInvoiceId)||!string.Equals(job.XeroInvoiceId,request.ExpectedInvoiceId,StringComparison.OrdinalIgnoreCase))return Results.Json(new{success=false,status="stale_invoice",message="The stored Xero InvoiceID changed. Reload the review."},statusCode:409);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var account=await GetXeroAccountAsync(conn,job.InspectorId,builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="xero_not_connected",message=account.ErrorMessage},statusCode:409);
+        var before=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,context.RequestAborted);if(!before.Success)return Results.Json(new{success=false,status="xero_invoice_verification_failed",message=before.Error},statusCode:409);if(!string.Equals(before.Reference,request.ExpectedReference??"",StringComparison.Ordinal))return Results.Json(new{success=false,status="stale_reference",message="The Xero Reference changed since this review loaded. Reload before updating."},statusCode:409);
+        if(!AutoMateApi.XeroRepairPolicySupport.TotalsMatch(before.Total,job.JobTotal))return Results.Json(new{success=false,status="financial_review_required",message="The live Xero total differs from THREED. Reference-only correction is blocked."},statusCode:409);
+        var target=(request.NewReference??"").Trim();if(string.IsNullOrWhiteSpace(target))return Results.BadRequest(new{success=false,message="The new Xero Reference is required."});
+        if(!await TryReserveXeroRepairAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"reference_update_started",actor,job.XeroInvoiceId,before.InvoiceNumber,context.RequestAborted))return Results.Json(new{success=false,status="command_in_progress",message="This exact Xero Reference command is already being processed. Reload before trying again."},statusCode:409);
+        using var http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);http.DefaultRequestHeaders.Add("xero-tenant-id",account.TenantId);http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));using var response=await http.PostAsJsonAsync("https://api.xero.com/api.xro/2.0/Invoices/"+Uri.EscapeDataString(job.XeroInvoiceId),AutoMateApi.XeroRepairPolicySupport.BuildReferenceUpdatePayload(job.XeroInvoiceId,target),context.RequestAborted);var providerBody=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode){await RecordXeroRepairAuditAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"reference_update_failed",actor,job.XeroInvoiceId,before.InvoiceNumber,before.Reference,target,before.Status,providerBody,context.RequestAborted);return Results.Json(new{success=false,status="xero_reference_update_failed",message="Xero did not update the Reference. The accounting period may be locked or the invoice may no longer permit this correction."},statusCode:409);}
+        var after=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,context.RequestAborted);if(!after.Success||!string.Equals(after.Reference,target,StringComparison.Ordinal)){await RecordXeroRepairAuditAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"reference_verification_failed",actor,job.XeroInvoiceId,before.InvoiceNumber,before.Reference,target,before.Status,after.Error,context.RequestAborted);return Results.Json(new{success=false,status="xero_reference_verification_failed",message="Xero accepted the update but the re-read Reference did not match. Attention remains unresolved."},statusCode:409);}
+        await RecordXeroRepairAuditAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"reference_updated",actor,job.XeroInvoiceId,after.InvoiceNumber,before.Reference,after.Reference,after.Status,"Verified by Xero re-read",context.RequestAborted);await ClearXeroReviewAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);return Results.Ok(new{success=true,status="reference_updated",message="Xero Reference updated and verified. Contact, lines, GST and total were unchanged.",invoice=after,canResend=after.Status is "AUTHORISED" or "PAID"});
+    }
+    catch(Exception ex){return Results.Problem(title:"Update Xero Reference failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/xero-reference-review/resend",async(HttpContext context,Guid jobId,XeroReferenceResendRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the separate corrected-invoice resend."},statusCode:409);if(string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.BadRequest(new{success=false,message="An idempotency key is required."});await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await EnsureXeroRepairAuditAsync(conn,context.RequestAborted);var replay=await LoadXeroRepairReplayAsync(conn,request.TenantId,request.IdempotencyKey,context.RequestAborted);if(replay!=null){if(replay.ActionKey=="corrected_invoice_resent")return Results.Ok(new{success=true,status="idempotent_replay",previousAction=replay.ActionKey,message="This exact corrected-invoice resend was already completed and was not sent again."});return Results.Json(new{success=false,status="idempotent_replay",previousAction=replay.ActionKey,message="This exact corrected-invoice resend was already attempted. Reload before retrying with a new command."},statusCode:409);}var job=await LoadXeroInvoiceJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound();if(!string.Equals(job.XeroInvoiceId,request.ExpectedInvoiceId,StringComparison.OrdinalIgnoreCase))return Results.Json(new{success=false,status="stale_invoice",message="Reload the Xero review before resending."},statusCode:409);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var account=await GetXeroAccountAsync(conn,job.InspectorId,builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="xero_not_connected",message=account.ErrorMessage},statusCode:409);var invoice=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,context.RequestAborted);if(!invoice.Success)return Results.Json(new{success=false,status="xero_invoice_verification_failed",message=invoice.Error},statusCode:409);if(invoice.Status is not("AUTHORISED" or "PAID"))return Results.Json(new{success=false,status="xero_invoice_approval_required",message="Approve this invoice in Xero before resending it."},statusCode:409);if(!await TryReserveXeroRepairAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"corrected_invoice_resend_started",actor,job.XeroInvoiceId,invoice.InvoiceNumber,context.RequestAborted))return Results.Json(new{success=false,status="command_in_progress",message="This exact corrected-invoice resend is already being processed. It was not sent twice."},statusCode:409);using var http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);http.DefaultRequestHeaders.Add("xero-tenant-id",account.TenantId);using var response=await http.PostAsync("https://api.xero.com/api.xro/2.0/Invoices/"+Uri.EscapeDataString(job.XeroInvoiceId)+"/Email",null,context.RequestAborted);var body=await response.Content.ReadAsStringAsync(context.RequestAborted);await RecordXeroRepairAuditAsync(conn,request.TenantId,jobId,request.IdempotencyKey,response.IsSuccessStatusCode?"corrected_invoice_resent":"corrected_invoice_resend_failed",actor,job.XeroInvoiceId,invoice.InvoiceNumber,invoice.Reference,invoice.Reference,invoice.Status,body,context.RequestAborted);return response.IsSuccessStatusCode?Results.Ok(new{success=true,status="resent",message="Xero accepted the corrected-invoice resend."}):Results.Json(new{success=false,status="resend_failed",message="The Reference remains corrected, but Xero did not resend the invoice. Retry only the resend."},statusCode:409);
+    }
+    catch(Exception ex){return Results.Problem(title:"Resend corrected Xero invoice failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/xero-reference-review/no-correction",async(HttpContext context,Guid jobId,XeroNoCorrectionRequest request)=>
+{
+    if(!request.Confirmed||string.IsNullOrWhiteSpace(request.Reason))return Results.Json(new{success=false,status="confirmation_required",message="Enter and confirm why no Xero correction is required."},statusCode:409);if(string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.BadRequest(new{success=false,message="An idempotency key is required."});await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await EnsureXeroRepairAuditAsync(conn,context.RequestAborted);var replay=await LoadXeroRepairReplayAsync(conn,request.TenantId,request.IdempotencyKey,context.RequestAborted);if(replay!=null)return replay.ActionKey=="no_correction_required"?Results.Ok(new{success=true,status="idempotent_replay",previousAction=replay.ActionKey,message="This exact no-correction decision was already recorded."}):Results.Json(new{success=false,status="idempotent_replay",previousAction=replay.ActionKey,message="This command key was already used for a different Xero repair action."},statusCode:409);var job=await LoadXeroInvoiceJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound();var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));if(!await TryReserveXeroRepairAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"no_correction_started",actor,job.XeroInvoiceId,job.XeroInvoiceNumber,context.RequestAborted))return Results.Json(new{success=false,status="command_in_progress",message="This exact no-correction decision is already being recorded."},statusCode:409);await RecordXeroRepairAuditAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"no_correction_required",actor,job.XeroInvoiceId,job.XeroInvoiceNumber,"","",job.XeroInvoiceStatus,request.Reason.Trim(),context.RequestAborted);await ClearXeroReviewAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);return Results.Ok(new{success=true,status="resolved",message="The no-correction decision was audited and Attention was resolved."});
+});
+
+app.MapGet("/jobs/{jobId:guid}/reconciliation",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var reconciliation=await LoadJobReconciliationAsync(conn,tenantId,jobId,builder.Configuration,context.RequestAborted);if(await TryMigrateLegacyCreditReviewCompletionAsync(conn,tenantId,jobId,reconciliation,context.RequestAborted))reconciliation=await LoadJobReconciliationAsync(conn,tenantId,jobId,builder.Configuration,context.RequestAborted);if(await TryResolveCoveredXeroReviewAsync(conn,tenantId,jobId,reconciliation,"AutoMate verified reconciliation",context.RequestAborted))reconciliation=reconciliation with{AttentionRequired=false};return Results.Ok(reconciliation);}
+    catch(KeyNotFoundException){return Results.NotFound(new{success=false,message="The job does not belong to this company."});}
+    catch(AutoMateApi.JobReconciliationException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Load job reconciliation failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/reconciliation/credit-review/complete",async(HttpContext context,Guid jobId,CreditReviewCompleteRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.ExpectedCurrentFingerprint)||string.IsNullOrWhiteSpace(request.ExpectedTargetFingerprint)||string.IsNullOrWhiteSpace(request.IdempotencyKey)||string.IsNullOrWhiteSpace(request.Outcome))
+            return Results.Json(new{success=false,status="confirmation_required",message="Confirm the exact credit review and its recorded outcome."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var current=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);
+        if(!string.Equals(current.CurrentFingerprint,request.ExpectedCurrentFingerprint,StringComparison.Ordinal)||!string.Equals(current.TargetFingerprint,request.ExpectedTargetFingerprint,StringComparison.Ordinal))
+            return Results.Json(new{success=false,status="credit_review_changed",message="The THREED or Xero amounts changed after this credit review loaded. Review the current amount before recording completion.",reconciliation=current},statusCode:409);
+        if(current.CreditReviewCompleted)return Results.Ok(new{success=true,status="already_completed",message="This exact credit review was already recorded as completed.",reconciliation=current});
+        if(!current.ProviderVerified||current.Action!="credit_review"||current.RemainingDifference>=-0.01m)
+            return Results.Json(new{success=false,status="credit_review_not_current",message="The current Xero and THREED evidence no longer matches this credit review. Refresh and review the current action.",reconciliation=current},statusCode:409);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        if(!await AutoMateApi.JobReconciliationSupport.ReserveAsync(conn,request.TenantId,jobId,"complete_credit_review",current.TargetFingerprint,request.IdempotencyKey,actor,context.RequestAborted))
+        {
+            var latest=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);
+            if(latest.CreditReviewCompleted)return Results.Ok(new{success=true,status="already_completed",message="This exact credit review was already recorded as completed.",reconciliation=latest});
+            return Results.Json(new{success=false,status="credit_review_completion_in_progress",message="This exact credit review is already being recorded. Refresh the job.",reconciliation=latest},statusCode:409);
+        }
+        var outcome=request.Outcome.Trim();
+        var transition=await AutoMateApi.BasicChangeRunSupport.ResolveReviewActionForFingerprintAsync(conn,request.TenantId,jobId,current.CurrentFingerprint,"invoice",current.OriginalInvoice.InvoiceId,"credit_review_completed|"+outcome,context.RequestAborted);
+        if(transition.Status!="completed")
+        {
+            await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,false,transition.Message,context.RequestAborted);
+            return Results.Json(new{success=false,status="credit_review_action_not_current",message=transition.Message},statusCode:409);
+        }
+        await ClearXeroReviewAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,request.TenantId,jobId,"xero_review","invoice","resolved",context.RequestAborted);
+        await EnsureXeroRepairAuditAsync(conn,context.RequestAborted);
+        await RecordXeroRepairAuditAsync(conn,request.TenantId,jobId,request.IdempotencyKey,"credit_review_completed",actor,current.OriginalInvoice.InvoiceId,current.OriginalInvoice.InvoiceNumber,"","",current.OriginalInvoice.Status,$"{outcome} Reviewed over-invoiced amount {Math.Abs(current.RemainingDifference):0.00} against current THREED fingerprint {current.CurrentFingerprint}.",context.RequestAborted);
+        await JobChangeSupport.AuditAsync(conn,jobId,request.TenantId,current.ApprovedVersion,"credit_review_completed",current.TargetFingerprint,"[]",$"{outcome} Reviewed amount: {Math.Abs(current.RemainingDifference):0.00}.",actor);
+        await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,true,"The exact current credit review was completed.",context.RequestAborted);
+        var updated=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);
+        return Results.Ok(new{success=true,status="credit_review_completed",message="Credit review completed. Overview and Payments now show no outstanding action for this exact change.",reconciliation=updated});
+    }
+    catch(AutoMateApi.JobReconciliationException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Complete Xero credit review failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/reconciliation/accept-current",async(HttpContext context,Guid jobId,JobReconciliationAcceptRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.ExpectedCurrentFingerprint)||string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.Json(new{success=false,status="confirmation_required",message="Confirm the displayed THREED changes before updating AutoMate."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var before=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);if(!string.Equals(before.CurrentFingerprint,request.ExpectedCurrentFingerprint,StringComparison.Ordinal))return Results.Json(new{success=false,status="stale_job",message="THREED changed after this comparison loaded. Refresh before updating AutoMate."},statusCode:409);
+        if(!before.NeedsUpdate)return Results.Ok(new{success=true,status="already_current",message="AutoMate already matches the accepted THREED job state.",reconciliation=before});
+        if(!await AutoMateApi.JobReconciliationSupport.ReserveAsync(conn,request.TenantId,jobId,"accept_current",before.CurrentFingerprint,request.IdempotencyKey,actor,context.RequestAborted))return Results.Json(new{success=false,status="command_already_recorded",message="This THREED state is already being accepted or was already accepted. Refresh the job."},statusCode:409);
+        try{var version=await AutoMateApi.JobReconciliationSupport.AcceptCurrentAsync(conn,request.TenantId,jobId,before.CurrentFingerprint,actor,context.RequestAborted);await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,true,$"Accepted as AutoMate job version {version}.",context.RequestAborted);var after=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);if(after.Action=="none"&&after.AttentionRequired){await ClearXeroReviewAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);await AutoMateApi.BasicChangeRunSupport.ResolveCurrentReviewActionAsync(conn,request.TenantId,jobId,"invoice",after.OriginalInvoice.InvoiceId,context.RequestAborted);after=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);}return Results.Ok(new{success=true,status="updated",message="AutoMate updated from THREED. No customer, provider or THREED action was run.",reconciliation=after});}
+        catch(Exception ex){await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,false,ex.Message,context.RequestAborted);throw;}
+    }
+    catch(AutoMateApi.JobReconciliationException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Update AutoMate job failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/reconciliation/additional-invoice",async(HttpContext context,Guid jobId,AdditionalInvoiceCommandRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.ExpectedTargetFingerprint)||string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.Json(new{success=false,status="confirmation_required",message="Confirm the exact additional-invoice amount."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var current=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);
+        var automaticallyAccepted=false;
+        if(current.NeedsUpdate)
+        {
+            await AutoMateApi.JobReconciliationSupport.AcceptCurrentAsync(conn,request.TenantId,jobId,current.CurrentFingerprint,"AutoMate automatic THREED reconciliation",context.RequestAborted);
+            automaticallyAccepted=true;current=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);
+        }
+        if(current.RemainingDifference<=0.01m&&current.Action=="none")return Results.Ok(new{success=true,status="already_reconciled",message="The current THREED total is already covered in Xero. No duplicate invoice was created.",reconciliation=current});
+        if(!current.CanCreateAdditionalInvoice||current.RemainingDifference<=0.01m)return Results.Json(new{success=false,status=current.Action,message=current.Message},statusCode:409);
+        if(!await AutoMateApi.JobReconciliationSupport.ReserveAsync(conn,request.TenantId,jobId,"create_additional_invoice",current.TargetFingerprint,request.IdempotencyKey,actor,context.RequestAborted))
+        {
+            var latest=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted);
+            if(latest.RemainingDifference<=0.01m)return Results.Ok(new{success=true,status="already_reconciled",message="The current THREED increase is already covered in Xero. No duplicate invoice was created.",reconciliation=latest});
+            return Results.Json(new{success=false,status="invoice_already_created_or_running",message="An invoice adjustment for this exact shortfall is already being processed."},statusCode:409);
+        }
+        var adjustmentChanges=current.Changes.Select(change=>new AutoMateApi.InvoiceAdjustmentChange(change.field,change.oldValue,change.newValue)).ToArray();var adjustmentLines=AutoMateApi.InvoiceAdjustmentLineSupport.Build(adjustmentChanges,current.RemainingDifference,current.OriginalInvoice.InvoiceNumber);
+        ScheduleActionResult result;try{result=await CreateXeroDraftInvoiceForJobAsync(conn,jobId,builder.Configuration,true,current.RemainingDifference,current.TotalInvoiced,false,adjustmentLines);await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,result.Success,result.Message,context.RequestAborted);}catch(Exception ex){await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,false,ex.Message,context.RequestAborted);throw;}
+        if(!result.Success)return Results.Json(new{success=false,status="xero_additional_invoice_failed",message=result.Message,details=result.Details},statusCode:409);
+        var detail=JsonSerializer.SerializeToElement(result.Details);var externalId=detail.ValueKind==JsonValueKind.Object&&detail.TryGetProperty("invoiceId",out var invoiceIdElement)?invoiceIdElement.GetString()??"":"";await AutoMateApi.BasicChangeRunSupport.ResolveCurrentReviewActionAsync(conn,request.TenantId,jobId,"invoice",externalId,context.RequestAborted);await ClearXeroReviewAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);
+        return Results.Ok(new{success=true,status="additional_invoice_created",message=result.Message,automaticallyAcceptedThreedChange=automaticallyAccepted,rebasedFromDisplayedFingerprint=!string.Equals(current.TargetFingerprint,request.ExpectedTargetFingerprint,StringComparison.Ordinal),details=result.Details,reconciliation=await LoadJobReconciliationAsync(conn,request.TenantId,jobId,builder.Configuration,context.RequestAborted)});
+    }
+    catch(AutoMateApi.JobReconciliationException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Create additional Xero invoice failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/reconciliation/additional-invoice/send",async(HttpContext context,Guid jobId,AdditionalInvoiceSendRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.InvoiceId)||string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.Json(new{success=false,status="confirmation_required",message="Confirm the separate additional-invoice send."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var job=await LoadXeroInvoiceJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound();var stored=(await AutoMateApi.JobReconciliationSupport.LoadAdditionalAsync(conn,request.TenantId,jobId,context.RequestAborted)).FirstOrDefault(item=>string.Equals(item.InvoiceId,request.InvoiceId,StringComparison.OrdinalIgnoreCase));if(stored==null)return Results.NotFound(new{success=false,message="The additional invoice is not linked to this job."});
+        var account=await GetXeroAccountAsync(conn,job.InspectorId,builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="xero_not_connected",message=account.ErrorMessage},statusCode:409);var invoice=await ReadXeroInvoiceEvidenceAsync(account,stored.InvoiceId,context.RequestAborted);if(!invoice.Success)return Results.Json(new{success=false,status="xero_invoice_verification_failed",message="Xero could not verify the additional invoice."},statusCode:409);if(invoice.Status is not("AUTHORISED" or "PAID"))return Results.Json(new{success=false,status="xero_invoice_approval_required",message="Approve this Draft invoice in Xero, then refresh before sending."},statusCode:409);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var target=$"{invoice.InvoiceId}:{invoice.Status}:send";if(!await AutoMateApi.JobReconciliationSupport.ReserveAsync(conn,request.TenantId,jobId,"send_additional_invoice",target,request.IdempotencyKey,actor,context.RequestAborted))return Results.Json(new{success=false,status="send_already_completed_or_running",message="This additional invoice was already sent or a send is in progress."},statusCode:409);
+        using var http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);http.DefaultRequestHeaders.Add("xero-tenant-id",account.TenantId);using var response=await http.PostAsync("https://api.xero.com/api.xro/2.0/Invoices/"+Uri.EscapeDataString(invoice.InvoiceId)+"/Email",null,context.RequestAborted);var body=await response.Content.ReadAsStringAsync(context.RequestAborted);await AutoMateApi.JobReconciliationSupport.MarkAdditionalSentAsync(conn,request.TenantId,jobId,invoice.InvoiceId,response.IsSuccessStatusCode,response.IsSuccessStatusCode?"":TravelRedact(body),context.RequestAborted);await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,response.IsSuccessStatusCode,response.IsSuccessStatusCode?"Xero accepted the separate send.":TravelRedact(body),context.RequestAborted);return response.IsSuccessStatusCode?Results.Ok(new{success=true,status="sent",message="Xero accepted the additional-invoice send."}):Results.Json(new{success=false,status="send_failed",message="The invoice still exists, but Xero did not send it. Retry only the send."},statusCode:409);
+    }
+    catch(Exception ex){return Results.Problem(title:"Send additional Xero invoice failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId:guid}/reconciliation/contact-name",async(HttpContext context,Guid jobId,XeroContactCorrectionRequest request)=>
+{
+    try
+    {
+        if(!request.Confirmed||string.IsNullOrWhiteSpace(request.ExpectedContactId)||string.IsNullOrWhiteSpace(request.ExpectedEmail)||string.IsNullOrWhiteSpace(request.NewName)||string.IsNullOrWhiteSpace(request.IdempotencyKey))return Results.Json(new{success=false,status="confirmation_required",message="Confirm the shared-contact impact, matching email and new customer name."},statusCode:409);
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var job=await LoadXeroInvoiceJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId||!string.Equals(job.XeroInvoiceId,request.ExpectedInvoiceId,StringComparison.OrdinalIgnoreCase))return Results.NotFound();var account=await GetXeroAccountAsync(conn,job.InspectorId,builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="xero_not_connected",message=account.ErrorMessage},statusCode:409);var before=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,context.RequestAborted);if(!before.Success||!string.Equals(before.ContactId,request.ExpectedContactId,StringComparison.OrdinalIgnoreCase)||!string.Equals(before.ContactEmail,request.ExpectedEmail,StringComparison.OrdinalIgnoreCase)||!string.Equals(job.ContactEmail,request.ExpectedEmail,StringComparison.OrdinalIgnoreCase))return Results.Json(new{success=false,status="ambiguous_contact",message="The Xero contact or matching email changed. Reload and select the contact manually in Xero."},statusCode:409);
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));if(!await AutoMateApi.JobReconciliationSupport.ReserveAsync(conn,request.TenantId,jobId,"correct_contact_name",$"{before.ContactId}:{before.ContactName}:{request.NewName}",request.IdempotencyKey,actor,context.RequestAborted))return Results.Json(new{success=false,status="contact_update_already_completed_or_running",message="This contact correction was already completed or is in progress."},statusCode:409);
+        using var http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);http.DefaultRequestHeaders.Add("xero-tenant-id",account.TenantId);var payload=new{Contacts=new[]{new{ContactID=before.ContactId,Name=request.NewName.Trim(),EmailAddress=before.ContactEmail}}};using var response=await http.PostAsJsonAsync("https://api.xero.com/api.xro/2.0/Contacts/"+Uri.EscapeDataString(before.ContactId),payload,context.RequestAborted);var body=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode){await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,false,TravelRedact(body),context.RequestAborted);return Results.Json(new{success=false,status="xero_contact_update_failed",message="Xero did not update the contact name."},statusCode:409);}var after=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,context.RequestAborted);if(!after.Success||!string.Equals(after.ContactName,request.NewName.Trim(),StringComparison.Ordinal)||!string.Equals(after.ContactEmail,before.ContactEmail,StringComparison.OrdinalIgnoreCase)){await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,false,"Provider re-read did not match.",context.RequestAborted);return Results.Json(new{success=false,status="xero_contact_verification_failed",message="Xero accepted the update but verification did not match. Attention remains open."},statusCode:409);}await AutoMateApi.JobReconciliationSupport.CompleteCommandAsync(conn,request.TenantId,request.IdempotencyKey,true,"Contact name updated; email preserved.",context.RequestAborted);await ClearXeroReviewAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);await AutoMateApi.BasicChangeRunSupport.ResolveCurrentReviewActionAsync(conn,request.TenantId,jobId,"invoice",job.XeroInvoiceId,context.RequestAborted);return Results.Ok(new{success=true,status="contact_name_updated",message="Xero contact name updated and verified. The email address was unchanged."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Correct Xero contact name failed",detail:ex.Message,statusCode:500);}
 });
 
 app.MapGet("/automation/integrations/signnow/mappings",async(HttpContext context,Guid tenantId) =>
@@ -388,7 +1305,125 @@ app.MapPut("/automation/integrations/signnow/mappings",async(HttpContext context
 app.MapPost("/automation/integrations/signnow/mappings/preview",async(HttpContext context,AutoMateApi.SignNowMappingPreviewRequest request) =>
 {
     await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();await AutomationFoundationSupport.EnsureAsync(conn);var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
-    const string sql="SELECT COALESCE(service_catalogue_version,0),COALESCE(service_catalogue_snapshot_json::text,''),COALESCE(contact1_email,'') FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job LIMIT 1";await using var command=new NpgsqlCommand(sql,conn);command.Parameters.AddWithValue("tenant",request.TenantId.ToString());command.Parameters.AddWithValue("job",request.JobId);await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);if(!await reader.ReadAsync(context.RequestAborted))return Results.NotFound(new{success=false,status="job_not_found",message="The controlled job was not found for this company."});var version=reader.GetInt32(0);var snapshot=reader.GetString(1);var missingEmail=string.IsNullOrWhiteSpace(reader.GetString(2));await reader.DisposeAsync();var state=await AutoMateApi.SignNowCatalogueMappingSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);return Results.Ok(new{success=true,preview=AutoMateApi.SignNowCatalogueMappingSupport.Preview(state,version,snapshot,missingEmail),sideEffectsExecuted=false});
+    var preview=await AutoMateApi.TenantAgreementPolicySupport.PreviewJobAsync(conn,request.TenantId,request.JobId,context.RequestAborted);
+    return Results.Ok(new{success=true,preview,agreements=preview.Agreements,sideEffectsExecuted=false});
+});
+
+app.MapPut("/automation/integrations/google-calendar/settings",async(HttpContext context,AutoMateApi.CompanyGoogleSaveRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var accountInspector=GetAuthenticatedInspectorId(context);if(request.CompanyAccountInspectorId!=accountInspector)return Results.Json(new{success=false,status="company_account_mismatch",message="Reconnect the company Google account before saving mappings."},statusCode:409);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,accountInspector);var account=await GetGoogleCalendarAccountAsync(conn,accountInspector,builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="google_not_connected",message=account.ErrorMessage},statusCode:409);
+        var settings=await AutoMateApi.CompanyGoogleCalendarSupport.SaveAsync(conn,request,actor,context.RequestAborted);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);var accountEmail=await ResolveGoogleConnectedEmailAsync(client,account.AccountName??"",context.RequestAborted);
+        foreach(var mapping in request.Mappings.Where(x=>x.Enabled&&!string.IsNullOrWhiteSpace(x.InspectorEmail))){string status,error="";if(string.Equals(mapping.InspectorEmail.Trim(),accountEmail.Trim(),StringComparison.OrdinalIgnoreCase)){status="owner";}else{var acl=new{role=mapping.ShareRole=="writer"?"writer":"reader",scope=new{type="user",value=mapping.InspectorEmail}};var baseUrl=$"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(mapping.CalendarId)}/acl";var ruleUrl=baseUrl+"/"+Uri.EscapeDataString("user:"+mapping.InspectorEmail.Trim().ToLowerInvariant());using var existing=await client.GetAsync(ruleUrl,context.RequestAborted);using var response=existing.IsSuccessStatusCode?await client.PutAsJsonAsync(ruleUrl,acl,context.RequestAborted):await client.PostAsJsonAsync(baseUrl,acl,context.RequestAborted);var providerBody=response.IsSuccessStatusCode?"":await response.Content.ReadAsStringAsync(context.RequestAborted);if(response.IsSuccessStatusCode)status="shared";else if(providerBody.Contains("cannotChangeOwnAcl",StringComparison.OrdinalIgnoreCase)){status="owner";error="";}else{status="share_failed";error=TravelRedact(providerBody);}}await using var update=new NpgsqlCommand("UPDATE public.tenant_google_inspector_calendars SET sharing_status=@status,last_error=@error,updated_at=NOW() WHERE tenant_id=@tenant AND inspector_id=@inspector",conn);update.Parameters.AddWithValue("tenant",request.TenantId);update.Parameters.AddWithValue("inspector",mapping.InspectorId);update.Parameters.AddWithValue("status",status);update.Parameters.AddWithValue("error",error);await update.ExecuteNonQueryAsync(context.RequestAborted);}
+        return Results.Ok(new{success=true,message="Company Google calendar mappings saved.",settings=await AutoMateApi.CompanyGoogleCalendarSupport.LoadAsync(conn,request.TenantId,accountInspector,context.RequestAborted)});
+    }
+    catch(AutoMateApi.CompanyGoogleException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}catch(Exception ex){return Results.Json(new{success=false,status="google_calendar_save_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/automation/integrations/google-calendar/calendars",async(HttpContext context,CompanyGoogleCalendarCreateRequest request) =>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;if(!request.Confirmed||string.IsNullOrWhiteSpace(request.Name))return Results.Conflict(new{success=false,status="confirmation_required",message="Confirm the new company calendar name."});var account=await GetGoogleCalendarAccountAsync(conn,GetAuthenticatedInspectorId(context),builder.Configuration);if(!account.Success)return Results.Json(new{success=false,status="google_not_connected",message=account.ErrorMessage},statusCode:409);using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);using var response=await client.PostAsJsonAsync("https://www.googleapis.com/calendar/v3/calendars",new{summary=request.Name.Trim(),timeZone="Pacific/Auckland"},context.RequestAborted);var json=await response.Content.ReadAsStringAsync(context.RequestAborted);if(!response.IsSuccessStatusCode)return Results.Json(new{success=false,status="google_calendar_create_failed",message=TravelRedact(json)},statusCode:(int)response.StatusCode);using var document=JsonDocument.Parse(json);return Results.Ok(new{success=true,id=GetJsonString(document.RootElement,"id"),name=GetJsonString(document.RootElement,"summary")});}catch(Exception ex){return Results.Json(new{success=false,status="google_calendar_create_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/integrations/{provider}/connect-url", async (HttpContext context, string provider, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var inspectorId=GetAuthenticatedInspectorId(context);var key=(provider??"").Trim().ToLowerInvariant();
+        string clientId,redirectUri,url;
+        switch(key)
+        {
+            case "xero":
+                clientId=builder.Configuration["XERO_CLIENT_ID"]??"";redirectUri=builder.Configuration["XERO_REDIRECT_URI"]??"";
+                if(string.IsNullOrWhiteSpace(clientId)||string.IsNullOrWhiteSpace(redirectUri))return Results.Problem(title:"Xero configuration missing",detail:"The AutoMate Xero application is not configured.",statusCode:503);
+                url="https://login.xero.com/identity/connect/authorize?response_type=code&client_id="+Uri.EscapeDataString(clientId)+"&redirect_uri="+Uri.EscapeDataString(redirectUri)+"&scope="+Uri.EscapeDataString("offline_access accounting.settings.read accounting.contacts accounting.invoices")+"&state="+Uri.EscapeDataString(inspectorId.ToString("D"));break;
+            case "google_calendar":
+                clientId=builder.Configuration["GOOGLE_CLIENT_ID"]??"";redirectUri=builder.Configuration["GOOGLE_REDIRECT_URI"]??"";
+                if(string.IsNullOrWhiteSpace(clientId)||string.IsNullOrWhiteSpace(redirectUri))return Results.Problem(title:"Google configuration missing",detail:"The AutoMate Google application is not configured.",statusCode:503);
+                url="https://accounts.google.com/o/oauth2/v2/auth?client_id="+Uri.EscapeDataString(clientId)+"&redirect_uri="+Uri.EscapeDataString(redirectUri)+"&response_type=code&scope="+Uri.EscapeDataString("openid email profile https://www.googleapis.com/auth/calendar")+"&access_type=offline&prompt=consent&state="+Uri.EscapeDataString(inspectorId.ToString("D"));break;
+            case "microsoft_documents":
+                clientId=builder.Configuration["MS_CLIENT_ID"]??"";redirectUri=builder.Configuration["MS_REDIRECT_URI"]??"";
+                if(string.IsNullOrWhiteSpace(clientId)||string.IsNullOrWhiteSpace(redirectUri))return Results.Problem(title:"Microsoft configuration missing",detail:"The AutoMate Microsoft application is not configured.",statusCode:503);
+                url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id="+Uri.EscapeDataString(clientId)+"&response_type=code&redirect_uri="+Uri.EscapeDataString(redirectUri)+"&response_mode=query&scope="+Uri.EscapeDataString("offline_access User.Read Sites.Selected")+"&state="+Uri.EscapeDataString(inspectorId.ToString("D"));break;
+            case "signnow":
+                clientId=builder.Configuration["SIGNNOW_CLIENT_ID"]??"";redirectUri=builder.Configuration["SIGNNOW_REDIRECT_URI"]??"";
+                if(string.IsNullOrWhiteSpace(clientId)||string.IsNullOrWhiteSpace(redirectUri))return Results.Problem(title:"SignNow configuration missing",detail:"The AutoMate SignNow application is not configured.",statusCode:503);
+                url="https://app.signnow.com/authorize?client_id="+Uri.EscapeDataString(clientId)+"&response_type=code&redirect_uri="+Uri.EscapeDataString(redirectUri)+"&scope="+Uri.EscapeDataString("*")+"&state=company";break;
+            default:return Results.NotFound(new{success=false,status="provider_unavailable",message="This integration provider is not available yet."});
+        }
+        return Results.Ok(new{success=true,provider=key,url,message="Complete authorisation in your browser, then return to AutoMate and refresh status."});
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Start integration connection failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/automation/travel/inspectors/discover",async(HttpContext context,AutoMateApi.TravelInspectorDiscoveryRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));await AutoMateApi.TravelCalendarSupport.DiscoverAsync(conn,request.TenantId,request.Inspectors??[],actor,context.RequestAborted);
+        return Results.Ok(new{success=true,settings=await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,request.TenantId,context.RequestAborted)});
+    }
+    catch(Exception ex){return Results.Problem(title:"Discover inspectors for travel failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/automation/travel/settings",async(HttpContext context,Guid tenantId) =>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;return Results.Ok(new{success=true,settings=await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted)});}
+    catch(Exception ex){return Results.Problem(title:"Load inspector travel settings failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/travel/settings",async(HttpContext context,AutoMateApi.TravelSettingsSaveRequest request) =>
+{
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var settings=await AutoMateApi.TravelCalendarSupport.SaveAsync(conn,request,actor,context.RequestAborted);return Results.Ok(new{success=true,message="Inspector travel settings saved.",settings});}
+    catch(AutoMateApi.TravelCalendarException ex){return Results.Json(new{success=false,status=ex.Code,message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Save inspector travel settings failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/jobs/{jobId}/travel",async(HttpContext context,Guid jobId,Guid tenantId,bool refresh=false) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;if(!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn,tenantId,jobId))return Results.NotFound();
+        var input=await LoadTravelJobInputAsync(conn,tenantId,jobId,context.RequestAborted);if(input is null)return Results.NotFound();var settings=await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted);var inspector=settings.Inspectors.FirstOrDefault(x=>x.InspectorId==input.InspectorId);
+        if(inspector is null||!inspector.Enabled||string.IsNullOrWhiteSpace(inspector.EffectiveBaseAddress))return Results.Ok(new{success=true,status="unavailable",message="Travel calculation is not enabled or no inspector base address is configured.",jobId});
+        var travel=await ComputeTravelAsync(input,inspector.EffectiveBaseAddress,builder.Configuration,context.RequestAborted);
+        if (!travel.Success) return Results.Json(new{success=false,status="unavailable",message=travel.Error,jobId},statusCode:503);
+        return Results.Ok(new{success=true,status="available",travel});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="travel_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/travel/calendar",async(HttpContext context,Guid jobId,TravelCalendarRefreshRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;if(!request.Confirmed)return Results.Conflict(new{success=false,status="confirmation_required",message="Confirm the travel Calendar refresh."});if(!await AutomationFoundationSupport.JobBelongsToTenantAsync(conn,request.TenantId,jobId))return Results.NotFound();
+        var input=await LoadTravelJobInputAsync(conn,request.TenantId,jobId,context.RequestAborted);if(input is null||!input.JobDate.HasValue)return Results.Conflict(new{success=false,status="schedule_required",message="The job must have an inspection date before creating travel time."});var settings=await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);var inspector=settings.Inspectors.FirstOrDefault(x=>x.InspectorId==input.InspectorId);if(inspector is null||!inspector.Enabled||string.IsNullOrWhiteSpace(inspector.EffectiveBaseAddress))return Results.Conflict(new{success=false,status="travel_settings_required",message="Enable travel and configure the inspector base address first."});
+        var travel=await ComputeTravelAsync(input,inspector.EffectiveBaseAddress,builder.Configuration,context.RequestAborted);if(!travel.Success)return Results.Json(new{success=false,status="route_unavailable",message=travel.Error},statusCode:503);var result=await UpsertTravelCalendarEventAsync(conn,input,travel,builder.Configuration,context.RequestAborted);if(!result.Success)return Results.Json(new{success=false,status="calendar_failed",message=result.Message},statusCode:503);return Results.Ok(new{success=true,status="updated",message=result.Message,travel,eventId=result.EventId,htmlLink=result.HtmlLink});
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="travel_calendar_failed",message=ex.Message},statusCode:500);}
+});
+
+app.MapGet("/automation/calendar/events",async(HttpContext context,Guid tenantId,DateTimeOffset start,DateTimeOffset end,string? inspectorIds) =>
+{
+    try
+    {
+        if(end<=start||end-start>TimeSpan.FromDays(42))return Results.BadRequest(new{success=false,message="Calendar range must be between one minute and 42 days."});await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;var settings=await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted);var requested=(inspectorIds??"").Split(',',StringSplitOptions.RemoveEmptyEntries).Select(x=>Guid.TryParse(x,out var id)?id:Guid.Empty).Where(x=>x!=Guid.Empty).ToHashSet();await AutoMateApi.IntegrationHubSupport.EnsureAsync(conn,context.RequestAborted);await using var providerCommand=new NpgsqlCommand("SELECT provider_key FROM public.tenant_integration_action_defaults WHERE tenant_id=@tenant AND action_type='calendar'",conn);providerCommand.Parameters.AddWithValue("tenant",tenantId);var provider=Convert.ToString(await providerCommand.ExecuteScalarAsync(context.RequestAborted))??"google_calendar";var events=new List<object>();var failures=new List<object>();
+        if(provider=="microsoft_calendar")
+        {
+            var company=await AutoMateApi.MicrosoftCalendarSupport.LoadAsync(conn,tenantId,context.RequestAborted);var mappings=company.Mappings.Where(x=>x.Enabled&&(requested.Count==0||requested.Contains(x.InspectorId))).Take(100).ToList();var profiles=settings.Inspectors.Where(x=>mappings.Any(m=>m.InspectorId==x.InspectorId)).ToList();var account=await GetMicrosoftCalendarAccountAsync(conn,tenantId,builder.Configuration,context.RequestAborted);foreach(var profile in profiles){var mapping=mappings.First(x=>x.InspectorId==profile.InspectorId);if(!account.Success){failures.Add(new{inspectorId=profile.InspectorId,name=profile.Name,message=account.Error});continue;}try{events.AddRange(await LoadMicrosoftCalendarRangeAsync(account,mapping.CalendarId,profile,start,end,context.RequestAborted));}catch(Exception ex){failures.Add(new{inspectorId=profile.InspectorId,name=profile.Name,message=ex.Message});}}return Results.Ok(new{success=true,start,end,timeZone="Pacific/Auckland",provider,inspectors=profiles.Select(x=>new{x.InspectorId,x.Name,x.Email}),events,failures,partial=failures.Count>0});
+        }
+        else
+        {
+            var accountInspector=GetAuthenticatedInspectorId(context);var company=await AutoMateApi.CompanyGoogleCalendarSupport.LoadAsync(conn,tenantId,accountInspector,context.RequestAborted);var mappings=company.Mappings.Where(x=>x.Enabled&&(requested.Count==0||requested.Contains(x.InspectorId))).Take(100).ToList();var profiles=settings.Inspectors.Where(x=>mappings.Any(m=>m.InspectorId==x.InspectorId)).ToList();var companyAccount=await GetGoogleCalendarAccountAsync(conn,company.CompanyAccountInspectorId,builder.Configuration);foreach(var profile in profiles){var mapping=mappings.First(x=>x.InspectorId==profile.InspectorId);var account=companyAccount.Success?companyAccount with{TenantId=mapping.CalendarId}:companyAccount;if(!account.Success){failures.Add(new{inspectorId=profile.InspectorId,name=profile.Name,message=account.ErrorMessage??"The company Google Calendar is not connected."});continue;}try{events.AddRange(await LoadGoogleCalendarRangeAsync(account,profile,start,end,context.RequestAborted));}catch(Exception ex){failures.Add(new{inspectorId=profile.InspectorId,name=profile.Name,message=ex.Message});}}return Results.Ok(new{success=true,start,end,timeZone="Pacific/Auckland",provider="google_calendar",inspectors=profiles.Select(x=>new{x.InspectorId,x.Name,x.Email}),events,failures,partial=failures.Count>0});
+        }
+    }
+    catch(Exception ex){return Results.Json(new{success=false,status="calendar_load_failed",message=ex.Message},statusCode:500);}
 });
 
 app.MapGet("/jobs/{jobId}/communications", async (HttpContext context, Guid jobId, Guid tenantId) =>
@@ -1244,20 +2279,15 @@ app.MapPost("/jobs/{jobId}/manual-review/{reviewType}/complete", async (Guid job
     int rows = await cmd.ExecuteNonQueryAsync(); return rows == 0 ? Results.NotFound() : Results.Ok(new { success = true, reviewType, completedBy });
 });
 
-app.MapPost("/jobs/{jobId}/cancel-unschedule", async (Guid jobId, Guid? tenantId, string? cancelledBy, bool sourceMissing) =>
+app.MapPost("/jobs/{jobId}/cancel-unschedule-legacy-disabled", async (Guid jobId, Guid? tenantId, string? cancelledBy, bool sourceMissing) =>
 {
-    await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await JobChangeSupport.EnsureAsync(conn);
-    await using (var owner = new NpgsqlCommand("SELECT 1 FROM public.jobs_staging WHERE job_id=@job AND (@tenant IS NULL OR tenant_id::text=@tenant)", conn))
-    { owner.Parameters.AddWithValue("job", jobId); owner.Parameters.Add("tenant", NpgsqlTypes.NpgsqlDbType.Text).Value = tenantId?.ToString() ?? (object)DBNull.Value; if (await owner.ExecuteScalarAsync() == null) return Results.NotFound(new { success = false, message = "Job not found for this company." }); }
-    var job = await LoadScheduleJobAsync(conn, jobId); if (job == null) return Results.NotFound();
-    var calendar = await CancelGoogleCalendarEventForJobAsync(conn, job, builder.Configuration);
-    await using (var cmd = new NpgsqlCommand(@"UPDATE public.jobs_staging SET unscheduled=true,source_missing=@missing,source_missing_at=CASE WHEN @missing THEN NOW() ELSE source_missing_at END,
-change_review_pending=false,booking_email_retry_requested=false,terms_retry_requested=false,invoice_retry_requested=false,calendar_retry_requested=false,report_retry_requested=false,
-xero_review_required=(xero_review_required OR invoice_sent),workflow_updated_at=NOW() WHERE job_id=@job", conn))
-    { cmd.Parameters.AddWithValue("job", jobId); cmd.Parameters.AddWithValue("missing", sourceMissing); await cmd.ExecuteNonQueryAsync(); }
-    await using (var actions = new NpgsqlCommand("UPDATE public.job_workflow_actions SET status='superseded',retry_requested=false,updated_at=NOW() WHERE job_id=@job AND status <> 'sent'", conn))
-    { actions.Parameters.AddWithValue("job", jobId); await actions.ExecuteNonQueryAsync(); }
-    return Results.Ok(new { success = calendar.Success, jobId, unscheduled = true, sourceMissing, calendar, xeroUnchanged = true, cancelledBy });
+    await Task.CompletedTask;
+    return Results.Json(new
+    {
+        success = false,
+        status = "legacy_contract_retired",
+        message = "Cancel and Unschedule are separate AutoMate lifecycle commands. This legacy command cannot change THREED, Calendar, invoices or client access."
+    }, statusCode: StatusCodes.Status410Gone);
 });
 
 app.MapPost("/jobs/{jobId}/confirm-address-change", async (Guid jobId, Guid? tenantId, string? confirmedBy) =>
@@ -1600,7 +2630,7 @@ app.MapGet("/integrations/microsoft/connect-url", (string inspectorId) =>
         });
     }
 
-    var scopes = "offline_access Mail.Send User.Read";
+    var scopes = "offline_access User.Read Sites.Selected";
 
     var url =
         "https://login.microsoftonline.com/common/oauth2/v2.0/authorize" +
@@ -1783,6 +2813,18 @@ DO UPDATE SET
 // =============================
 app.MapPost("/integrations/microsoft/send-test-email", async (SendTestEmailRequest request) =>
 {
+    // Microsoft is reserved for OneDrive/SharePoint document automation.
+    // Customer email is sent only through the tenant's local SMTP configuration.
+    if (request is not null)
+    {
+        return Results.Json(new
+        {
+            success = false,
+            status = "microsoft_email_disabled",
+            message = "Microsoft email delivery is disabled. Configure company SMTP in AutoMate."
+        }, statusCode: StatusCodes.Status410Gone);
+    }
+
     try
     {
         if (!Guid.TryParse(request.InspectorId, out Guid inspectorId))
@@ -1911,7 +2953,7 @@ LIMIT 1;";
                     ["refresh_token"] = refreshToken,
                     ["grant_type"] = "refresh_token",
                     ["redirect_uri"] = redirectUri,
-                    ["scope"] = "offline_access Mail.Send User.Read"
+                    ["scope"] = "offline_access User.Read Sites.Selected"
                 }));
 
             var refreshJson = await refreshResponse.Content.ReadAsStringAsync();
@@ -1994,29 +3036,7 @@ WHERE inspector_id = @inspector_id
             }
         };
 
-        var response = await httpClient.PostAsJsonAsync(
-            "https://graph.microsoft.com/v1.0/me/sendMail",
-            emailBody);
-
-        var responseText = await response.Content.ReadAsStringAsync();
-
-        if (!response.IsSuccessStatusCode)
-        {
-            return Results.Problem(
-                title: "Microsoft send mail failed",
-                detail: responseText,
-                statusCode: 500
-            );
-        }
-
-        return Results.Ok(new
-        {
-            success = true,
-            message = "Test email sent.",
-            inspectorId = request.InspectorId,
-            toEmail = request.ToEmail,
-            fromAccount = externalAccountEmail
-        });
+        return Results.Json(new { success=false,status="local_smtp_required",message="Microsoft email delivery has been removed. Use Company SMTP in the desktop app." },statusCode:410);
     }
     catch (Exception ex)
     {
@@ -3421,7 +4441,7 @@ app.MapGet("/integrations/email/status", async (Guid inspectorId) =>
         await EnsureInspectorsTableAsync(conn);
 
         const string sql = @"
-SELECT COALESCE(email_sender_mode, 'microsoft') AS email_sender_mode
+SELECT COALESCE(email_sender_mode, 'manual-smtp') AS email_sender_mode
 FROM public.inspectors
 WHERE inspector_id = @inspector_id
 LIMIT 1;";
@@ -3438,7 +4458,8 @@ LIMIT 1;";
             inspectorId,
             senderMode,
             senderModeLabel = GetEmailSenderModeLabel(senderMode),
-            cloudCanSend = !IsSmtpEmailSenderMode(senderMode)
+            smtpRequired = true,
+            credentialsStoredLocally = true
         });
     }
     catch (Exception ex)
@@ -3464,7 +4485,7 @@ app.MapPost("/integrations/email/sender-mode", async (EmailSenderModeRequest req
             });
         }
 
-        var senderMode = NormalizeEmailSenderMode(request.SenderMode);
+        var senderMode = "manual-smtp";
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
@@ -3489,7 +4510,8 @@ WHERE inspector_id = @inspector_id;";
             inspectorId,
             senderMode,
             senderModeLabel = GetEmailSenderModeLabel(senderMode),
-            cloudCanSend = !IsSmtpEmailSenderMode(senderMode)
+            smtpRequired = true,
+            credentialsStoredLocally = true
         });
     }
     catch (Exception ex)
@@ -3701,6 +4723,8 @@ app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         if (slot == null) return Results.BadRequest(new { success = false, message = "Unsupported Basic template slot." });
         var recipientLabel = recipientKey == "contact_2" ? labels.Contact2 : labels.Contact1;
         var defaults = BuildDefaultBasicTemplate(eventKey, recipientKey, recipientLabel);
+        var engagementSettings = await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn, tenantId, context.RequestAborted);
+        var branding = await LoadTenantEmailBrandingAsync(conn, tenantId, context.RequestAborted);
         Guid? templateId = null; var templateVersion = 0; DateTimeOffset? updatedAt = null;
         if (slot.TemplateId.HasValue)
         {
@@ -3710,7 +4734,7 @@ app.MapGet("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
             await using var reader = await metadata.ExecuteReaderAsync(context.RequestAborted);
             if (await reader.ReadAsync(context.RequestAborted)) { templateId = reader.GetGuid(0); templateVersion = reader.GetInt32(1); updatedAt = reader.GetFieldValue<DateTimeOffset>(2); }
         }
-        return Results.Ok(new { success = true, eventKey, recipientKey, recipientLabel, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, recipientLabel), subject = string.IsNullOrWhiteSpace(slot.Subject) ? defaults.Subject : slot.Subject, htmlBody = string.IsNullOrWhiteSpace(slot.HtmlBody) ? defaults.HtmlBody : slot.HtmlBody, hasTemplate = slot.TemplateId.HasValue, templateId, templateVersion, updatedAt, defaultSubject = defaults.Subject, defaultHtmlBody = defaults.HtmlBody });
+        return Results.Ok(new { success = true, eventKey, recipientKey, recipientLabel, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, recipientLabel), subject = string.IsNullOrWhiteSpace(slot.Subject) ? defaults.Subject : slot.Subject, htmlBody = string.IsNullOrWhiteSpace(slot.HtmlBody) ? defaults.HtmlBody : slot.HtmlBody, hasTemplate = slot.TemplateId.HasValue, templateId, templateVersion, updatedAt, defaultSubject = defaults.Subject, defaultHtmlBody = defaults.HtmlBody, companyName=branding.CompanyName, companyLogoUrl=branding.LogoUrl, brandColour=engagementSettings.BrandColour });
     }
     catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
     catch (ArgumentException ex) { return Results.BadRequest(new { success = false, message = ex.Message }); }
@@ -3734,6 +4758,8 @@ app.MapPut("/automation/basic/templates/{eventKey}/{recipientKey}", async (HttpC
         var requestId = string.IsNullOrWhiteSpace(request.RequestId) ? context.TraceIdentifier : request.RequestId.Trim();
         var result = await AutoMateApi.BasicTemplateCommandSupport.SaveAsync(conn, new AutoMateApi.BasicTemplateSaveCommand(request.TenantId, inspectorId, eventKey, recipientKey, label, request.Subject.Trim(), SanitizeBasicTemplateHtml(request.HtmlBody), request.ExpectedVersion, request.IdempotencyKey, actor, requestId), context.RequestAborted);
         if (result.Status is "conflict" or "idempotency_conflict") return Results.Json(new { success=false, status=result.Status, code=result.Status, message=result.Message, templateId=result.TemplateId, templateVersion=result.TemplateVersion, auditId=result.AuditId }, statusCode:409);
+        await AutoMateApi.AuthoritativeAttentionSupport.ResolveTemplateSlotAsync(conn,request.TenantId,$"{eventKey}/{recipientKey}",context.RequestAborted);
+        await AutoMateApi.AuthoritativeAttentionSupport.ReconcileAsync(conn,request.TenantId,context.RequestAborted);
         return Results.Ok(new { success = true, status=result.Status, templateId=result.TemplateId, templateVersion=result.TemplateVersion, updatedAt=result.UpdatedAt, auditId=result.AuditId, replayed=result.Replayed, requestId, templateName = AutoMateApi.BasicAutomationSupport.BuildDisplayName(eventKey, label) });
     }
     catch (AuthenticatedAutomationIdentityException ex) { return Results.Json(new { success=false,status="authenticated_identity_required",code="authenticated_identity_required",message=ex.Message }, statusCode:401); }
@@ -3774,7 +4800,7 @@ app.MapPost("/jobs/{jobId}/automation/basic-render", async (HttpContext context,
         await EnsureJobInvoiceLinesTableAsync(conn); await EnsureEmailTemplatesTableAsync(conn); await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
         var job = await LoadScheduleJobAsync(conn, jobId); if (job == null || job.TenantId != request.TenantId) return Results.NotFound(new { success=false,message="Job not found for this company." });
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId); if (!owner.Allowed) return owner.Error!;
-        var rendered = await RenderBasicEmailAsync(conn, job, request.EventKey, request.RecipientKey, request.Subject, request.HtmlBody);
+        var rendered = await RenderBasicEmailAsync(conn, job, request.EventKey, request.RecipientKey, request.Subject, request.HtmlBody,request.RawCustomFields);
         return Results.Ok(new { success=true, rendered.ToEmail, rendered.Subject, rendered.HtmlBody, rendered.RecipientLabel });
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { success=false,message=ex.Message }); }
@@ -3872,11 +4898,28 @@ app.MapGet("/jobs/{jobId}/automation/basic/production", async (HttpContext conte
     {
         await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
         var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);var engineKey=await AutoMateApi.AdvancedWorkflowSupport.ResolveEngineAsync(conn,tenantId,jobId,context.RequestAborted);
+        var catalogueGate=await TenantServiceCatalogueSupport.CheckSchedulingGateAsync(conn,tenantId,jobId,context.RequestAborted);
+        var contactGate=await TenantContactConfigurationSupport.CheckSchedulingGateAsync(conn,tenantId,jobId,context.RequestAborted);
+        var agreementGate=await AutoMateApi.TenantAgreementPolicySupport.CheckSchedulingGateAsync(conn,tenantId,jobId,context.RequestAborted);
         var status=await AutoMateApi.BasicProductionSchedulingSupport.LoadStatusAsync(conn,tenantId,jobId,context.RequestAborted);
+        var controlled=await IsControlledPilotJobAsync(conn,tenantId,jobId,context.RequestAborted);
+        var pilotJob=await LoadScheduleJobAsync(conn,jobId);
+        var pilotXeroJob=pilotJob?.InvoiceRequired==true?await LoadXeroInvoiceJobAsync(conn,jobId):null;
+        var hub=await AutoMateApi.IntegrationHubSupport.LoadAsync(conn,tenantId,GetAuthenticatedInspectorId(context),context.RequestAborted);
+        var xero=hub.Providers.First(x=>x.ProviderKey=="xero");var agreementProviderKey=hub.Defaults.TryGetValue("agreement_management",out var selectedAgreementProvider)?AutoMateApi.AgreementProviderSupport.NormalizeProvider(selectedAgreementProvider):"signnow";var agreementProvider=hub.Providers.FirstOrDefault(x=>x.ProviderKey==agreementProviderKey);var agreementProviderConnected=agreementProvider?.Status=="connected";
+        var xeroOutcome=hub.Settings.XeroInvoiceMode=="authorised"&&hub.Settings.XeroDeliveryMode=="send"?"Create authorised invoice and email it from Xero":hub.Settings.XeroInvoiceMode=="authorised"?"Create authorised invoice for review":"Create draft invoice for review";
         var latest=status.Actions.FirstOrDefault();
-        return Results.Ok(new{success=true,jobId,armed=status.Armed,armVersion=status.ArmVersion,approvedRevision=status.ApprovedVersion.ToString(),approvedFingerprint=status.ApprovedFingerprint,
+        string bookingError="",termsError="",invoiceError="",calendarError="";var schedulingStarted=false;
+        await using(var errors=new NpgsqlCommand("SELECT COALESCE(booking_email_last_error,''),COALESCE(terms_last_error,''),COALESCE(xero_last_error,''),COALESCE(calendar_last_error,''),basic_scheduling_started_at IS NOT NULL FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job",conn))
+        {errors.Parameters.AddWithValue("tenant",tenantId.ToString("D"));errors.Parameters.AddWithValue("job",jobId);await using var errorReader=await errors.ExecuteReaderAsync(context.RequestAborted);if(await errorReader.ReadAsync(context.RequestAborted)){bookingError=errorReader.GetString(0);termsError=errorReader.GetString(1);invoiceError=errorReader.GetString(2);calendarError=errorReader.GetString(3);schedulingStarted=errorReader.GetBoolean(4);}}
+        var activeTestCycle=await LoadActiveTestCycleAsync(conn,tenantId,jobId,context.RequestAborted);
+        var changeRun=await AutoMateApi.BasicChangeRunSupport.LoadCurrentAsync(conn,tenantId,jobId,context.RequestAborted);
+        return Results.Ok(new{success=true,jobId,engineKey,basicAutomationApplies=engineKey==AutoMateApi.AdvancedWorkflowSupport.Basic,schedulingStarted,armed=status.Armed,armVersion=status.ArmVersion,approvedRevision=status.ApprovedVersion.ToString(),approvedFingerprint=status.ApprovedFingerprint,
             recipientAvailable=status.RecipientAvailable,recipientName=status.RecipientName,recipientEmail=status.RecipientEmail,templateEnabled=status.SlotEnabled,templateSaved=status.TemplateSaved,
-            bookingEmailState=status.BookingEmailSent?"completed":status.BookingEmailRequired?"pending":"not_required",changeReviewPending=status.ChangeReviewPending,unscheduled=status.Unscheduled,
+            bookingEmailState=status.BookingEmailSent?"completed":status.BookingEmailRequired?"pending":"not_required",changeReviewPending=status.ChangeReviewPending,unscheduled=status.Unscheduled,catalogueGate,contactGate,agreementGate,
+            pilot=new{controlled,providerExecutionEnabled=IsProviderPilotEnabled(builder.Configuration,jobId),cycleNumber=activeTestCycle.CycleNumber,fullRetestAvailable=activeTestCycle.FullRetest,xeroConnected=xero.Status=="connected",agreementProviderConnected,agreementProviderKey,agreementProviderName=agreementProvider?.Name??"Agreement provider",signNowConnected=agreementProviderKey=="signnow"&&agreementProviderConnected,agreementRequired=pilotJob?.TermsRequired??false,invoiceRequired=pilotJob?.InvoiceRequired??false,calendarRequired=pilotJob?.CalendarRequired??false,agreementState=pilotJob?.TermsRequired!=true?"not_required":pilotJob.TermsSigned?"signed":pilotJob.TermsSent?"sent":!string.IsNullOrWhiteSpace(termsError)?"failed":"ready",invoiceState=pilotJob?.InvoiceRequired!=true?"not_required":!string.IsNullOrWhiteSpace(pilotXeroJob?.XeroInvoiceId)?"existing":!string.IsNullOrWhiteSpace(invoiceError)?"failed":"ready",calendarState=pilotJob?.CalendarRequired!=true?"not_required":pilotJob.CalendarCreated?"existing":!string.IsNullOrWhiteSpace(calendarError)?"failed":"ready",bookingError,termsError,invoiceError,calendarError,xeroOutcome},
+            changeRun,
             action=latest==null?null:new{actionId=latest.ActionId,jobId,approvedRevision=latest.ApprovedVersion.ToString(),recipientKey="contact_1",latest.RecipientName,latest.RecipientEmail,
                 latest.RenderedSubject,latest.TemplateVersion,state=latest.State,createdAt=latest.PreparedAt,claimedAt=latest.ClaimedAt,completedAt=latest.CompletedAt,error=latest.CompletionError}});
     }
@@ -3889,6 +4932,8 @@ app.MapPut("/jobs/{jobId}/automation/basic/production/arm", async (HttpContext c
     try
     {
         await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var catalogueGate=await TenantServiceCatalogueSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!catalogueGate.Allowed)return Results.Json(new{success=false,status=catalogueGate.Status,message=catalogueGate.Message,catalogueGate},statusCode:409);
+        var contactGate=await TenantContactConfigurationSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!contactGate.Allowed)return Results.Json(new{success=false,status=contactGate.Status,message=contactGate.Message,contactGate},statusCode:409);
         var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
         var result=await AutoMateApi.BasicProductionSchedulingSupport.SetArmAsync(conn,new(request.TenantId,jobId,request.Armed,request.DisposableConfirmed,request.Confirmed,request.ExpectedVersion,actor),context.RequestAborted);
         if(result.Status is "confirmation_required" or "conflict")return Results.Json(new{success=false,status=result.Status,message=result.Message,armed=result.Armed,armVersion=result.Version},statusCode:409);
@@ -3903,11 +4948,37 @@ app.MapPost("/jobs/{jobId}/automation/basic/production/prepare", async (HttpCont
     try
     {
         await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var lifecycle=await AutoMateApi.JobLifecycleSupport.LoadAsync(conn,request.TenantId,jobId,context.RequestAborted);
+        if(lifecycle==null)return Results.NotFound();
+        if(!AutoMateApi.JobLifecyclePolicy.CanExposeScheduling(lifecycle.AutomateStatus,lifecycle.AppointmentAt.HasValue)||lifecycle.ThreedRecordState!="present")
+            return Results.Json(new{success=false,status="lifecycle_blocked",message=$"Scheduling cannot start while the AutoMate job is {lifecycle.AutomateStatus} or its THREED source record is unavailable."},statusCode:409);
+        var catalogueGate=await TenantServiceCatalogueSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!catalogueGate.Allowed)return Results.Json(new{success=false,status=catalogueGate.Status,message=catalogueGate.Message,catalogueGate},statusCode:409);
+        var contactGate=await TenantContactConfigurationSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!contactGate.Allowed)return Results.Json(new{success=false,status=contactGate.Status,message=contactGate.Message,contactGate},statusCode:409);
         var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound();
         var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var agreementGate=await AutoMateApi.TenantAgreementPolicySupport.CaptureForSchedulingAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);if(!agreementGate.Allowed)return Results.Json(new{success=false,status=agreementGate.Status,message=agreementGate.Message,agreementGate},statusCode:409);
         var rendered=await RenderBasicEmailAsync(conn,job,"scheduling","contact_1",null,null);
+        await AutoMateApi.BasicChangeRunSupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var updatedBooking=new NpgsqlCommand("""
+            SELECT EXISTS(
+                SELECT 1 FROM public.basic_job_change_runs r
+                JOIN public.basic_job_change_run_actions a ON a.run_id=r.run_id
+                WHERE r.tenant_id=@tenant AND r.job_id=@job AND r.source_snapshot_version=j.approved_snapshot_version
+                  AND r.status IN ('prepared','running','attention') AND a.action_key='booking_email'
+                  AND a.status IN ('pending','running','failed'))
+            FROM public.jobs_staging j WHERE j.job_id=@job
+            """,conn))
+        {
+            updatedBooking.Parameters.AddWithValue("tenant",request.TenantId);updatedBooking.Parameters.AddWithValue("job",jobId);
+            if(Convert.ToBoolean(await updatedBooking.ExecuteScalarAsync(context.RequestAborted)))
+            {
+                const string banner="<div style=\"margin:0 0 18px;padding:14px 16px;background:#fff3cd;border:1px solid #e3b341;border-radius:6px;font-weight:700;color:#5f4500;\">This email contains updated booking details and replaces the previous booking email.</div>";
+                rendered=rendered with{Subject=rendered.Subject.StartsWith("Updated booking details",StringComparison.OrdinalIgnoreCase)?rendered.Subject:"Updated booking details — "+rendered.Subject,HtmlBody=banner+rendered.HtmlBody};
+            }
+        }
         var result=await AutoMateApi.BasicProductionSchedulingSupport.PrepareAsync(conn,new(request.TenantId,jobId,rendered.Subject,rendered.HtmlBody,request.Confirmed,actor),context.RequestAborted);
         if(result.ActionId==null||result.Status is not ("prepared" or "replayed"))return Results.Json(new{success=false,status=result.Status,message=result.Message,actionId=result.ActionId,state=result.State},statusCode:409);
+        await AutoMateApi.JobLifecycleSupport.MarkSchedulingStartedAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);
         return Results.Ok(new{success=true,status=result.Status,actionId=result.ActionId,state=result.State,replayed=result.Replayed,message=result.Message});
     }
     catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
@@ -3916,7 +4987,7 @@ app.MapPost("/jobs/{jobId}/automation/basic/production/prepare", async (HttpCont
 
 app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/approve", async (HttpContext context, Guid jobId, Guid actionId, BasicProductionCommandRequest request) =>
 {
-    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var result=await AutoMateApi.BasicProductionSchedulingSupport.ApproveAsync(conn,new(request.TenantId,jobId,actionId,request.Confirmed,actor),context.RequestAborted);return result.State=="approved"?Results.Ok(new{success=true,status=result.Status,actionId,state=result.State,message=result.Message}):Results.Json(new{success=false,status=result.Status,message=result.Message},statusCode:409);}
+    try{await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var catalogueGate=await TenantServiceCatalogueSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!catalogueGate.Allowed)return Results.Json(new{success=false,status=catalogueGate.Status,message=catalogueGate.Message,catalogueGate},statusCode:409);var contactGate=await TenantContactConfigurationSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!contactGate.Allowed)return Results.Json(new{success=false,status=contactGate.Status,message=contactGate.Message,contactGate},statusCode:409);var agreementGate=await AutoMateApi.TenantAgreementPolicySupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!agreementGate.Allowed)return Results.Json(new{success=false,status=agreementGate.Status,message=agreementGate.Message,agreementGate},statusCode:409);var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));var result=await AutoMateApi.BasicProductionSchedulingSupport.ApproveAsync(conn,new(request.TenantId,jobId,actionId,request.Confirmed,actor),context.RequestAborted);return result.State=="approved"?Results.Ok(new{success=true,status=result.Status,actionId,state=result.State,message=result.Message}):Results.Json(new{success=false,status=result.Status,message=result.Message},statusCode:409);}
     catch(Exception ex){return Results.Problem(title:"Approve production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
 });
 
@@ -3925,6 +4996,9 @@ app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/claim", async 
     try
     {
         await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var catalogueGate=await TenantServiceCatalogueSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!catalogueGate.Allowed)return Results.Json(new{success=false,status=catalogueGate.Status,message=catalogueGate.Message,catalogueGate},statusCode:409);
+        var contactGate=await TenantContactConfigurationSupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!contactGate.Allowed)return Results.Json(new{success=false,status=contactGate.Status,message=contactGate.Message,contactGate},statusCode:409);
+        var agreementGate=await AutoMateApi.TenantAgreementPolicySupport.CheckSchedulingGateAsync(conn,request.TenantId,jobId,context.RequestAborted);if(!agreementGate.Allowed)return Results.Json(new{success=false,status=agreementGate.Status,message=agreementGate.Message,agreementGate},statusCode:409);
         var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
         var claim=await AutoMateApi.BasicProductionSchedulingSupport.ClaimForDeliveryAsync(conn,new(request.TenantId,jobId,actionId,request.Confirmed,actor),context.RequestAborted);
         if(claim.Status!="claimed")return Results.Json(new{success=false,status=claim.Status,message=claim.Message,state=claim.State},statusCode:409);
@@ -3939,7 +5013,7 @@ app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/claim", async 
                 var token=AutoMateApi.ClientEngagementSupport.CreateToken("inspection_page",clientTokenPepper);
                 var issued=await AutoMateApi.ClientEngagementSupport.IssueCommunicationAsync(conn,new(request.TenantId,jobId,publication.PublicationId,"contact_1",claim.ToEmail,"inspection_page",$"basic-production|{actionId:N}|v{publication.ApprovedVersion}",token.Secret,expiry,claim.Subject,false,false,actor),clientTokenPepper,context.RequestAborted);
                 if(issued.RawToken==null)throw new InvalidOperationException("The engagement token was already issued; delivery will not be retried.");
-                communicationId=issued.CommunicationId;var url=$"{publicBaseUrl}/inspection/{Uri.EscapeDataString(issued.RawToken)}";html+=BuildClientEngagementFooter(url,settings.PageEnabled,settings.PixelEnabled);
+                communicationId=issued.CommunicationId;var url=$"{publicBaseUrl}/inspection/{Uri.EscapeDataString(issued.RawToken)}";html=ApplyClientEngagement(html,url,settings.PageEnabled,settings.PixelEnabled,settings.BrandColour);
             }
         }
         catch(Exception)
@@ -3958,6 +5032,250 @@ app.MapPost("/jobs/{jobId}/automation/basic/production/{actionId}/complete", asy
     catch(Exception ex){return Results.Problem(title:"Complete production Basic Scheduling failed",detail:ex.Message,statusCode:500);}
 });
 
+app.MapPost("/automation/company-branding/threed-logo", async (HttpContext context, ThreeDCompanyLogoRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync(context.RequestAborted);await EnsureTenantCompanyBrandingAsync(conn,context.RequestAborted);
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        byte[] bytes;try{bytes=Convert.FromBase64String(request.Base64Data??"");}catch{return Results.BadRequest(new{success=false,message="THREED company logo data is invalid."});}
+        if(bytes.Length==0||bytes.Length>2_000_000)return Results.BadRequest(new{success=false,message="THREED company logo must be between 1 byte and 2 MB."});
+        var contentType=(request.ContentType??"").Trim().ToLowerInvariant();if(contentType is not ("image/png" or "image/jpeg" or "image/gif"))return Results.BadRequest(new{success=false,message="THREED company logo must be PNG, JPEG or GIF."});
+        var hash=Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
+        const string sql=@"INSERT INTO public.tenant_company_branding(tenant_id,company_name,logo_bytes,logo_content_type,logo_sha256,source_name,updated_at)
+VALUES(@tenant,@company,@bytes,@type,@hash,'THREED',NOW()) ON CONFLICT(tenant_id) DO UPDATE SET company_name=EXCLUDED.company_name,logo_bytes=EXCLUDED.logo_bytes,logo_content_type=EXCLUDED.logo_content_type,logo_sha256=EXCLUDED.logo_sha256,source_name='THREED',updated_at=NOW()";
+        await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("tenant",request.TenantId);cmd.Parameters.AddWithValue("company",(request.CompanyName??"").Trim());cmd.Parameters.AddWithValue("bytes",bytes);cmd.Parameters.AddWithValue("type",contentType);cmd.Parameters.AddWithValue("hash",hash);await cmd.ExecuteNonQueryAsync(context.RequestAborted);
+        return Results.Ok(new{success=true,source="THREED",hash,logoUrl=CompanyLogoPublicUrl(request.TenantId,hash)});
+    }
+    catch(Exception ex){return Results.Problem(title:"Sync THREED company logo failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapGet("/branding/{tenantId:guid}/logo/{hash}",async(Guid tenantId,string hash,HttpContext context)=>
+{
+    await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync(context.RequestAborted);await EnsureTenantCompanyBrandingAsync(conn,context.RequestAborted);
+    const string sql="SELECT logo_bytes,logo_content_type FROM public.tenant_company_branding WHERE tenant_id=@tenant AND logo_sha256=@hash";await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("tenant",tenantId);cmd.Parameters.AddWithValue("hash",hash.ToLowerInvariant());await using var reader=await cmd.ExecuteReaderAsync(context.RequestAborted);if(!await reader.ReadAsync(context.RequestAborted))return Results.NotFound();context.Response.Headers.CacheControl="public,max-age=31536000,immutable";return Results.File((byte[])reader[0],reader.GetString(1));
+});
+
+app.MapGet("/jobs/{jobId}/automation/basic/change-runs/current",async(HttpContext context,Guid jobId,Guid tenantId)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var run=await AutoMateApi.BasicChangeRunSupport.LoadCurrentAsync(conn,tenantId,jobId,context.RequestAborted);
+        return run==null?Results.Ok(new{success=true,jobId,run=(object?)null}):Results.Ok(new{success=true,jobId,run});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load Basic change run failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/{actionKey}/claim",async(HttpContext context,Guid jobId,Guid runId,string actionKey,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var result=await AutoMateApi.BasicChangeRunSupport.ClaimAsync(conn,request.TenantId,jobId,runId,actionKey,context.RequestAborted);
+        return result.Status=="running"?Results.Ok(new{success=true,result.Status,result.Action,result.Replayed,message=result.Message}):Results.Json(new{success=false,result.Status,result.Action,result.Replayed,message=result.Message},statusCode:409);
+    }
+    catch(ArgumentException ex){return Results.BadRequest(new{success=false,status="invalid_change_action",message=ex.Message});}
+    catch(Exception ex){return Results.Problem(title:"Claim Basic change action failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/{actionKey}/complete",async(HttpContext context,Guid jobId,Guid runId,string actionKey,BasicChangeActionCompleteRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var result=await AutoMateApi.BasicChangeRunSupport.CompleteAsync(conn,request.TenantId,jobId,runId,actionKey,request.Succeeded,request.ExternalId,request.ErrorCode,request.ErrorMessage,context.RequestAborted);
+        return result.Status is "completed" or "failed"?Results.Ok(new{success=request.Succeeded,result.Status,result.Action,result.Replayed,message=result.Message}):Results.Json(new{success=false,result.Status,result.Action,result.Replayed,message=result.Message},statusCode:409);
+    }
+    catch(ArgumentException ex){return Results.BadRequest(new{success=false,status="invalid_change_result",message=ex.Message});}
+    catch(Exception ex){return Results.Problem(title:"Complete Basic change action failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/{actionKey}/retry",async(HttpContext context,Guid jobId,Guid runId,string actionKey,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var result=await AutoMateApi.BasicChangeRunSupport.RetryFailedAsync(conn,request.TenantId,jobId,runId,actionKey,context.RequestAborted);
+        return result.Status=="pending"?Results.Ok(new{success=true,result.Status,result.Action,result.Replayed,message=result.Message}):Results.Json(new{success=false,result.Status,result.Action,result.Replayed,message=result.Message},statusCode:409);
+    }
+    catch(ArgumentException ex){return Results.BadRequest(new{success=false,status="invalid_change_action",message=ex.Message});}
+    catch(Exception ex){return Results.Problem(title:"Retry Basic change action failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/{actionKey}/approve-live",async(HttpContext context,Guid jobId,Guid runId,string actionKey,LiveChangeActionCommandRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var result=await AutoMateApi.BasicChangeRunSupport.ApproveLiveActionAsync(conn,request.TenantId,jobId,runId,actionKey,request.ExpectedFingerprint,context.RequestAborted);
+        return result.Status=="pending"?Results.Ok(new{success=true,result.Status,result.Action,result.Replayed,message=result.Message}):Results.Json(new{success=false,result.Status,result.Action,result.Replayed,message=result.Message},statusCode:409);
+    }
+    catch(ArgumentException ex){return Results.BadRequest(new{success=false,status="invalid_live_action",message=ex.Message});}
+    catch(Exception ex){return Results.Problem(title:"Approve live THREED action failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/{actionKey}/retry-current-settings",async(HttpContext context,Guid jobId,Guid runId,string actionKey,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        if(!string.Equals(request.ConfirmationText,"RETRY USING CURRENT SETTINGS",StringComparison.Ordinal))return Results.BadRequest(new{success=false,status="confirmation_required",message="Confirm the warned current-settings retry."});
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        Guid? templateId=null,planId=null;int? templateVersion=null,planVersion=null;string? calendarId=null;var inspectorId=GetAuthenticatedInspectorId(context);
+        await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn,context.RequestAborted);await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(conn,context.RequestAborted);await AutoMateApi.TenantAgreementPolicySupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var command=new NpgsqlCommand("""
+            SELECT s.template_id,t.template_version,j.agreement_plan_id,p.plan_version,
+                   (SELECT e.calendar_id FROM public.job_calendar_evidence e WHERE e.tenant_id=@tenant AND e.job_id=j.job_id AND e.provider='google' AND e.event_status='active' ORDER BY e.last_observed_at DESC LIMIT 1)
+            FROM public.jobs_staging j
+            LEFT JOIN public.basic_automation_settings s ON s.tenant_id=@tenant AND s.event_key='scheduling' AND s.recipient_key='contact_1'
+            LEFT JOIN public.email_templates t ON t.tenant_id=@tenant AND t.template_id=s.template_id AND t.archived_at IS NULL
+            LEFT JOIN public.job_agreement_plans p ON p.plan_id=j.agreement_plan_id
+            WHERE j.tenant_id::text=@tenantText AND j.job_id=@job
+            """,conn))
+        {command.Parameters.AddWithValue("tenant",request.TenantId);command.Parameters.AddWithValue("tenantText",request.TenantId.ToString());command.Parameters.AddWithValue("job",jobId);await using var reader=await command.ExecuteReaderAsync(context.RequestAborted);if(!await reader.ReadAsync(context.RequestAborted))return Results.NotFound(new{success=false,status="job_not_found",message="The owned job was not found."});templateId=reader.IsDBNull(0)?null:reader.GetGuid(0);templateVersion=reader.IsDBNull(1)?null:reader.GetInt32(1);planId=reader.IsDBNull(2)?null:reader.GetGuid(2);planVersion=reader.IsDBNull(3)?null:reader.GetInt32(3);calendarId=reader.IsDBNull(4)?null:reader.GetString(4);}
+        var run=await AutoMateApi.BasicChangeRunSupport.LoadCurrentAsync(conn,request.TenantId,jobId,context.RequestAborted);if(run==null||run.RunId!=runId)return Results.NotFound(new{success=false,status="change_run_not_found",message="The current owned change run was not found."});
+        var refs=new AutoMateApi.BasicChangeConfigReferences(run.SourceSnapshotVersion,templateId,templateVersion,planId,planVersion,$"xero-company-settings:{request.TenantId:N}",calendarId,$"inspector-calendar-mapping:{inspectorId:N}:{calendarId}",$"local-company-smtp:{request.TenantId:N}");
+        var result=await AutoMateApi.BasicChangeRunSupport.RetryFailedUsingCurrentSettingsAsync(conn,request.TenantId,jobId,runId,actionKey,refs,context.RequestAborted);
+        return result.Status=="pending"?Results.Ok(new{success=true,result.Status,result.Action,result.Replayed,message=result.Message}):Results.Json(new{success=false,result.Status,result.Action,result.Replayed,message=result.Message},statusCode:409);
+    }
+    catch(ArgumentException ex){return Results.BadRequest(new{success=false,status="invalid_change_action",message=ex.Message});}
+    catch(Exception ex){return Results.Problem(title:"Retry Basic change action using current settings failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/terms/send-signed-replacement",async(HttpContext context,Guid jobId,Guid runId,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        if(!string.Equals(request.ConfirmationText,"SEND REPLACEMENT AGREEMENT",StringComparison.Ordinal))return Results.BadRequest(new{success=false,status="confirmation_required",message="Confirm the explicit signed-agreement replacement."});
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var gate=await AutoMateApi.TenantAgreementPolicySupport.ReplaceUnsignedPlanForServiceChangeAsync(conn,request.TenantId,jobId,actor,context.RequestAborted,allowSignedReplacement:true);if(!gate.Allowed)return Results.Conflict(new{success=false,status=gate.Status,message=gate.Message});
+        var result=await AutoMateApi.BasicChangeRunSupport.ApproveSignedAgreementReplacementAsync(conn,request.TenantId,jobId,runId,context.RequestAborted);
+        return result.Status=="pending"?Results.Ok(new{success=true,result.Status,result.Action,result.Replayed,message=result.Message}):Results.Json(new{success=false,result.Status,result.Action,result.Replayed,message=result.Message},statusCode:409);
+    }
+    catch(Exception ex){return Results.Problem(title:"Approve signed agreement replacement failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/cancellation-email/render",async(HttpContext context,Guid jobId,Guid runId,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        await AutoMateApi.BasicChangeRunSupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var gate=new NpgsqlCommand("SELECT 1 FROM public.basic_job_change_run_actions a JOIN public.basic_job_change_runs r ON r.run_id=a.run_id WHERE r.tenant_id=@tenant AND r.job_id=@job AND r.run_id=@run AND a.action_key='cancellation_email' AND a.status='running'",conn))
+        {gate.Parameters.AddWithValue("tenant",request.TenantId);gate.Parameters.AddWithValue("job",jobId);gate.Parameters.AddWithValue("run",runId);if(await gate.ExecuteScalarAsync(context.RequestAborted)==null)return Results.Conflict(new{success=false,status="cancellation_email_not_claimed",message="Claim the current cancellation email before rendering it."});}
+        var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound(new{success=false,message="The owned job was not found."});
+        var settings=await AutoMateApi.BasicAutomationSupport.LoadAsync(conn,request.TenantId,context.RequestAborted);var slot=settings.First(item=>item.EventKey=="cancellation"&&item.RecipientKey=="contact_1");
+        if(!slot.Enabled)return Results.Conflict(new{success=false,status="cancellation_template_disabled",message="Enable Cancellation / Contact 1 under Basic Automations, then retry this action."});
+        if(string.IsNullOrWhiteSpace(job.ClientEmail))return Results.Conflict(new{success=false,status="cancellation_recipient_missing",message="THREED Contact 1 Email is missing."});
+        var rendered=await RenderBasicEmailAsync(conn,job,"cancellation","contact_1",null,null);
+        return Results.Ok(new{success=true,jobId,runId,toEmail=rendered.ToEmail,rendered.Subject,rendered.HtmlBody,settingVersion=slot.SettingVersion});
+    }
+    catch(Exception ex){return Results.Problem(title:"Render Basic cancellation email failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/change-runs/{runId}/cancellation/{actionKey}/execute",async(HttpContext context,Guid jobId,Guid runId,string actionKey,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(actionKey is not ("calendar_cancel" or "client_page_revoke" or "terms_cancel"))return Results.BadRequest(new{success=false,status="invalid_cancellation_action",message="Unknown cancellation action."});
+        await AutoMateApi.BasicChangeRunSupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var gate=new NpgsqlCommand("SELECT 1 FROM public.basic_job_change_run_actions a JOIN public.basic_job_change_runs r ON r.run_id=a.run_id WHERE r.tenant_id=@tenant AND r.job_id=@job AND r.run_id=@run AND a.action_key=@key AND a.status='running'",conn))
+        {gate.Parameters.AddWithValue("tenant",request.TenantId);gate.Parameters.AddWithValue("job",jobId);gate.Parameters.AddWithValue("run",runId);gate.Parameters.AddWithValue("key",actionKey);if(await gate.ExecuteScalarAsync(context.RequestAborted)==null)return Results.Conflict(new{success=false,status="cancellation_action_not_claimed",message="Claim the current cancellation action before executing it."});}
+        var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound(new{success=false,message="The owned job was not found."});
+        ScheduleActionResult result;
+        if(actionKey=="calendar_cancel")result=await CancelGoogleCalendarEventForJobAsync(conn,job,builder.Configuration);
+        else if(actionKey=="terms_cancel")result=await CancelUnsignedSignNowTermsForJobAsync(conn,job,builder.Configuration);
+        else
+        {
+            var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+            var count=await AutoMateApi.ClientEngagementSupport.RevokeJobAsync(conn,new(request.TenantId,jobId,"THREED job cancelled or unscheduled",actor),context.RequestAborted);
+            result=ScheduleActionResult.Ok("client_page_revoke",count==0?"No active Client View page remained.":"Client View access revoked.",new{externalId=jobId.ToString("D"),revoked=count});
+        }
+        return Results.Ok(new{success=result.Success,skipped=result.Skipped,key=actionKey,jobId,message=result.Message,details=result.Details});
+    }
+    catch(Exception ex){return Results.Problem(title:"Execute Basic cancellation action failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/basic/cancellation/source-missing/observe",async(HttpContext context,Guid jobId,BasicChangeActionCommandRequest request)=>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;await AutoMateApi.BasicChangeRunSupport.EnsureAsync(conn,context.RequestAborted);
+        int count;
+        await using(var observation=new NpgsqlCommand("INSERT INTO public.basic_source_missing_observations(tenant_id,job_id,consecutive_count) VALUES(@tenant,@job,1) ON CONFLICT(tenant_id,job_id) DO UPDATE SET consecutive_count=basic_source_missing_observations.consecutive_count+1,last_observed_at=NOW() RETURNING consecutive_count",conn)){observation.Parameters.AddWithValue("tenant",request.TenantId);observation.Parameters.AddWithValue("job",jobId);count=Convert.ToInt32(await observation.ExecuteScalarAsync(context.RequestAborted));}
+        if(count<2)return Results.Ok(new{success=true,prepared=false,consecutiveObservations=count,message="The missing THREED row must be confirmed by the next successful scan before cancellation."});
+        await AutoMateApi.JobLifecycleSupport.EnsureAsync(conn,context.RequestAborted);
+        await using(var missing=new NpgsqlCommand("UPDATE public.jobs_staging SET threed_record_state='missing',source_missing=true,source_missing_at=COALESCE(source_missing_at,NOW()),source_missing_successful_scans=@count,workflow_updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job",conn)){missing.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));missing.Parameters.AddWithValue("job",jobId);missing.Parameters.AddWithValue("count",count);await missing.ExecuteNonQueryAsync(context.RequestAborted);}
+        return Results.Ok(new{success=true,prepared=false,consecutiveObservations=count,status="removal_review_required",message="THREED job deletion confirmed by repeated successful scans. AutoMate status was not changed; explicit removal review is required."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Observe missing THREED job failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/pilot/rerun", async (HttpContext context, Guid jobId, SchedulingRerunRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(!request.Confirmed)return Results.Json(new{success=false,message="Confirm the scheduling action."},statusCode:409);
+        await AutoMateApi.BasicProductionSchedulingSupport.EnsureAsync(conn,context.RequestAborted);
+        var testRunId=Guid.NewGuid();
+        await using var tx=await conn.BeginTransactionAsync(context.RequestAborted);
+        var resetEmail=string.IsNullOrWhiteSpace(request.Action)||request.Action=="all"||request.Action=="email";
+        if(resetEmail)await using(var actions=new NpgsqlCommand("DELETE FROM public.basic_production_scheduling_actions WHERE tenant_id=@tenant AND job_id=@job",conn,tx)){actions.Parameters.AddWithValue("tenant",request.TenantId);actions.Parameters.AddWithValue("job",jobId);await actions.ExecuteNonQueryAsync(context.RequestAborted);}
+        await using(var job=new NpgsqlCommand(@"UPDATE public.jobs_staging SET
+approved_snapshot_json=COALESCE(current_snapshot_json,approved_snapshot_json),
+approved_snapshot_fingerprint=COALESCE(NULLIF(current_snapshot_fingerprint,''),approved_snapshot_fingerprint),
+approved_snapshot_version=GREATEST(approved_snapshot_version,0)+1,
+change_review_pending=false,pending_change_json=NULL,pending_change_fingerprint=NULL,pending_change_reasons=NULL,change_detected_at=NULL,address_change_pending=false,
+booking_email_sent=CASE WHEN @reset_email THEN false ELSE booking_email_sent END,booking_email_sent_at=CASE WHEN @reset_email THEN NULL ELSE booking_email_sent_at END,booking_email_retry_requested=CASE WHEN @reset_email THEN false ELSE booking_email_retry_requested END,booking_email_last_error=CASE WHEN @reset_email THEN NULL ELSE booking_email_last_error END
+WHERE tenant_id::text=@tenant AND job_id=@job",conn,tx)){job.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));job.Parameters.AddWithValue("job",jobId);job.Parameters.AddWithValue("reset_email",resetEmail);if(await job.ExecuteNonQueryAsync(context.RequestAborted)!=1)throw new InvalidOperationException("The scheduled job was not found for this company.");}
+        await tx.CommitAsync(context.RequestAborted);
+        return Results.Ok(new{success=true,testRunId,message="Latest THREED details accepted for this scheduling action."});
+    }
+    catch(Exception ex){return Results.Problem(title:"Prepare controlled test rerun failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPost("/jobs/{jobId}/automation/pilot/providers", async (HttpContext context, Guid jobId, PilotScheduleProviderRequest request) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the scheduling actions."},statusCode:409);
+        await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);var engineKey=await AutoMateApi.AdvancedWorkflowSupport.AssignAtFirstSchedulingAsync(conn,request.TenantId,jobId,context.RequestAborted);if(engineKey==AutoMateApi.AdvancedWorkflowSupport.Advanced)return Results.Json(new{success=false,status="advanced_workflow_job",message="This job is assigned to Advanced Workflows. Basic scheduling actions were not run."},statusCode:409);
+        var lifecycle=await AutoMateApi.JobLifecycleSupport.LoadAsync(conn,request.TenantId,jobId,context.RequestAborted);
+        if(lifecycle==null)return Results.NotFound();
+        if(!AutoMateApi.JobLifecyclePolicy.CanExposeScheduling(lifecycle.AutomateStatus,lifecycle.AppointmentAt.HasValue)||lifecycle.ThreedRecordState!="present")
+            return Results.Json(new{success=false,status="lifecycle_blocked",message=$"Provider scheduling actions are unavailable while the AutoMate job is {lifecycle.AutomateStatus} or its THREED source record is unavailable."},statusCode:409);
+        var lockKey=$"schedule-pilot:{request.TenantId:D}:{jobId:D}";
+        if(!await TryAcquirePilotLockAsync(conn,lockKey,context.RequestAborted))return Results.Json(new{success=false,status="pilot_already_running",message="This scheduling test is already running. Wait for its recorded outcomes; do not start another copy."},statusCode:409);
+        try
+        {
+            var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+            var job=await LoadScheduleJobAsync(conn,jobId);if(job==null||job.TenantId!=request.TenantId)return Results.NotFound(new{success=false,status="job_not_found",message="Sync this THREED job before scheduling."});
+            var requested=string.IsNullOrWhiteSpace(request.Action)?"all":request.Action.Trim().ToLowerInvariant();
+            await AutoMateApi.JobLifecycleSupport.MarkSchedulingStartedAsync(conn,request.TenantId,jobId,actor,context.RequestAborted);
+            await using(var clear=new NpgsqlCommand(@"UPDATE public.jobs_staging SET
+terms_last_error=CASE WHEN @action IN ('all','terms') THEN NULL ELSE terms_last_error END,
+xero_last_error=CASE WHEN @action IN ('all','invoice') THEN NULL ELSE xero_last_error END,
+calendar_last_error=CASE WHEN @action IN ('all','calendar') THEN NULL ELSE calendar_last_error END
+WHERE tenant_id::text=@tenant AND job_id=@job",conn)){clear.Parameters.AddWithValue("action",requested);clear.Parameters.AddWithValue("tenant",request.TenantId.ToString("D"));clear.Parameters.AddWithValue("job",jobId);await clear.ExecuteNonQueryAsync(context.RequestAborted);}
+            var results=new List<ScheduleActionResult>();
+            var forceDuplicate=request.ForceTestRerun;
+            if(requested is "all" or "terms")results.Add(job.TermsRequired?await SendSignNowTermsForJobAsync(conn,job,builder.Configuration,forceDuplicate,request.ReplaceUnsignedAgreement):ScheduleActionResult.Skip("terms","No agreement is required for this job."));
+            if(requested is "all" or "invoice")results.Add(await CreateXeroDraftInvoiceForJobAsync(conn,jobId,builder.Configuration,forceDuplicate));
+            if(requested is "all" or "calendar")results.Add(job.CalendarRequired?await CreateGoogleCalendarEventForJobAsync(conn,job,builder.Configuration,forceDuplicate):ScheduleActionResult.Skip("calendar","No Calendar event is required for this job."));
+            var failed=results.Where(x=>!x.Success&&!x.Skipped).ToArray();
+            return Results.Ok(new{success=failed.Length==0,status=failed.Length==0?"completed":"completed_with_errors",message=failed.Length==0?"Scheduling actions completed.":"One or more scheduling actions failed. Other actions were still attempted and each failed action can be retried.",jobId,actions=results});
+        }
+        finally{await ReleasePilotLockAsync(conn,lockKey);}
+    }
+    catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
+    catch(Exception ex){return Results.Problem(title:"Run controlled pilot provider steps failed",detail:ex.Message,statusCode:500);}
+});
+
 app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
 {
     try
@@ -3973,6 +5291,7 @@ app.MapGet("/jobs/{jobId}/email-template-context", async (Guid jobId) =>
             return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
 
         var fields = BuildEmailTemplateFields(job, null);
+        MergeEmailTemplateFields(fields,await LoadRawCustomEmailFieldsAsync(conn,job.JobId));
         var invoiceContext = await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn, jobId);
         if (invoiceContext != null)
             MergeEmailTemplateFields(fields, invoiceContext.Tokens);
@@ -4033,9 +5352,8 @@ app.MapPost("/jobs/{jobId}/communications/client-email/prepare", async (HttpCont
         catch(InvalidOperationException ex) when(ex.Message.Contains("idempotency",StringComparison.OrdinalIgnoreCase)){return Results.Conflict(new{success=false,status="delivery_already_prepared",message="This email delivery was already prepared and will not be sent again automatically."});}
         if(issued.RawToken==null)return Results.Conflict(new{success=false,status="delivery_already_prepared",message="This email delivery was already prepared and will not be sent again automatically."});
         var url=$"{publicBaseUrl}/inspection/{Uri.EscapeDataString(issued.RawToken)}";
-        var footer=BuildClientEngagementFooter(url,settings.PageEnabled,settings.PixelEnabled);
         var subject=controlledTest?"[CLIENT PAGE TEST] "+rendered.Subject:rendered.Subject;
-        return Results.Ok(new{success=true,Subject=subject,HtmlBody=rendered.HtmlBody+footer,ToEmail=deliveryAddress,rendered.ActionKey,trackingApplied=true,controlledClientPageTest=controlledTest,settings.PageEnabled,settings.PixelEnabled,communicationId=issued.CommunicationId,expiresAt=issued.ExpiresAt});
+        return Results.Ok(new{success=true,Subject=subject,HtmlBody=ApplyClientEngagement(rendered.HtmlBody,url,settings.PageEnabled,settings.PixelEnabled,settings.BrandColour),ToEmail=deliveryAddress,rendered.ActionKey,trackingApplied=true,controlledClientPageTest=controlledTest,settings.PageEnabled,settings.PixelEnabled,communicationId=issued.CommunicationId,expiresAt=issued.ExpiresAt});
     }
     catch(AuthenticatedAutomationIdentityException ex){return Results.Json(new{success=false,status="authenticated_identity_required",message=ex.Message},statusCode:401);}
     catch(Exception ex){return Results.Problem(title:"Prepare tracked Client email failed",detail:ex.Message,statusCode:500);}
@@ -4066,11 +5384,12 @@ app.MapPost("/jobs/{jobId}/email-templates/booking-email/preview", async (Guid j
         if (rendered == null)
             return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
 
+        var previewHtml=Regex.Replace(rendered.HtmlBody,"\\{\\{\\s*INSPECTION_DETAILS_BUTTON\\s*\\}\\}","<div style=\"margin:24px 0;text-align:center\"><span style=\"display:inline-block;background:#0b5f86;color:#fff;padding:12px 20px;border-radius:8px;font-family:Arial,sans-serif;font-weight:700\">View inspection details</span></div>",RegexOptions.IgnoreCase);
         return Results.Ok(new
         {
             success = true,
             rendered.Subject,
-            rendered.HtmlBody,
+            HtmlBody=previewHtml,
             rendered.ToEmail,
             rendered.ActionKey,
             rendered.ServiceTypeKey,
@@ -4125,90 +5444,14 @@ app.MapPost("/jobs/{jobId}/email-templates/booking-email/render", async (Guid jo
 
 app.MapPost("/jobs/{jobId}/email-templates/booking-email/send", async (Guid jobId, EmailTemplateSendRequest request) =>
 {
-    try
+    return Results.Json(new
     {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await EnsureInspectorIntegrationsTableAsync(conn);
-        await EnsureJobPaymentColumnsAsync(conn);
-        await EnsureWorkflowActionsTableAsync(conn);
-        await EnsureInspectorsTableAsync(conn);
-        await EnsureEmailTemplatesTableAsync(conn);
-
-        var rendered = await RenderBookingEmailTemplateAsync(conn, jobId, request, preferDraft: false);
-        if (rendered == null)
-            return Results.NotFound(new { success = false, message = "Job was not found in Railway.", jobId });
-
-        if (string.IsNullOrWhiteSpace(rendered.ToEmail))
-            return Results.BadRequest(new { success = false, message = "Recipient email is required." });
-
-        if (builder.Configuration.GetValue("AUTOMATE_SMTP_ONLY", true))
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "AutoMate email is SMTP-only. Send from the desktop connector so the company's SMTP credentials remain local.",
-                senderMode = "customer-smtp",
-                provider = "Customer SMTP"
-            });
-
-        if (IsSmtpEmailSenderMode(rendered.EmailSenderMode))
-        {
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = "This inspector is set to SMTP. Send from the desktop connector so SMTP credentials stay local.",
-                senderMode = rendered.EmailSenderMode,
-                provider = GetEmailSenderModeLabel(rendered.EmailSenderMode)
-            });
-        }
-
-        var account = await GetMicrosoftMailAccountAsync(conn, rendered.InspectorId, builder.Configuration);
-        if (!account.Success)
-        {
-            await MarkBookingEmailFailedAsync(conn, jobId, account.ErrorMessage ?? "Microsoft email is not connected.");
-            return Results.BadRequest(new
-            {
-                success = false,
-                message = account.ErrorMessage ?? "Microsoft email is not connected."
-            });
-        }
-
-        using var httpClient = new HttpClient();
-        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
-        var response = await SendMicrosoftMailAsync(httpClient, rendered.ToEmail, rendered.Subject, rendered.HtmlBody);
-        if (!response.Success)
-        {
-            await MarkBookingEmailFailedAsync(conn, jobId, response.Message);
-            await MarkWorkflowActionFailedAsync(conn, jobId, rendered.ActionKey, response.Message);
-            return Results.Problem(
-                title: "Microsoft send mail failed",
-                detail: response.Message,
-                statusCode: 500);
-        }
-
-        if (request.MarkWorkflowComplete)
-        {
-            await MarkWorkflowActionSentAsync(conn, jobId, rendered.ActionKey);
-            await MarkBookingEmailSentIfNoPendingActionsAsync(conn, jobId);
-        }
-
-        return Results.Ok(new
-        {
-            success = true,
-            message = "Email sent via Microsoft Test Mode.",
-            provider = "Microsoft Test Mode",
-            toEmail = rendered.ToEmail,
-            actionKey = rendered.ActionKey
-        });
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem(
-            title: "Send email template failed",
-            detail: ex.ToString(),
-            statusCode: 500
-        );
-    }
+        success = false,
+        status = "local_smtp_required",
+        message = "Customer email can be sent only by the desktop connector through the user's locally stored Company SMTP settings.",
+        senderMode = "manual-smtp",
+        credentialsStoredLocally = true
+    }, statusCode: StatusCodes.Status410Gone);
 });
 // XERO CREATE DRAFT INVOICE
 // =============================
@@ -4295,27 +5538,17 @@ app.MapPost("/integrations/xero/jobs/{jobId}/create-draft-invoice", async (Guid 
             });
         }
 
+        var xeroSettings=await AutoMateApi.IntegrationHubSupport.LoadXeroAsync(conn,job.TenantId);
+        var invoiceRecord=new Dictionary<string,object>
+        {
+            ["Type"]="ACCREC",["Contact"]=new{ContactID=contactId},["DateString"]=DateTime.UtcNow.ToString("yyyy-MM-dd"),["DueDateString"]=(job.JobDate??DateTime.UtcNow).ToString("yyyy-MM-dd"),["Reference"]=string.IsNullOrWhiteSpace(job.SiteAddress)?job.JobName:job.SiteAddress,["Status"]="DRAFT",["SentToContact"]=false,
+            ["LineItems"]=invoiceLines.Select(line=>new{Description=line.Description,Quantity=line.Quantity<=0m?1m:line.Quantity,UnitAmount=line.UnitAmount}).ToArray()
+        };
+        if(!string.IsNullOrWhiteSpace(xeroSettings.BrandingThemeId))invoiceRecord["BrandingThemeID"]=xeroSettings.BrandingThemeId;
+
         var invoicePayload = new
         {
-            Invoices = new[]
-            {
-                new
-                {
-                    Type = "ACCREC",
-                    Contact = new { ContactID = contactId },
-                    DateString = DateTime.UtcNow.ToString("yyyy-MM-dd"),
-                    DueDateString = (job.JobDate ?? DateTime.UtcNow).ToString("yyyy-MM-dd"),
-                    Reference = string.IsNullOrWhiteSpace(job.SiteAddress) ? job.JobName : job.SiteAddress,
-                    Status = "DRAFT",
-                    SentToContact = false,
-                    LineItems = invoiceLines.Select(line => new
-                    {
-                        Description = line.Description,
-                        Quantity = line.Quantity <= 0m ? 1m : line.Quantity,
-                        UnitAmount = line.UnitAmount
-                    }).ToArray()
-                }
-            }
+            Invoices = new[] { invoiceRecord }
         };
 
         var invoiceResponse = await httpClient.PostAsJsonAsync(
@@ -4396,6 +5629,9 @@ app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
 {
     var results = new List<ScheduleActionResult>();
 
+    if (!builder.Configuration.GetValue<bool>("AUTOMATE_LEGACY_SCHEDULE_EXECUTION_ENABLED"))
+        return Results.Conflict(new { success=false,status="provider_execution_disabled",message="Legacy scheduling execution is disabled. Use the guarded Basic Automation preparation flow." });
+
     try
     {
         await using var conn = new NpgsqlConnection(connectionString);
@@ -4409,17 +5645,23 @@ app.MapPost("/jobs/{jobId}/schedule", async (Guid jobId) =>
         await JobChangeSupport.EnsureAsync(conn);
 
         await TenantMappingProfileSupport.EnsureAsync(conn);
-        await using (var gate = new NpgsqlCommand("SELECT change_review_pending,unscheduled,mapping_workflow_ready FROM public.jobs_staging WHERE job_id=@job", conn))
+        await TenantServiceCatalogueSupport.EnsureAsync(conn);
+        Guid? schedulingTenant=null;bool changeReviewPending=false,unscheduled=false,mappingWorkflowReady=false;
+        await using (var gate = new NpgsqlCommand("SELECT tenant_id,change_review_pending,unscheduled,mapping_workflow_ready FROM public.jobs_staging WHERE job_id=@job", conn))
         {
             gate.Parameters.AddWithValue("job", jobId);
             await using var gateReader = await gate.ExecuteReaderAsync();
             if (await gateReader.ReadAsync())
             {
-                if (!gateReader.GetBoolean(2))
-                    return Results.Conflict(new { success = false, status = "mapping_review_required", message = "Validate the tenant mapping and re-sync this job before running customer workflows." });
-                if (gateReader.GetBoolean(0) || gateReader.GetBoolean(1))
-                    return Results.Conflict(new { success = false, status = "change_review_required", message = "Review the detected 3D job changes before running customer workflows." });
+                schedulingTenant=gateReader.GetGuid(0);changeReviewPending=gateReader.GetBoolean(1);unscheduled=gateReader.GetBoolean(2);mappingWorkflowReady=gateReader.GetBoolean(3);
             }
+        }
+        if(schedulingTenant.HasValue)
+        {
+            var catalogueGate=await TenantServiceCatalogueSupport.CheckSchedulingGateAsync(conn,schedulingTenant.Value,jobId);if(!catalogueGate.Allowed)return Results.Conflict(new{success=false,status=catalogueGate.Status,message=catalogueGate.Message,catalogueGate});
+            var contactGate=await TenantContactConfigurationSupport.CheckSchedulingGateAsync(conn,schedulingTenant.Value,jobId);if(!contactGate.Allowed)return Results.Conflict(new{success=false,status=contactGate.Status,message=contactGate.Message,contactGate});
+            if(!mappingWorkflowReady)return Results.Conflict(new{success=false,status="mapping_review_required",message="Validate the tenant mapping and re-sync this job before running customer workflows."});
+            if(changeReviewPending||unscheduled)return Results.Conflict(new{success=false,status="change_review_required",message="Review the detected 3D job changes before running customer workflows."});
         }
 
         var job = await LoadScheduleJobAsync(conn, jobId);
@@ -4854,22 +6096,13 @@ LIMIT 100;";
 // GET JOB WORKFLOW STATUS
 // Read-only connector view of Railway-owned state
 // =============================
-app.MapGet("/jobs/workflow-status", async () =>
+app.MapGet("/jobs/workflow-status", async (HttpContext context) =>
 {
     try
     {
+        context.Response.Headers.CacheControl="no-store, no-cache, must-revalidate";
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
-        await EnsureInspectorsTableAsync(conn);
-        await EnsureJobPaymentColumnsAsync(conn);
-        await EnsureSignNowJobColumnsAsync(conn);
-        await EnsureWorkflowActionsTableAsync(conn);
-        await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
-        await TenantMappingProfileSupport.EnsureAsync(conn);
-        await EnsureEmailTemplatesTableAsync(conn);
-        await EnsureAdvancedActionsTablesAsync(conn);
-        await AutomationFoundationSupport.EnsureAsync(conn);
-        await JobChangeSupport.EnsureAsync(conn);
 
         const string sql = @"
 SELECT
@@ -4880,6 +6113,7 @@ SELECT
     j.date_added,
     j.source_updated_at,
     j.status,
+    j.basic_scheduling_started_at,
     j.inspector_name,
     j.job_total,
     j.primary_service,
@@ -4975,6 +6209,7 @@ LIMIT 500;";
                 date_added = reader["date_added"]?.ToString(),
                 source_updated_at = reader["source_updated_at"]?.ToString(),
                 status = reader["status"]?.ToString(),
+                basic_scheduling_started_at = reader["basic_scheduling_started_at"]?.ToString(),
                 inspector_name = reader["inspector_name"]?.ToString(),
                 job_total = reader["job_total"]?.ToString(),
                 invoice_total = reader["job_total"]?.ToString(),
@@ -5149,7 +6384,7 @@ SELECT
     COALESCE(NULLIF(j.inspector_email,''),i.email_from_address) AS email_from_address,
     COALESCE(NULLIF(j.inspector_phone,''),i.phone) AS phone,
     i.timezone,
-    COALESCE(i.email_sender_mode, 'microsoft') AS email_sender_mode,
+    COALESCE(i.email_sender_mode, 'manual-smtp') AS email_sender_mode,
     i.allow_report_release_before_payment,
     i.onboarding_status,
     i.logo_url,
@@ -6354,10 +7589,13 @@ WHERE job_id = @job_id;
 // =============================
 app.MapPost("/jobs/{jobId}/mark-report-sent", async (Guid jobId) =>
 {
+    if (!builder.Configuration.GetValue<bool>("AUTOMATE_REPORT_PUBLISHING_ENABLED"))
+        return Results.Conflict(new { success=false,status="report_publishing_disabled",message="Report publishing remains disabled in this guarded release." });
     try
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        Guid? reportTenant=null;await using(var tenantCommand=new NpgsqlCommand("SELECT tenant_id FROM public.jobs_staging WHERE job_id=@job",conn)){tenantCommand.Parameters.AddWithValue("job",jobId);var tenantValue=await tenantCommand.ExecuteScalarAsync();reportTenant=tenantValue is Guid value?value:null;}if(!reportTenant.HasValue)return Results.NotFound(new{success=false,status="job_not_found",message="The job was not found."});var agreementReportGate=await AutoMateApi.TenantAgreementPolicySupport.CheckReportGateAsync(conn,reportTenant.Value,jobId);if(!agreementReportGate.Allowed)return Results.Conflict(new{success=false,status=agreementReportGate.Status,message=agreementReportGate.Message,agreementReportGate});
 
         const string sql = @"
 UPDATE public.jobs_staging
@@ -6377,6 +7615,7 @@ WHERE job_id = @job_id;
         cmd.Parameters.AddWithValue("job_id", jobId);
 
         int rows = await cmd.ExecuteNonQueryAsync();
+        if(rows==1)await AutoMateApi.JobLifecycleSupport.MarkReportAcceptedAsync(conn,reportTenant.Value,jobId);
 
         return Results.Ok(new
         {
@@ -6764,6 +8003,8 @@ app.MapPost("/jobs/upsert", async (HttpContext context) =>
 
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
+        var uploadOwner=await RequireAutomationOwnerAsync(context,conn,tenantId);
+        if(!uploadOwner.Allowed)return uploadOwner.Error!;
         await EnsureWorkflowActionsTableAsync(conn);
 
         const string createTableSql = @"
@@ -6833,6 +8074,7 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
     report_required boolean NOT NULL DEFAULT true,
     building_type text,
     stories text,
+    property_floor_area numeric NULL,
     bedrooms text,
     bathrooms text,
     monolithic text,
@@ -6892,13 +8134,32 @@ CREATE TABLE IF NOT EXISTS public.jobs_staging
             await createCmd.ExecuteNonQueryAsync();
         }
 
+        await AutoMateApi.JobLifecycleSupport.EnsureAsync(conn, context.RequestAborted);
+        var incomingDateAdded=ParseNullableDateTime(payload.Job.DateAddedUtc);
+        var importDecision=await AutoMateApi.JobImportPolicySupport.EvaluateAsync(conn,tenantId,jobId,incomingDateAdded.HasValue?new DateTimeOffset(incomingDateAdded.Value):(DateTimeOffset?)null,context.RequestAborted);
+        if(!importDecision.Allowed)
+        {
+            return Results.Ok(new
+            {
+                success=true,
+                imported=false,
+                status=importDecision.Code,
+                jobId,
+                registrationCutoff=importDecision.RegistrationCutoff,
+                message=importDecision.Code=="source_date_added_required"
+                    ? "This new THREED job has no reliable creation time and was not imported."
+                    : "This THREED job predates AutoMate registration and was not imported."
+            });
+        }
+
         await using (var profileColumns = new NpgsqlCommand(@"
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS inspector_email text NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS inspector_phone text NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact1_display_name text NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact1_role_label text NULL;
 ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_display_name text NULL;
-ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_role_label text NULL;", conn))
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_role_label text NULL;
+ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS property_floor_area numeric NULL;", conn))
         {
             await profileColumns.ExecuteNonQueryAsync();
         }
@@ -6906,16 +8167,22 @@ ALTER TABLE public.jobs_staging ADD COLUMN IF NOT EXISTS contact2_role_label tex
         await EnsureJobPaymentColumnsAsync(conn);
         await EnsureOnlinePropertyTablesAsync(conn);
         await TenantMappingProfileSupport.EnsureAsync(conn, context.RequestAborted);
+        await TenantServiceCatalogueSupport.EnsureAsync(conn, context.RequestAborted);
+        await TenantContactConfigurationSupport.EnsureAsync(conn, context.RequestAborted);
         var canonicalResolution = await CanonicalSyncResolver.ResolveAsync(
             conn, tenantId, body, payload, new CanonicalSyncGateOptions(true, false), context.RequestAborted);
         if (canonicalResolution.Gate.Allowed && canonicalResolution.Values != null)
             CanonicalSyncProjection.Apply(payload, canonicalResolution.Values);
+        var serviceCatalogueResolution = await TenantServiceCatalogueSupport.ResolveJobAsync(conn, tenantId, payload, context.RequestAborted);
+        await AutoMateApi.TenantAgreementPolicySupport.EnsureAsync(conn, context.RequestAborted);
+        var agreementRequirement = await AutoMateApi.TenantAgreementPolicySupport.ResolveTermsRequiredAsync(conn, tenantId, jobId, serviceCatalogueResolution.Version, serviceCatalogueResolution.SnapshotJson, context.RequestAborted);
         await JobChangeSupport.EnsureAsync(conn);
         JobChangePreparation? changePreparation = canonicalResolution.Gate.Allowed
             ? await JobChangeSupport.PrepareAsync(conn, jobId, payload)
             : null;
 
         string previousAddress = "";
+        bool jobExisted = false;
         bool workflowStartedBeforeAddressChange = false;
         await using (var previousCmd = new NpgsqlCommand(@"SELECT site_address,
 (booking_email_sent OR terms_sent OR calendar_created OR invoice_sent) AS workflow_started
@@ -6925,6 +8192,7 @@ FROM public.jobs_staging WHERE job_id=@job_id LIMIT 1", conn))
             await using var previousReader = await previousCmd.ExecuteReaderAsync();
             if (await previousReader.ReadAsync())
             {
+                jobExisted = true;
                 previousAddress = previousReader["site_address"]?.ToString() ?? "";
                 workflowStartedBeforeAddressChange = previousReader["workflow_started"] != DBNull.Value && (bool)previousReader["workflow_started"];
             }
@@ -6967,6 +8235,7 @@ INSERT INTO public.jobs_staging
     report_required,
     building_type,
     stories,
+    property_floor_area,
     bedrooms,
     bathrooms,
     monolithic,
@@ -7017,6 +8286,9 @@ INSERT INTO public.jobs_staging
     mapping_review_required,
     mapping_attention_reason,
     mapping_synced_at,
+    service_catalogue_version,
+    service_catalogue_snapshot_json,
+    service_catalogue_review_required,
     updated_at
 )
 VALUES
@@ -7053,6 +8325,7 @@ VALUES
     @report_required,
     @building_type,
     @stories,
+    @property_floor_area,
     @bedrooms,
     @bathrooms,
     @monolithic,
@@ -7103,6 +8376,9 @@ VALUES
     @mapping_review_required,
     @mapping_attention_reason,
     NOW(),
+    @service_catalogue_version,
+    CAST(@service_catalogue_snapshot_json AS jsonb),
+    @service_catalogue_review_required,
     NOW()
 )
 ON CONFLICT (job_id)
@@ -7138,6 +8414,7 @@ DO UPDATE SET
     report_required              = EXCLUDED.report_required,
     building_type                = EXCLUDED.building_type,
     stories                      = EXCLUDED.stories,
+    property_floor_area          = EXCLUDED.property_floor_area,
     bedrooms                     = EXCLUDED.bedrooms,
     bathrooms                    = EXCLUDED.bathrooms,
     monolithic                   = EXCLUDED.monolithic,
@@ -7188,7 +8465,11 @@ DO UPDATE SET
     mapping_review_required      = EXCLUDED.mapping_review_required,
     mapping_attention_reason     = EXCLUDED.mapping_attention_reason,
     mapping_synced_at            = EXCLUDED.mapping_synced_at,
-    updated_at                   = NOW();";
+    service_catalogue_version    = EXCLUDED.service_catalogue_version,
+    service_catalogue_snapshot_json = EXCLUDED.service_catalogue_snapshot_json,
+    service_catalogue_review_required = EXCLUDED.service_catalogue_review_required,
+    updated_at                   = NOW()
+WHERE jobs_staging.threed_record_state NOT IN ('removed','reappeared');";
 
         await using (var cmd = new NpgsqlCommand(upsertSql, conn))
         {
@@ -7205,7 +8486,7 @@ DO UPDATE SET
 
             var jobDate = ParseNullableDateTime(payload.Job.JobDate);
             var sourceUpdatedAt = ParseNullableDateTime(payload.Job.SourceUpdatedAtUtc);
-            var dateAdded = ParseNullableDateTime(payload.Job.DateAddedUtc);
+            var dateAdded = incomingDateAdded;
             var invoiceTotal = ParseNullableDecimal(payload.Job.InvoiceTotal);
 
             cmd.Parameters.AddWithValue("job_date", jobDate.HasValue ? jobDate.Value : (object)DBNull.Value);
@@ -7225,12 +8506,13 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("additional2_service_key", payload.Services?.Additional2ServiceKey ?? InferCanonicalServiceType(payload.Services?.Additional2));
             cmd.Parameters.AddWithValue("booking_template_key", BuildBookingTemplateKey(payload.Services));
             cmd.Parameters.AddWithValue("booking_email_required", payload.Services?.BookingEmailRequired ?? true);
-            cmd.Parameters.AddWithValue("terms_required", payload.Services?.TermsRequired ?? ShouldRequireTermsForBooking(payload.Services));
+            cmd.Parameters.AddWithValue("terms_required", agreementRequirement.Authoritative ? agreementRequirement.TermsRequired : payload.Services?.TermsRequired ?? ShouldRequireTermsForBooking(payload.Services));
             cmd.Parameters.AddWithValue("invoice_required", payload.Services?.InvoiceRequired ?? true);
             cmd.Parameters.AddWithValue("calendar_required", payload.Services?.CalendarRequired ?? true);
             cmd.Parameters.AddWithValue("report_required", payload.Services?.ReportRequired ?? true);
             cmd.Parameters.AddWithValue("building_type", payload.JobDetails?.BuildingType ?? "");
             cmd.Parameters.AddWithValue("stories", payload.JobDetails?.Stories ?? "");
+            var floorArea=ParseNullableDecimal(payload.JobDetails?.FloorArea);cmd.Parameters.AddWithValue("property_floor_area",floorArea.HasValue&&floorArea.Value>0?floorArea.Value:(object)DBNull.Value);
             cmd.Parameters.AddWithValue("bedrooms", payload.JobDetails?.Bedrooms ?? "");
             cmd.Parameters.AddWithValue("bathrooms", payload.JobDetails?.Bathrooms ?? "");
             cmd.Parameters.AddWithValue("monolithic", payload.JobDetails?.Monolithic ?? "");
@@ -7281,9 +8563,38 @@ DO UPDATE SET
             cmd.Parameters.AddWithValue("canonical_values_json", mappingEnvelope?.Values.GetRawText() ?? "{}");
             cmd.Parameters.AddWithValue("mapping_review_required", !canonicalResolution.Gate.Allowed);
             cmd.Parameters.AddWithValue("mapping_attention_reason", CanonicalSyncResolver.AttentionReason(canonicalResolution.Gate));
+            cmd.Parameters.AddWithValue("service_catalogue_version", serviceCatalogueResolution.Version > 0 ? serviceCatalogueResolution.Version : (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("service_catalogue_snapshot_json", serviceCatalogueResolution.SnapshotJson);
+            cmd.Parameters.AddWithValue("service_catalogue_review_required", serviceCatalogueResolution.ReviewRequired);
 
             await cmd.ExecuteNonQueryAsync();
         }
+
+        await using (var sourceEvidence = new NpgsqlCommand("""
+        UPDATE public.jobs_staging SET threed_record_state=CASE WHEN threed_record_state IN ('removed','reappeared') THEN 'reappeared' ELSE 'present' END,source_missing=false,source_missing_at=NULL,
+          source_missing_successful_scans=0,
+          threed_complete_observed_at=CASE WHEN @complete AND NOT threed_complete THEN NOW() WHEN NOT @complete THEN NULL ELSE threed_complete_observed_at END,
+          threed_complete=@complete
+        WHERE tenant_id::text=@tenant AND job_id=@job
+        """, conn))
+        {
+            sourceEvidence.Parameters.AddWithValue("tenant",tenantId.ToString("D"));sourceEvidence.Parameters.AddWithValue("job",jobId);
+            sourceEvidence.Parameters.AddWithValue("complete",payload.Job.ThreedComplete||string.Equals(payload.Job.Status,"Completed",StringComparison.OrdinalIgnoreCase));
+            await sourceEvidence.ExecuteNonQueryAsync(context.RequestAborted);
+        }
+
+        var normalizedContacts=payload.Contacts?.Where(x=>x.ContactIndex is >=0 and <=6).ToList()??new List<ContactFlat>();
+        if(normalizedContacts.Count==0)
+        {
+            var legacyContact1=payload.Contact1??new ContactFlat();var legacyContact2=payload.Contact2??new ContactFlat();
+            if(legacyContact1.ContactIndex<0)legacyContact1.ContactIndex=0;if(legacyContact2.ContactIndex<0)legacyContact2.ContactIndex=1;
+            normalizedContacts.Add(legacyContact1);normalizedContacts.Add(legacyContact2);
+        }
+        await TenantContactConfigurationSupport.SyncJobContactsAsync(conn,tenantId,jobId,normalizedContacts,context.RequestAborted);
+        await AutoMateApi.TenantAgreementPolicySupport.MarkPlanReviewIfServicesChangedAsync(conn,tenantId,jobId,serviceCatalogueResolution.SnapshotJson,context.RequestAborted);
+        AutoMateApi.AgreementSchedulingGate? initialAgreementGate=null;
+        if(!jobExisted&&ParseNullableDateTime(payload.Job.JobDate).HasValue)
+            initialAgreementGate=await AutoMateApi.TenantAgreementPolicySupport.CaptureForSchedulingAsync(conn,tenantId,jobId,$"THREED sync {inspectorId:D}",context.RequestAborted);
 
         if (addressChanged)
         {
@@ -7327,11 +8638,98 @@ WHERE job_id=@job_id", conn);
             }
         }
 
+        Guid? basicChangeRunId=null;bool jobChangeReviewPending=false;
         if (canonicalResolution.Gate.Allowed && changePreparation != null)
         {
             await RefreshBookingWorkflowActionsAsync(conn, payload, jobId, tenantId, inspectorId);
             await RefreshJobInvoiceLinesAsync(conn, payload, jobId);
+            var storedInvoiceLines=await LoadXeroInvoiceLinesAsync(conn,jobId);
+            var expectedInvoiceLines=(payload.InvoiceLines??[]).OrderBy(x=>x.LineIndex).ToArray();
+            var expectedInvoiceTotal=expectedInvoiceLines.Sum(x=>x.Amount!=0m?x.Amount:(x.Quantity<=0m?1m:x.Quantity)*x.UnitPrice);
+            var storedInvoiceTotal=storedInvoiceLines.Sum(x=>(x.Quantity<=0m?1m:x.Quantity)*x.UnitAmount);
+            var invoiceSnapshotMatches=expectedInvoiceLines.Length==storedInvoiceLines.Count&&expectedInvoiceLines.All(expected=>
+            {
+                var stored=storedInvoiceLines.FirstOrDefault(x=>x.LineIndex==expected.LineIndex);var quantity=expected.Quantity<=0m?1m:expected.Quantity;var amount=expected.Amount!=0m?expected.Amount:quantity*expected.UnitPrice;
+                return stored!=null&&Math.Abs((stored.Quantity<=0m?1m:stored.Quantity)-quantity)<0.0001m&&Math.Abs(stored.UnitAmount*quantity-amount)<0.01m;
+            });
+            if(!invoiceSnapshotMatches||Math.Abs(storedInvoiceTotal-expectedInvoiceTotal)>0.01m)
+            {
+                var expectedDetail=string.Join("; ",expectedInvoiceLines.Select(x=>$"#{x.LineIndex} {x.Description}: {(x.Quantity<=0m?1m:x.Quantity):0.####} x {(x.Amount!=0m?x.Amount/(x.Quantity<=0m?1m:x.Quantity):x.UnitPrice):0.00}"));
+                var storedDetail=string.Join("; ",storedInvoiceLines.Select(x=>$"#{x.LineIndex} {x.Description}: {(x.Quantity<=0m?1m:x.Quantity):0.####} x {x.UnitAmount:0.00}"));
+                return Results.Conflict(new{success=false,status="invoice_snapshot_mismatch",message=$"THREED invoice sync verification failed. THREED: {expectedInvoiceLines.Length} lines totaling {expectedInvoiceTotal:0.00}. Railway: {storedInvoiceLines.Count} lines totaling {storedInvoiceTotal:0.00}. THREED lines: {expectedDetail}. Railway lines: {storedDetail}. No provider action was started."});
+            }
             await JobChangeSupport.ApplyAsync(conn, jobId, tenantId, changePreparation);
+            await AutoMateApi.JobLifecycleSupport.EnsureAsync(conn,context.RequestAborted);
+            await using(var ignored=new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.job_threed_snapshot_decisions WHERE tenant_id=@tenant AND job_id=@job AND threed_fingerprint=@fingerprint AND decision='keep_automate')",conn))
+            {ignored.Parameters.AddWithValue("tenant",tenantId);ignored.Parameters.AddWithValue("job",jobId);ignored.Parameters.AddWithValue("fingerprint",changePreparation.Fingerprint);if(Convert.ToBoolean(await ignored.ExecuteScalarAsync(context.RequestAborted)))await using(var clearIgnored=new NpgsqlCommand("UPDATE public.jobs_staging SET change_review_pending=false,pending_change_json=NULL,pending_change_fingerprint=NULL,pending_change_reasons=NULL,change_detected_at=NULL WHERE tenant_id::text=@tenant AND job_id=@job",conn)){clearIgnored.Parameters.AddWithValue("tenant",tenantId.ToString("D"));clearIgnored.Parameters.AddWithValue("job",jobId);await clearIgnored.ExecuteNonQueryAsync(context.RequestAborted);}}
+            bool pendingLiveChange=false;string automateStatus="Unscheduled";
+            await using(var pendingCommand=new NpgsqlCommand("SELECT change_review_pending,automate_status FROM public.jobs_staging WHERE job_id=@job",conn))
+            {
+                pendingCommand.Parameters.AddWithValue("job",jobId);await using var pendingReader=await pendingCommand.ExecuteReaderAsync(context.RequestAborted);
+                if(await pendingReader.ReadAsync(context.RequestAborted)){pendingLiveChange=pendingReader.GetBoolean(0);automateStatus=pendingReader.GetString(1);}
+            }
+            if(pendingLiveChange&&automateStatus==AutoMateApi.JobLifecycleSupport.Scheduled)
+            {
+                await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn,context.RequestAborted);
+                await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(conn,context.RequestAborted);
+                bool termsRequired=false,termsSigned=false,invoiceRequired=true,calendarRequired=true;string xeroStatus="";Guid? templateId=null;int? templateVersion=null;string? calendarId=null;
+                await using(var stateCommand=new NpgsqlCommand("""
+                    SELECT j.terms_required,j.terms_signed,j.invoice_required,COALESCE(j.xero_invoice_status,''),j.calendar_required,
+                           s.template_id,t.template_version,
+                           (SELECT e.calendar_id FROM public.job_calendar_evidence e WHERE e.tenant_id=@tenant AND e.job_id=j.job_id AND e.provider='google' AND e.event_status='active' ORDER BY e.last_observed_at DESC LIMIT 1)
+                    FROM public.jobs_staging j
+                    LEFT JOIN public.basic_automation_settings s ON s.tenant_id=@tenant AND s.event_key='scheduling' AND s.recipient_key='contact_1'
+                    LEFT JOIN public.email_templates t ON t.tenant_id=@tenant AND t.template_id=s.template_id AND t.archived_at IS NULL
+                    WHERE j.job_id=@job
+                    """,conn))
+                {
+                    stateCommand.Parameters.AddWithValue("tenant",tenantId);stateCommand.Parameters.AddWithValue("job",jobId);
+                    await using var stateReader=await stateCommand.ExecuteReaderAsync(context.RequestAborted);
+                    if(await stateReader.ReadAsync(context.RequestAborted))
+                    {
+                        termsRequired=stateReader.GetBoolean(0);termsSigned=stateReader.GetBoolean(1);invoiceRequired=stateReader.GetBoolean(2);xeroStatus=stateReader.GetString(3);calendarRequired=stateReader.GetBoolean(4);
+                        templateId=stateReader.IsDBNull(5)?null:stateReader.GetGuid(5);templateVersion=stateReader.IsDBNull(6)?null:stateReader.GetInt32(6);calendarId=stateReader.IsDBNull(7)?null:stateReader.GetString(7);
+                    }
+                }
+                var sourceChanges=JsonSerializer.Deserialize<List<JobFieldChange>>(changePreparation.ChangesJson,new JsonSerializerOptions{PropertyNameCaseInsensitive=true})??[];
+                var providerState=new AutoMateApi.BasicChangeProviderState(termsRequired,termsSigned,invoiceRequired,string.IsNullOrWhiteSpace(xeroStatus)||string.Equals(xeroStatus,"DRAFT",StringComparison.OrdinalIgnoreCase),calendarRequired);
+                var classifiedChanges=sourceChanges.Select(item=>new AutoMateApi.BasicSourceFieldChange(item.field,item.category,item.oldValue,item.newValue)).ToArray();
+                var classification=AutoMateApi.BasicChangeClassifier.Classify(classifiedChanges,providerState);
+                if(classification.Categories.Contains(AutoMateApi.BasicChangeCategory.PrimaryService)&&termsRequired&&!termsSigned)
+                {
+                    var replacementGate=await AutoMateApi.TenantAgreementPolicySupport.ReplaceUnsignedPlanForServiceChangeAsync(conn,tenantId,jobId,$"THREED sync {inspectorId:D}",context.RequestAborted);
+                    if(!replacementGate.Allowed)return Results.Conflict(new{success=false,status=replacementGate.Status,message=replacementGate.Message,agreementGate=replacementGate});
+                    termsRequired=replacementGate.AgreementCount>0;
+                    providerState=providerState with{TermsRequired=termsRequired};
+                    classification=AutoMateApi.BasicChangeClassifier.Classify(classifiedChanges,providerState);
+                }
+                var agreementPlan=await AutoMateApi.TenantAgreementPolicySupport.LoadJobPlanAsync(conn,tenantId,jobId,context.RequestAborted);
+                var preparation=new AutoMateApi.BasicChangeRunPreparation(
+                    tenantId,jobId,changePreparation.Fingerprint,changePreparation.ApprovedVersion+1,
+                    classifiedChanges,providerState,
+                    new AutoMateApi.BasicChangeConfigReferences(changePreparation.ApprovedVersion+1,templateId,templateVersion,agreementPlan?.PlanId,agreementPlan?.PlanVersion,$"xero-company-settings:{tenantId:N}",calendarId,$"inspector-calendar-mapping:{inspectorId:N}:{calendarId}",$"local-company-smtp:{tenantId:N}"));
+                basicChangeRunId=await AutoMateApi.BasicChangeRunSupport.PrepareAsync(conn,preparation,context.RequestAborted);
+                jobChangeReviewPending=true;
+                if(classification.Actions.Any(action=>action.ActionKey=="booking_email"&&action.Automatic))
+                {
+                    await using var reopenEmail=new NpgsqlCommand("UPDATE public.jobs_staging SET booking_email_sent=false,booking_email_sent_at=NULL,booking_email_retry_requested=false,booking_email_last_error=NULL WHERE job_id=@job AND tenant_id::text=@tenant",conn);
+                    reopenEmail.Parameters.AddWithValue("job",jobId);reopenEmail.Parameters.AddWithValue("tenant",tenantId.ToString());await reopenEmail.ExecuteNonQueryAsync(context.RequestAborted);
+                }
+            }
+            if(pendingLiveChange)
+            {
+                await AutoMateApi.JobReconciliationSupport.AcceptCurrentAsync(conn,tenantId,jobId,changePreparation.Fingerprint,"AutoMate live THREED sync",context.RequestAborted);
+                jobChangeReviewPending=false;
+            }
+        }
+
+        await AutoMateApi.BasicChangeRunSupport.EnsureAsync(conn,context.RequestAborted);
+        await AutoMateApi.AuthoritativeAttentionSupport.ReconcileAsync(conn,tenantId,context.RequestAborted);
+        await using(var clearMissing=new NpgsqlCommand("DELETE FROM public.basic_source_missing_observations WHERE tenant_id=@tenant AND job_id=@job",conn))
+        {
+            clearMissing.Parameters.AddWithValue("tenant",tenantId);
+            clearMissing.Parameters.AddWithValue("job",jobId);
+            await clearMissing.ExecuteNonQueryAsync(context.RequestAborted);
         }
 
         return Results.Ok(new
@@ -7341,8 +8739,9 @@ WHERE job_id=@job_id", conn);
             jobId = payload.Job.JobId,
             tenantId = payload.TenantId,
             inspectorId = payload.Job.InspectorId,
-            changeReviewPending = changePreparation?.Pending ?? false,
+            changeReviewPending = jobChangeReviewPending,
             changeReasons = changePreparation?.Reasons ?? "",
+            basicChangeRunId,
             currentSnapshotFingerprint = changePreparation?.Fingerprint ?? "",
             mapping = new
             {
@@ -7352,7 +8751,16 @@ WHERE job_id=@job_id", conn);
                 profileVersion = canonicalResolution.Parse.Envelope?.ProfileVersion ?? 0,
                 profileFingerprint = canonicalResolution.Parse.Envelope?.ProfileFingerprint ?? "",
                 attention = CanonicalSyncResolver.AttentionReason(canonicalResolution.Gate)
-            }
+            },
+            serviceCatalogue = new
+            {
+                version = serviceCatalogueResolution.Version,
+                serviceCatalogueResolution.Status,
+                serviceCatalogueResolution.ReviewRequired,
+                serviceCatalogueResolution.ServiceCount,
+                serviceCatalogueResolution.ModifierCount
+            },
+            agreementPlan = initialAgreementGate
         });
     }
     catch (PostgresException pgEx)
@@ -7386,10 +8794,13 @@ app.MapGet("/automation/foundation", async (HttpContext context, Guid tenantId) 
         await EnsureEmailTemplatesTableAsync(conn);
         await EnsureAdvancedActionsTablesAsync(conn);
         await AutomationFoundationSupport.EnsureAsync(conn);
+        await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);
         var owner = await RequireAutomationOwnerAsync(context, conn, tenantId);
         if (!owner.Allowed) return owner.Error!;
         var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, tenantId);
         var mode = await AutomationFoundationSupport.GetActivationModeAsync(conn, tenantId);
+        var advancedMode = await AutoMateApi.AdvancedWorkflowSupport.LoadModeAsync(conn,tenantId,context.RequestAborted);
+        var missingRequiredEvents = await AutoMateApi.AdvancedWorkflowSupport.MissingRequiredEventsAsync(conn,tenantId,context.RequestAborted);
         return Results.Ok(new
         {
             success = true,
@@ -7403,11 +8814,61 @@ app.MapGet("/automation/foundation", async (HttpContext context, Guid tenantId) 
                 outgoingWebhooks = entitlement.OutgoingWebhooks
             },
             activationMode = mode,
-            basicExecutionActive = mode != "all_jobs",
-            customerFacingExecutionEnabled = false
+            engineMode = advancedMode.Mode,
+            engineSettingsVersion = advancedMode.Version,
+            advancedReady = missingRequiredEvents.Count == 0,
+            missingRequiredEvents,
+            basicExecutionActive = advancedMode.Mode == AutoMateApi.AdvancedWorkflowSupport.Basic,
+            customerFacingExecutionEnabled = bool.TryParse(builder.Configuration["ADVANCED_WORKFLOW_EXECUTION_ENABLED"],out var advancedExecutionEnabled)&&advancedExecutionEnabled
         });
     }
     catch (Exception ex) { return Results.Problem(title: "Load automation foundation failed", detail: ex.Message, statusCode: 500); }
+});
+
+app.MapGet("/automation/basic/scheduling-mode", async (HttpContext context, Guid tenantId) =>
+{
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        await AutomationFoundationSupport.EnsureAsync(conn);var owner=await RequireAutomationOwnerAsync(context,conn,tenantId);if(!owner.Allowed)return owner.Error!;
+        var mode=await AutoMateApi.BasicSchedulingModeSupport.LoadAsync(conn,tenantId,context.RequestAborted);
+        return Results.Ok(new{success=true,mode,automatic=mode==AutoMateApi.BasicSchedulingModeSupport.Automatic});
+    }
+    catch(Exception ex){return Results.Problem(title:"Load Basic scheduling mode failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/basic/scheduling-mode", async (HttpContext context, BasicSchedulingModeRequest request) =>
+{
+    if(request.TenantId==Guid.Empty)return Results.BadRequest(new{success=false,message="TenantId is required."});
+    if(!request.Confirmed)return Results.Json(new{success=false,status="confirmation_required",message="Confirm the scheduling mode change."},statusCode:409);
+    if(string.Equals(request.Mode,"automatic",StringComparison.OrdinalIgnoreCase)&&!request.AutomaticDataWarningConfirmed)
+        return Results.Json(new{success=false,status="automatic_warning_required",message="Confirm that THREED job data will be used automatically."},statusCode:409);
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();
+        await AutomationFoundationSupport.EnsureAsync(conn);var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var mode=await AutoMateApi.BasicSchedulingModeSupport.SaveAsync(conn,request.TenantId,request.Mode,actor,context.RequestAborted);
+        return Results.Ok(new{success=true,mode,automatic=mode==AutoMateApi.BasicSchedulingModeSupport.Automatic});
+    }
+    catch(Exception ex){return Results.Problem(title:"Save Basic scheduling mode failed",detail:ex.Message,statusCode:500);}
+});
+
+app.MapPut("/automation/advanced/mode",async(HttpContext context,AdvancedWorkflowModeRequest request)=>
+{
+    if(request.TenantId==Guid.Empty||!request.Confirmed)return Results.BadRequest(new{success=false,status="confirmation_required",message="Confirm the Advanced Workflows mode change."});
+    if(string.Equals(request.Mode,AutoMateApi.AdvancedWorkflowSupport.Advanced,StringComparison.OrdinalIgnoreCase)&&(!bool.TryParse(builder.Configuration["ADVANCED_WORKFLOW_EXECUTION_ENABLED"],out var advancedExecutionEnabled)||!advancedExecutionEnabled))return Results.Json(new{success=false,status="advanced_execution_acceptance_required",message="The Advanced Workflow builder is ready, but activation remains locked until its action dispatcher completes controlled acceptance. Basic Automations remain active."},statusCode:409);
+    try
+    {
+        await using var conn=new NpgsqlConnection(connectionString);await conn.OpenAsync();await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);
+        var owner=await RequireAutomationOwnerAsync(context,conn,request.TenantId);if(!owner.Allowed)return owner.Error!;
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        var saved=await AutoMateApi.AdvancedWorkflowSupport.SaveModeAsync(conn,request.TenantId,request.Mode,request.ExpectedVersion,actor,context.RequestAborted);
+        return Results.Ok(new{success=true,engineMode=saved.Mode,engineSettingsVersion=saved.Version,message=saved.Mode==AutoMateApi.AdvancedWorkflowSupport.Advanced?"Advanced Workflows will apply only to jobs first scheduled after this switch. Existing job engine assignments were not changed.":"Basic Automations will apply only to jobs first scheduled after this switch. Existing job engine assignments were not changed."});
+    }
+    catch(AutoMateApi.AdvancedWorkflowReadinessException ex){return Results.Json(new{success=false,status="advanced_workflows_incomplete",message="Build, validate and enable all required workflows before enabling Advanced Workflows.",missingRequiredEvents=ex.MissingEvents},statusCode:409);}
+    catch(InvalidOperationException ex){return Results.Json(new{success=false,status="version_conflict",message=ex.Message},statusCode:409);}
+    catch(Exception ex){return Results.Problem(title:"Save Advanced Workflows mode failed",detail:ex.Message,statusCode:500);}
 });
 
 app.MapPut("/automation/foundation/activation", async (HttpContext context, AutomationActivationRequest request) =>
@@ -7518,11 +8979,11 @@ app.MapPost("/actions/ensure-tables", async () =>
 
 app.MapGet("/actions/catalog", () => Results.Ok(new
 {
-    events = new[] { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" },
-    fields = new[] { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories" },
-    operators = new[] { "includes", "does_not_include" },
-    actions = new[] { "send_email", "send_webhook", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" },
-    modes = new[] { "disabled", "review" }
+    events = new[] { "inspection_scheduled", "inspection_rescheduled", "inspection_unscheduled", "inspection_cancelled", "pre_inspection_due", "price_changed", "service_changed", "report_review_ready", "report_publishing" },
+    fields = new[] { "lifecycle", "status", "primary_service", "all_services", "service_category_ids", "service_ids", "modifier_group_ids", "modifier_values", "invoice_reconciliation", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories", "agreement_status", "payment_status", "report_status" },
+    operators = new[] { "has", "does_not_have", "equals", "not_equals", "greater_than", "less_than" },
+    actions = new[] { "send_email", "send_webhook", "upsert_calendar", "create_xero_draft", "send_agreement", "queue_report_communication", "set_workflow_state" },
+    modes = new[] { "disabled", "enabled" }
 }));
 
 app.MapGet("/actions/rules", async (HttpContext context, Guid tenantId) =>
@@ -7532,24 +8993,26 @@ app.MapGet("/actions/rules", async (HttpContext context, Guid tenantId) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureAdvancedActionsTablesAsync(conn);
+        await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);
         await EnsureEmailTemplatesTableAsync(conn);
         await AutomationFoundationSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, tenantId);
         if (!owner.Allowed) return owner.Error!;
         const string sql = @"
-SELECT rule_id, tenant_id, name, event_key, mode, enabled, conditions_json, actions_json, created_at, updated_at
-FROM public.automation_rules
-WHERE tenant_id = @tenantId
-ORDER BY updated_at DESC, name;";
+SELECT v.workflow_id,v.tenant_id,v.version,v.name,v.event_key,v.enabled,v.workflow_conditions_json,v.actions_json,v.validated_at,v.created_at,c.updated_at
+FROM public.advanced_workflow_current c
+JOIN public.advanced_workflow_versions v ON v.workflow_id=c.workflow_id AND v.version=c.current_version
+WHERE c.tenant_id=@tenantId
+ORDER BY c.updated_at DESC,v.name;";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("tenantId", tenantId);
         await using var reader = await cmd.ExecuteReaderAsync();
         var rules = new List<object>();
         while (await reader.ReadAsync())
         {
-            var loadWarning = ""; List<AutomationCondition> loadedConditions; List<AutomationActionDefinition> loadedActions;
-            try { loadedConditions = JsonSerializer.Deserialize<List<AutomationCondition>>(reader.GetString(6)) ?? new(); }
-            catch (Exception ex) { loadedConditions = new(); loadWarning = "Conditions could not be read: " + ex.Message; }
+            var loadWarning = ""; List<AutomationConditionGroup> loadedGroups; List<AutomationActionDefinition> loadedActions;
+            try { loadedGroups = JsonSerializer.Deserialize<List<AutomationConditionGroup>>(reader.GetString(6)) ?? new(); }
+            catch (Exception ex) { loadedGroups = new(); loadWarning = "Conditions could not be read: " + ex.Message; }
             try { loadedActions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(7)) ?? new(); }
             catch (Exception ex) { loadedActions = new(); loadWarning = (loadWarning + " Actions could not be read: " + ex.Message).Trim(); }
             foreach (var loadedAction in loadedActions)
@@ -7557,11 +9020,11 @@ ORDER BY updated_at DESC, name;";
                     loadedAction.Settings["headers"] = AutomationSecretProtector.Unprotect(protectedHeaders, builder.Configuration["AUTOMATE_AUTOMATION_SECRET_KEY"]);
             rules.Add(new
             {
-                ruleId = reader.GetGuid(0), tenantId = reader.GetGuid(1), name = reader.GetString(2),
-                eventKey = reader.GetString(3), mode = reader.GetString(4), enabled = reader.GetBoolean(5),
-                conditions = loadedConditions,
+                ruleId = reader.GetGuid(0), tenantId = reader.GetGuid(1), version=reader.GetInt32(2),name = reader.GetString(3),
+                eventKey = reader.GetString(4), mode = reader.GetBoolean(5)?"enabled":"disabled", enabled = reader.GetBoolean(5),
+                conditionGroups = loadedGroups,
                 actions = loadedActions,
-                createdAt = reader.GetDateTime(8), updatedAt = reader.GetDateTime(9), loadWarning
+                validatedAt = reader.IsDBNull(8)?(DateTime?)null:reader.GetDateTime(8),createdAt = reader.GetDateTime(9), updatedAt = reader.GetDateTime(10), loadWarning
             });
         }
         return Results.Ok(rules);
@@ -7574,6 +9037,8 @@ ORDER BY updated_at DESC, name;";
 
 app.MapPost("/actions/rules", async (HttpContext context, AutomationRuleSaveRequest request) =>
 {
+    if (!request.Confirmed)
+        return Results.BadRequest(new { success = false, message = "Explicit confirmation is required." });
     var validation = ValidateAutomationRule(request);
     if (validation.Count > 0)
         return Results.BadRequest(new { success = false, errors = validation });
@@ -7585,6 +9050,7 @@ app.MapPost("/actions/rules", async (HttpContext context, AutomationRuleSaveRequ
         await EnsureAdvancedActionsTablesAsync(conn);
         await EnsureEmailTemplatesTableAsync(conn);
         await AutomationFoundationSupport.EnsureAsync(conn);
+        await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);
         var owner = await RequireAutomationOwnerAsync(context, conn, request.TenantId);
         if (!owner.Allowed) return owner.Error!;
         var entitlement = await AutomationFoundationSupport.LoadEntitlementAsync(conn, request.TenantId);
@@ -7594,30 +9060,9 @@ app.MapPost("/actions/rules", async (HttpContext context, AutomationRuleSaveRequ
         foreach (var action in request.Actions)
             if (NormalizeAutomationKey(action.ActionKey) == "send_webhook" && action.Settings.TryGetValue("headers", out var webhookHeaders) && !string.IsNullOrWhiteSpace(webhookHeaders))
                 action.Settings["headers"] = AutomationSecretProtector.Protect(webhookHeaders, builder.Configuration["AUTOMATE_AUTOMATION_SECRET_KEY"]);
-        const string sql = @"
-INSERT INTO public.automation_rules
-    (rule_id, tenant_id, name, event_key, mode, enabled, conditions_json, actions_json, created_at, updated_at)
-VALUES
-    (@ruleId, @tenantId, @name, @eventKey, @mode, @enabled, CAST(@conditions AS jsonb), CAST(@actions AS jsonb), NOW(), NOW())
-ON CONFLICT (rule_id) DO UPDATE SET
-    name = EXCLUDED.name, event_key = EXCLUDED.event_key, mode = EXCLUDED.mode,
-    enabled = EXCLUDED.enabled, conditions_json = EXCLUDED.conditions_json,
-    actions_json = EXCLUDED.actions_json, updated_at = NOW()
-WHERE public.automation_rules.tenant_id = EXCLUDED.tenant_id
-RETURNING rule_id, updated_at;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("ruleId", ruleId);
-        cmd.Parameters.AddWithValue("tenantId", request.TenantId);
-        cmd.Parameters.AddWithValue("name", request.Name.Trim());
-        cmd.Parameters.AddWithValue("eventKey", NormalizeAutomationKey(request.EventKey));
-        cmd.Parameters.AddWithValue("mode", request.Enabled ? "review" : "disabled");
-        cmd.Parameters.AddWithValue("enabled", request.Enabled);
-        cmd.Parameters.AddWithValue("conditions", JsonSerializer.Serialize(request.Conditions));
-        cmd.Parameters.AddWithValue("actions", JsonSerializer.Serialize(request.Actions));
-        await using var reader = await cmd.ExecuteReaderAsync();
-        if (!await reader.ReadAsync())
-            return Results.NotFound(new { success = false, message = "Rule was not found for this tenant." });
-        return Results.Ok(new { success = true, ruleId = reader.GetGuid(0), updatedAt = reader.GetDateTime(1), mode = request.Enabled ? "review" : "disabled" });
+        var actor=await LoadAuthenticatedAutomationActorAsync(conn,request.TenantId,GetAuthenticatedInspectorId(context));
+        ruleId=await AutoMateApi.AdvancedWorkflowSupport.SaveVersionAsync(conn,request.TenantId,ruleId,request.Name.Trim(),NormalizeAutomationKey(request.EventKey),request.Enabled,JsonSerializer.Serialize(request.ConditionGroups),JsonSerializer.Serialize(request.Actions),actor,context.RequestAborted);
+        return Results.Ok(new { success = true, ruleId, mode=request.Enabled?"enabled":"disabled",enabled=request.Enabled,validated=true,sideEffectsExecuted = false });
     }
     catch (Exception ex)
     {
@@ -7629,9 +9074,9 @@ app.MapDelete("/actions/rules/{ruleId}", async (HttpContext context, Guid ruleId
 {
     try
     {
-        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureAdvancedActionsTablesAsync(conn); await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
+        await using var conn = new NpgsqlConnection(connectionString); await conn.OpenAsync(); await EnsureAdvancedActionsTablesAsync(conn); await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn,context.RequestAborted);await EnsureEmailTemplatesTableAsync(conn); await AutomationFoundationSupport.EnsureAsync(conn);
         var owner = await RequireAutomationOwnerAsync(context, conn, tenantId); if (!owner.Allowed) return owner.Error!;
-        await using var cmd = new NpgsqlCommand("DELETE FROM public.automation_rules WHERE rule_id=@rule AND tenant_id=@tenant", conn);
+        await using var cmd = new NpgsqlCommand("DELETE FROM public.advanced_workflow_current WHERE workflow_id=@rule AND tenant_id=@tenant", conn);
         cmd.Parameters.AddWithValue("rule", ruleId); cmd.Parameters.AddWithValue("tenant", tenantId);
         int rows = await cmd.ExecuteNonQueryAsync();
         return rows == 0 ? Results.NotFound(new { success = false, message = "Workflow action was not found for this company." }) : Results.Ok(new { success = true });
@@ -7639,28 +9084,26 @@ app.MapDelete("/actions/rules/{ruleId}", async (HttpContext context, Guid ruleId
     catch (Exception ex) { return Results.Problem(title: "Delete workflow action failed", detail: ex.Message, statusCode: 500); }
 });
 
-app.MapPost("/actions/rules/preview", (AutomationRulePreviewRequest request) =>
+app.MapPost("/actions/rules/preview", async (HttpContext context, AutomationRulePreviewRequest request) =>
 {
+    await using var conn = new NpgsqlConnection(connectionString);
+    await conn.OpenAsync();
+    await EnsureEmailTemplatesTableAsync(conn);
+    await AutomationFoundationSupport.EnsureAsync(conn);
+    var owner = await RequireAutomationOwnerAsync(context, conn, request.Rule.TenantId);
+    if (!owner.Allowed) return owner.Error!;
     var validation = ValidateAutomationRule(request.Rule);
     if (validation.Count > 0)
         return Results.BadRequest(new { success = false, errors = validation });
 
-    var evaluations = request.Rule.Conditions.Select(condition =>
-    {
-        request.Fields.TryGetValue(condition.FieldKey ?? "", out var actual);
-        actual ??= "";
-        var expected = condition.Value ?? "";
-        bool contains = actual.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0;
-        bool matched = NormalizeAutomationKey(condition.Operator) == "includes" ? contains : !contains;
-        return new { fieldKey = condition.FieldKey, condition.Operator, expected, actual, matched };
-    }).ToList();
-    bool ruleMatched = evaluations.All(item => item.matched);
+    var evaluations = EvaluateAutomationConditionGroups(request.Rule.ConditionGroups, request.Fields);
+    bool ruleMatched = evaluations.Count==0||evaluations.Any(group=>group.Matched);
     return Results.Ok(new
     {
         success = true,
         matched = ruleMatched,
         sideEffectsExecuted = false,
-        conditions = evaluations,
+        conditionGroups = evaluations,
         proposedActions = ruleMatched ? request.Rule.Actions : new List<AutomationActionDefinition>(),
         message = ruleMatched ? "Rule matched. Actions require review before execution." : "Rule did not match this job."
     });
@@ -7669,7 +9112,7 @@ app.MapPost("/actions/rules/preview", (AutomationRulePreviewRequest request) =>
 app.MapPost("/actions/events", async (AutomationEventRequest request) =>
 {
     var eventKey = NormalizeAutomationKey(request.EventKey);
-    var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" };
+    var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "inspection_unscheduled", "inspection_cancelled", "pre_inspection_due", "price_changed", "service_changed", "report_review_ready", "report_publishing" };
     if (request.TenantId == Guid.Empty || !validEvents.Contains(eventKey) || string.IsNullOrWhiteSpace(request.IdempotencyKey))
         return Results.BadRequest(new { success = false, message = "TenantId, a supported EventKey, and IdempotencyKey are required." });
     try
@@ -7677,10 +9120,15 @@ app.MapPost("/actions/events", async (AutomationEventRequest request) =>
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureAdvancedActionsTablesAsync(conn);
+        await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(conn);
+        if(!request.JobId.HasValue)return Results.BadRequest(new{success=false,message="JobId is required for an Advanced Workflow event."});
+        var assignedEngine=await AutoMateApi.AdvancedWorkflowSupport.AssignAtFirstSchedulingAsync(conn,request.TenantId,request.JobId.Value);
+        if(assignedEngine!=AutoMateApi.AdvancedWorkflowSupport.Advanced)return Results.Ok(new{success=true,engine=assignedEngine,matchedRules=0,queuedForExecution=0,sideEffectsExecuted=false,message="This job is permanently assigned to Basic Automations."});
         const string loadSql = @"
-SELECT rule_id, name, conditions_json, actions_json
-FROM public.automation_rules
-WHERE tenant_id = @tenantId AND event_key = @eventKey AND enabled = true AND mode = 'review';";
+SELECT v.workflow_id,v.name,v.version,v.workflow_conditions_json,v.actions_json
+FROM public.advanced_workflow_current c
+JOIN public.advanced_workflow_versions v ON v.workflow_id=c.workflow_id AND v.version=c.current_version
+WHERE c.tenant_id=@tenantId AND v.event_key=@eventKey AND v.enabled=true AND v.validated_at IS NOT NULL;";
         await using var load = new NpgsqlCommand(loadSql, conn);
         load.Parameters.AddWithValue("tenantId", request.TenantId);
         load.Parameters.AddWithValue("eventKey", eventKey);
@@ -7688,11 +9136,11 @@ WHERE tenant_id = @tenantId AND event_key = @eventKey AND enabled = true AND mod
         var matches = new List<AutomationRuleMatch>();
         while (await reader.ReadAsync())
         {
-            var conditions = JsonSerializer.Deserialize<List<AutomationCondition>>(reader.GetString(2)) ?? new();
-            var actions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(3)) ?? new();
-            var evaluations = EvaluateAutomationConditions(conditions, request.Fields);
-            if (evaluations.All(item => item.Matched))
-                matches.Add(new AutomationRuleMatch(reader.GetGuid(0), reader.GetString(1), evaluations, actions));
+            var groups = JsonSerializer.Deserialize<List<AutomationConditionGroup>>(reader.GetString(3)) ?? new();
+            var actions = JsonSerializer.Deserialize<List<AutomationActionDefinition>>(reader.GetString(4)) ?? new();
+            var evaluations = EvaluateAutomationConditionGroups(groups, request.Fields);
+            if (evaluations.Count==0||evaluations.Any(item => item.Matched))
+                matches.Add(new AutomationRuleMatch(reader.GetGuid(0), reader.GetString(1),reader.GetInt32(2), evaluations, actions));
         }
         await reader.CloseAsync();
 
@@ -7700,22 +9148,31 @@ WHERE tenant_id = @tenantId AND event_key = @eventKey AND enabled = true AND mod
         foreach (var match in matches)
         {
             const string insertSql = @"
-INSERT INTO public.automation_rule_executions
-    (tenant_id, rule_id, job_id, event_key, event_idempotency_key, status, matched_conditions_json, proposed_actions_json, created_at, updated_at)
+INSERT INTO public.advanced_workflow_executions
+    (tenant_id,job_id,workflow_id,workflow_version,event_key,event_idempotency_key,field_snapshot_json,status,created_at,updated_at)
 VALUES
-    (@tenantId, @ruleId, @jobId, @eventKey, @idempotencyKey, 'awaiting_review', CAST(@conditions AS jsonb), CAST(@actions AS jsonb), NOW(), NOW())
-ON CONFLICT (tenant_id, rule_id, event_idempotency_key) DO NOTHING;";
+    (@tenantId,@jobId,@ruleId,@version,@eventKey,@idempotencyKey,CAST(@fields AS jsonb),'pending',NOW(),NOW())
+ON CONFLICT (tenant_id,workflow_id,event_idempotency_key) DO NOTHING
+RETURNING execution_id;";
             await using var insert = new NpgsqlCommand(insertSql, conn);
             insert.Parameters.AddWithValue("tenantId", request.TenantId);
             insert.Parameters.AddWithValue("ruleId", match.RuleId);
-            insert.Parameters.AddWithValue("jobId", request.JobId.HasValue ? request.JobId.Value : DBNull.Value);
+            insert.Parameters.AddWithValue("version",match.Version);
+            insert.Parameters.AddWithValue("jobId", request.JobId.Value);
             insert.Parameters.AddWithValue("eventKey", eventKey);
             insert.Parameters.AddWithValue("idempotencyKey", request.IdempotencyKey.Trim());
-            insert.Parameters.AddWithValue("conditions", JsonSerializer.Serialize(match.Conditions));
-            insert.Parameters.AddWithValue("actions", JsonSerializer.Serialize(match.Actions));
-            queued += await insert.ExecuteNonQueryAsync();
+            insert.Parameters.AddWithValue("fields", JsonSerializer.Serialize(request.Fields));
+            var executionId=await insert.ExecuteScalarAsync();if(executionId is Guid id)
+            {
+                for(var index=0;index<match.Actions.Count;index++)
+                {
+                    var action=match.Actions[index];var actionGroups=EvaluateAutomationConditionGroups(action.ConditionGroups,request.Fields);var actionStatus=actionGroups.Count==0||actionGroups.Any(value=>value.Matched)?"pending":"skipped";await using var actionInsert=new NpgsqlCommand("INSERT INTO public.advanced_workflow_action_executions(execution_id,action_index,action_key,action_snapshot_json,idempotency_key,status,completed_at) VALUES(@execution,@index,@key,CAST(@snapshot AS jsonb),@idempotency,@status,CASE WHEN @status='skipped' THEN NOW() ELSE NULL END) ON CONFLICT(execution_id,action_index) DO NOTHING",conn);
+                    actionInsert.Parameters.AddWithValue("execution",id);actionInsert.Parameters.AddWithValue("index",index);actionInsert.Parameters.AddWithValue("key",NormalizeAutomationKey(action.ActionKey));actionInsert.Parameters.AddWithValue("snapshot",JsonSerializer.Serialize(action));actionInsert.Parameters.AddWithValue("idempotency",$"advanced:{id:D}:{index}");actionInsert.Parameters.AddWithValue("status",actionStatus);await actionInsert.ExecuteNonQueryAsync();
+                }
+                queued++;
+            }
         }
-        return Results.Ok(new { success = true, matchedRules = matches.Count, queuedForReview = queued, duplicateMatchesSkipped = matches.Count - queued, sideEffectsExecuted = false });
+        return Results.Ok(new { success = true,engine="advanced",matchedRules = matches.Count, queuedForExecution = queued, duplicateMatchesSkipped = matches.Count - queued, sideEffectsExecuted = false,message="Matched workflow actions were frozen in the durable execution ledger. The dispatcher resumes them in order without replaying completed actions." });
     }
     catch (Exception ex)
     {
@@ -7723,13 +9180,17 @@ ON CONFLICT (tenant_id, rule_id, event_idempotency_key) DO NOTHING;";
     }
 });
 
-app.MapGet("/actions/review-queue", async (Guid tenantId) =>
+app.MapGet("/actions/review-queue", async (HttpContext context, Guid tenantId) =>
 {
     try
     {
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync();
         await EnsureAdvancedActionsTablesAsync(conn);
+        await EnsureEmailTemplatesTableAsync(conn);
+        await AutomationFoundationSupport.EnsureAsync(conn);
+        var owner = await RequireAutomationOwnerAsync(context, conn, tenantId);
+        if (!owner.Allowed) return owner.Error!;
         const string sql = @"
 SELECT e.execution_id, e.rule_id, r.name, e.job_id, e.event_key, e.status,
        e.matched_conditions_json, e.proposed_actions_json, e.last_error, e.created_at
@@ -7755,9 +9216,12 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
 {
     await startupMigrationConnection.OpenAsync();
     await EnsureOnlinePropertyTablesAsync(startupMigrationConnection);
+    await RepairMismatchedOnlinePropertyDataAsync(startupMigrationConnection);
     await JobChangeSupport.EnsureAsync(startupMigrationConnection);
     await JobChangeSupport.BackfillApprovedSnapshotsAsync(startupMigrationConnection);
     await JobChangeSupport.RepairPendingChangesAsync(startupMigrationConnection);
+    var adoptedInactiveBaselines=await JobChangeSupport.AdoptInactiveLiveBaselinesAsync(startupMigrationConnection,"AutoMate live-baseline migration");
+    if(adoptedInactiveBaselines>0)Console.WriteLine($"AutoMate live-baseline migration adopted {adoptedInactiveBaselines} inactive job snapshot(s); no provider or THREED action ran.");
     await EnsureEmailTemplatesTableAsync(startupMigrationConnection);
     await EnsureAdvancedActionsTablesAsync(startupMigrationConnection);
     await AutomationFoundationSupport.EnsureAsync(startupMigrationConnection);
@@ -7765,12 +9229,98 @@ await using (var startupMigrationConnection = new NpgsqlConnection(connectionStr
     await AutoMateApi.BasicTemplateCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicSettingCommandSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicTestExecutionSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.JobTrackingSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.AuthoritativeAttentionSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.JobImportPolicySupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.SharePointArchiveSupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.BasicProductionSchedulingSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.BasicChangeRunSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.TenantAgreementPolicySupport.EnsureAsync(startupMigrationConnection);
     await AutoMateApi.ClientEngagementSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.QuoteWorkflowSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.ProviderIntegrationSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.GoogleDriveArchiveSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.AgreementProviderSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.MicrosoftCalendarSupport.EnsureAsync(startupMigrationConnection);
+    await AutoMateApi.AdvancedWorkflowSupport.EnsureAsync(startupMigrationConnection);
+    await EnsureTenantCompanyBrandingAsync(startupMigrationConnection);
     await EnsureBasicJobProfileColumnsAsync(startupMigrationConnection);
 }
 
 app.Run();
+
+static string ProviderCallbackHtml(string title,string detail)=>"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"+WebUtility.HtmlEncode(title)+"</title></head><body style=\"font:16px/1.5 Segoe UI,Arial,sans-serif;background:#f5f7f9;color:#17212b;margin:0\"><main style=\"max-width:640px;margin:10vh auto;padding:28px\"><section style=\"background:white;border:1px solid #dbe4e8;border-radius:14px;padding:28px\"><h1 style=\"font-size:24px\">"+WebUtility.HtmlEncode(title)+"</h1><p>"+detail+"</p><p>You can close this window and return to AutoMate.</p></section></main></body></html>";
+
+static async Task<GoogleDriveRoot> EnsureGoogleDriveRootAsync(HttpClient client,CancellationToken ct)
+{
+    const string name="AutoMate Reports";var q="name = 'AutoMate Reports' and mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+    using(var search=await client.GetAsync("https://www.googleapis.com/drive/v3/files?q="+Uri.EscapeDataString(q)+"&spaces=drive&fields=files(id,name,webViewLink,createdTime)&orderBy=createdTime&pageSize=20",ct))
+    {
+        var json=await search.Content.ReadAsStringAsync(ct);if(!search.IsSuccessStatusCode)throw new InvalidOperationException("Google Drive could not search for the AutoMate Reports folder.");
+        using var document=JsonDocument.Parse(json);if(document.RootElement.TryGetProperty("files",out var files)&&files.ValueKind==JsonValueKind.Array)foreach(var file in files.EnumerateArray()){var id=GetJsonString(file,"id");if(id.Length>0)return new(id,GetJsonString(file,"name"),GetJsonString(file,"webViewLink"));}
+    }
+    using var create=await client.PostAsJsonAsync("https://www.googleapis.com/drive/v3/files?fields=id,name,webViewLink",new{name,mimeType="application/vnd.google-apps.folder"},ct);var createJson=await create.Content.ReadAsStringAsync(ct);if(!create.IsSuccessStatusCode)throw new InvalidOperationException("Google Drive could not create the AutoMate Reports folder.");using var created=JsonDocument.Parse(createJson);var root=created.RootElement;var rootId=GetJsonString(root,"id");if(rootId.Length==0)throw new InvalidOperationException("Google Drive created the folder without returning its ID.");return new(rootId,GetJsonString(root,"name"),GetJsonString(root,"webViewLink"));
+}
+
+static async Task<GoogleDriveAccessResult> GetGoogleDriveAccountAsync(NpgsqlConnection connection,Guid tenantId,Microsoft.Extensions.Configuration.IConfiguration configuration,CancellationToken ct)
+{
+    var secret=configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]??"";if(!AutoMateApi.ProviderIntegrationSupport.IsRealValue(secret))return new(false,"","Provider encryption is not configured. Add AUTOMATE_INTEGRATION_SECRET_KEY in Railway.");
+    AutoMateApi.ProviderAccount? account;try{account=await AutoMateApi.ProviderIntegrationSupport.LoadAccountAsync(connection,tenantId,"google_drive",secret,ct);}catch(Exception ex){return new(false,"",ex.Message);}
+    if(account is null||!string.Equals(account.Status,"connected",StringComparison.OrdinalIgnoreCase))return new(false,"","Google Drive is not connected for this company.");
+    if(!string.IsNullOrWhiteSpace(account.AccessToken)&&(!account.ExpiresAt.HasValue||account.ExpiresAt.Value>DateTime.UtcNow.AddMinutes(2)))return new(true,account.AccessToken,"");
+    if(string.IsNullOrWhiteSpace(account.RefreshToken))return new(false,"","Google Drive access expired and no refresh token is available. Reconnect Google Drive.");
+    if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(configuration,"GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET"))return new(false,"","Google Drive provider values are incomplete in Railway.");
+    using var client=new HttpClient();using var response=await client.PostAsync("https://oauth2.googleapis.com/token",new FormUrlEncodedContent(new Dictionary<string,string>{{"client_id",configuration["GOOGLE_DRIVE_CLIENT_ID"]!},{"client_secret",configuration["GOOGLE_DRIVE_CLIENT_SECRET"]!},{"refresh_token",account.RefreshToken},{"grant_type","refresh_token"}}),ct);var json=await response.Content.ReadAsStringAsync(ct);if(!response.IsSuccessStatusCode)return new(false,"","Google Drive access could not be refreshed. Reconnect Google Drive.");using var document=JsonDocument.Parse(json);var access=GetJsonString(document.RootElement,"access_token");var refresh=GetJsonString(document.RootElement,"refresh_token");var expiresIn=document.RootElement.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;if(string.IsNullOrWhiteSpace(access))return new(false,"","Google Drive refresh did not return an access token.");await AutoMateApi.ProviderIntegrationSupport.UpdateTokensAsync(connection,tenantId,"google_drive",access,refresh,DateTime.UtcNow.AddSeconds(expiresIn),secret,ct);return new(true,access,"");
+}
+
+static string DocuSignAuthBase(Microsoft.Extensions.Configuration.IConfiguration configuration)=>string.Equals(configuration["DOCUSIGN_ENVIRONMENT"],"production",StringComparison.OrdinalIgnoreCase)?"https://account.docusign.com":"https://account-d.docusign.com";
+
+static async Task<IReadOnlyList<string>> LoadDocuSignSignerRolesAsync(HttpClient client,string apiBase,string accountId,string templateId,CancellationToken ct)
+{
+    using var response=await client.GetAsync(apiBase.TrimEnd('/')+"/restapi/v2.1/accounts/"+Uri.EscapeDataString(accountId)+"/templates/"+Uri.EscapeDataString(templateId)+"/recipients",ct);if(!response.IsSuccessStatusCode)return new[]{"Signer 1"};
+    using var document=JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));var roles=new List<string>();foreach(var collection in new[]{"signers","agents","editors","certifiedDeliveries","inPersonSigners"})if(document.RootElement.TryGetProperty(collection,out var rows)&&rows.ValueKind==JsonValueKind.Array)foreach(var row in rows.EnumerateArray()){var role=FirstNonEmptyJsonString(row,"roleName","name");if(role.Length>0&&!roles.Contains(role,StringComparer.OrdinalIgnoreCase))roles.Add(role);}return roles.Count>0?roles:new[]{"Signer 1"};
+}
+
+static async Task<AgreementProviderAccessResult> GetAgreementProviderAccountAsync(NpgsqlConnection connection,Guid tenantId,string provider,Microsoft.Extensions.Configuration.IConfiguration configuration,CancellationToken ct)
+{
+    provider=AutoMateApi.AgreementProviderSupport.NormalizeProvider(provider);var secret=configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]??"";if(!AutoMateApi.ProviderIntegrationSupport.IsRealValue(secret))return new(false,"","","","Provider encryption is not configured.");AutoMateApi.ProviderAccount? account;try{account=await AutoMateApi.ProviderIntegrationSupport.LoadAccountAsync(connection,tenantId,provider,secret,ct);}catch(Exception ex){return new(false,"","","",ex.Message);}if(account is null||account.Status!="connected")return new(false,"","","",(provider=="adobe_sign"?"Adobe Acrobat Sign":"DocuSign")+" is not connected for this company.");if(!account.ExpiresAt.HasValue||account.ExpiresAt.Value>DateTime.UtcNow.AddMinutes(2))return new(true,account.AccessToken,account.ApiBaseUri,account.ExternalAccountId,"");if(string.IsNullOrWhiteSpace(account.RefreshToken))return new(false,"","","","Provider access expired. Reconnect the account.");
+    using var client=new HttpClient();HttpResponseMessage response;if(provider=="docusign")
+    {
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(configuration,"DOCUSIGN_CLIENT_ID","DOCUSIGN_CLIENT_SECRET"))return new(false,"","","","DocuSign provider values are incomplete.");client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Basic",Convert.ToBase64String(Encoding.UTF8.GetBytes(configuration["DOCUSIGN_CLIENT_ID"]+":"+configuration["DOCUSIGN_CLIENT_SECRET"])));response=await client.PostAsync(DocuSignAuthBase(configuration)+"/oauth/token",new FormUrlEncodedContent(new Dictionary<string,string>{{"grant_type","refresh_token"},{"refresh_token",account.RefreshToken}}),ct);
+    }
+    else
+    {
+        if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(configuration,"ADOBE_SIGN_CLIENT_ID","ADOBE_SIGN_CLIENT_SECRET"))return new(false,"","","","Adobe Acrobat Sign provider values are incomplete.");response=await client.PostAsync(account.ApiBaseUri.TrimEnd('/')+"/oauth/v2/refresh",new FormUrlEncodedContent(new Dictionary<string,string>{{"grant_type","refresh_token"},{"refresh_token",account.RefreshToken},{"client_id",configuration["ADOBE_SIGN_CLIENT_ID"]!},{"client_secret",configuration["ADOBE_SIGN_CLIENT_SECRET"]!}}),ct);
+    }
+    using(response){var json=await response.Content.ReadAsStringAsync(ct);if(!response.IsSuccessStatusCode)return new(false,"","","","Provider access could not be refreshed. Reconnect the account.");using var document=JsonDocument.Parse(json);var access=GetJsonString(document.RootElement,"access_token");var refresh=GetJsonString(document.RootElement,"refresh_token");var expires=document.RootElement.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;if(access.Length==0)return new(false,"","","","Provider refresh returned no access token.");await AutoMateApi.ProviderIntegrationSupport.UpdateTokensAsync(connection,tenantId,provider,access,refresh,DateTime.UtcNow.AddSeconds(expires),secret,ct);return new(true,access,account.ApiBaseUri,account.ExternalAccountId,"");}
+}
+
+static async Task<MicrosoftCalendarAccessResult> GetMicrosoftCalendarAccountAsync(NpgsqlConnection connection,Guid tenantId,Microsoft.Extensions.Configuration.IConfiguration configuration,CancellationToken ct)
+{
+    var secret=configuration["AUTOMATE_INTEGRATION_SECRET_KEY"]??"";if(!AutoMateApi.ProviderIntegrationSupport.IsRealValue(secret))return new(false,"","","Provider encryption is not configured.");AutoMateApi.ProviderAccount? account;try{account=await AutoMateApi.ProviderIntegrationSupport.LoadAccountAsync(connection,tenantId,"microsoft_calendar",secret,ct);}catch(Exception ex){return new(false,"","",ex.Message);}if(account is null||account.Status!="connected")return new(false,"","","Microsoft Calendar is not connected for this company.");if(!account.ExpiresAt.HasValue||account.ExpiresAt.Value>DateTime.UtcNow.AddMinutes(2))return new(true,account.AccessToken,account.AccountEmail,"");if(string.IsNullOrWhiteSpace(account.RefreshToken))return new(false,"","","Microsoft Calendar access expired. Reconnect the account.");if(!AutoMateApi.ProviderIntegrationSupport.HasConfiguration(configuration,"MS_CALENDAR_CLIENT_ID","MS_CALENDAR_CLIENT_SECRET"))return new(false,"","","Microsoft Calendar provider values are incomplete.");var microsoftTenant=AutoMateApi.ProviderIntegrationSupport.IsRealValue(configuration["MS_CALENDAR_TENANT"])?configuration["MS_CALENDAR_TENANT"]!:"common";using var client=new HttpClient();using var response=await client.PostAsync("https://login.microsoftonline.com/"+Uri.EscapeDataString(microsoftTenant)+"/oauth2/v2.0/token",new FormUrlEncodedContent(new Dictionary<string,string>{{"client_id",configuration["MS_CALENDAR_CLIENT_ID"]!},{"client_secret",configuration["MS_CALENDAR_CLIENT_SECRET"]!},{"refresh_token",account.RefreshToken},{"grant_type","refresh_token"},{"scope","openid profile email offline_access User.Read Calendars.ReadWrite"}}),ct);var json=await response.Content.ReadAsStringAsync(ct);if(!response.IsSuccessStatusCode)return new(false,"","","Microsoft Calendar access could not be refreshed. Reconnect the account.");using var document=JsonDocument.Parse(json);var access=GetJsonString(document.RootElement,"access_token");var refresh=GetJsonString(document.RootElement,"refresh_token");var expires=document.RootElement.TryGetProperty("expires_in",out var expiry)&&expiry.TryGetInt32(out var seconds)?seconds:3600;if(access.Length==0)return new(false,"","","Microsoft Calendar refresh returned no access token.");await AutoMateApi.ProviderIntegrationSupport.UpdateTokensAsync(connection,tenantId,"microsoft_calendar",access,refresh,DateTime.UtcNow.AddSeconds(expires),secret,ct);return new(true,access,account.AccountEmail,"");
+}
+
+static async Task<AgreementWebhookApplyResult> ApplyAgreementWebhookAsync(NpgsqlConnection connection,string provider,string documentId,string providerStatus,CancellationToken ct)
+{
+    if(string.IsNullOrWhiteSpace(documentId))return new(null,"Webhook payload did not contain an agreement or envelope ID.");await AutoMateApi.AgreementProviderSupport.EnsureAsync(connection,ct);Guid tenantId,jobId,itemId;string currentStatus,inviteId;
+    await using(var command=new NpgsqlCommand("SELECT tenant_id,job_id,plan_item_id,status,external_invite_id FROM public.job_agreement_items WHERE provider_key=@provider AND external_document_id=@document ORDER BY updated_at DESC LIMIT 1",connection)){command.Parameters.AddWithValue("provider",AutoMateApi.AgreementProviderSupport.NormalizeProvider(provider));command.Parameters.AddWithValue("document",documentId);await using var reader=await command.ExecuteReaderAsync(ct);if(!await reader.ReadAsync(ct))return new(null,"No AutoMate agreement item matches the provider document ID.");tenantId=reader.GetGuid(0);jobId=reader.GetGuid(1);itemId=reader.GetGuid(2);currentStatus=reader.GetString(3);inviteId=reader.GetString(4);}
+    var normalized=(providerStatus??"").Trim().ToLowerInvariant();var signed=provider=="adobe_sign"?normalized is "signed" or "approved":normalized=="completed";var terminalFailure=provider=="adobe_sign"?normalized is "cancelled" or "expired" or "aborted":normalized is "voided" or "declined";var status=signed?"signed":terminalFailure?"failed":currentStatus=="signed"?"signed":"invited";await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(connection,tenantId,jobId,itemId,status,documentId,inviteId,providerStatus??"",terminalFailure?"Provider reported "+providerStatus:"",ct);await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(connection,tenantId,jobId,ct);return new(tenantId,"");
+}
+
+static async Task<(bool Success,string AccessToken,string Error)> LoadMicrosoftDocumentTokenAsync(NpgsqlConnection connection,Guid inspectorId,CancellationToken ct)
+{
+    await EnsureInspectorIntegrationsTableAsync(connection);
+    await using var command=new NpgsqlCommand("SELECT COALESCE(access_token_encrypted,''),COALESCE(status,''),expires_at FROM public.inspector_integrations WHERE inspector_id=@inspector AND provider='microsoft' LIMIT 1",connection);command.Parameters.AddWithValue("inspector",inspectorId);await using var reader=await command.ExecuteReaderAsync(ct);if(!await reader.ReadAsync(ct))return(false,"","Microsoft report storage is not connected.");var token=reader.GetString(0);var status=reader.GetString(1);var expires=reader.IsDBNull(2)?DateTime.MinValue:reader.GetDateTime(2);if(status!="connected"||string.IsNullOrWhiteSpace(token))return(false,"","Microsoft report storage is not connected.");if(expires<=DateTime.UtcNow.AddMinutes(2))return(false,"","Microsoft access has expired. Reconnect Microsoft before discovering SharePoint destinations.");return(true,token,"");
+}
+
+static string AttentionActionTitle(string key,string status)=>key switch
+{
+    "booking_email"=>"Job details changed — review and resend booking email",
+    "terms"=>"Agreement details changed — review and send replacement Terms",
+    "invoice"=>"Job total changed — review the additional invoice or credit action",
+    "calendar"=>"Appointment details changed — review and update calendar event",
+    _=>status=="failed"?"Workflow action failed":"Job change requires review"
+};
 
 static AutoMateApi.ClientEngagementCommand EngagementCommand(HttpContext context, AutoMateApi.ClientPageAccess access, string eventType, string eventKey) =>
     new(access.CommunicationId,access.TenantId,access.JobId,eventType,eventKey,
@@ -7784,25 +9334,39 @@ static string EngagementEventKey(HttpContext context,string type)
     return $"{type}:{bucket}:{family}";
 }
 
-static string BuildClientEngagementFooter(string url,bool pageEnabled,bool pixelEnabled)
+static string BuildClientEngagementFooter(string url,bool pageEnabled,bool pixelEnabled,string brandColour="#0b5f86")
 {
-    var safe=WebUtility.HtmlEncode(url);
-    var button=pageEnabled?$"<div style=\"margin:24px 0;text-align:center\"><a href=\"{safe}\" style=\"display:inline-block;background:#0b5f86;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-family:Segoe UI,Arial,sans-serif;font-weight:700\">View Inspection Details</a></div>":"";
+    var safe=WebUtility.HtmlEncode(url);var brand=Regex.IsMatch(brandColour??"","^#[0-9a-fA-F]{6}$")?brandColour:"#0b5f86";
+    var button=pageEnabled?$"<div style=\"margin:24px 0;text-align:center\"><a href=\"{safe}\" style=\"display:inline-block;background:{brand};color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-family:Arial,sans-serif;font-weight:700\">View inspection details</a></div>":"";
     var pixel=pixelEnabled?$"<img src=\"{safe}/pixel.gif\" width=\"1\" height=\"1\" alt=\"\" style=\"display:block;width:1px;height:1px;border:0;opacity:0\">":"";
     return $"<!-- AutoMate client engagement -->{button}{pixel}";
 }
+
+static string ApplyClientEngagement(string html,string url,bool pageEnabled,bool pixelEnabled,string brandColour="#0b5f86")
+{
+    if(Regex.IsMatch(brandColour??"","^#[0-9a-fA-F]{6}$"))html=html.Replace("#0b5f86",brandColour,StringComparison.OrdinalIgnoreCase);
+    var engagement=BuildClientEngagementFooter(url,pageEnabled,pixelEnabled,brandColour??"#0b5f86");var buttonEnd=engagement.IndexOf("<img",StringComparison.OrdinalIgnoreCase);var button=buttonEnd>=0?engagement[..buttonEnd]:engagement;var pixel=buttonEnd>=0?engagement[buttonEnd..]:"";
+    var hasToken=html.Contains("{{INSPECTION_DETAILS_BUTTON}}",StringComparison.OrdinalIgnoreCase);html=Regex.Replace(html,"\\{\\{\\s*INSPECTION_DETAILS_BUTTON\\s*\\}\\}",pageEnabled?button:"",RegexOptions.IgnoreCase);
+    if(pageEnabled&&!hasToken)html=InsertBeforeClosingBody(html,button);
+    if(pixelEnabled)html=InsertBeforeClosingBody(html,pixel);
+    return html;
+}
+static string InsertBeforeClosingBody(string html,string content){var index=html.LastIndexOf("</body",StringComparison.OrdinalIgnoreCase);return index>=0?html.Insert(index,content):html+content;}
 
 static string ExpiredClientPageHtml()=>"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex,nofollow\"><title>Inspection page unavailable</title></head><body style=\"margin:0;background:#f5f7f9;color:#17212b;font:16px/1.5 Segoe UI,Arial,sans-serif\"><main style=\"max-width:620px;margin:12vh auto;padding:32px\"><div style=\"background:white;border:1px solid #dfe5e9;border-radius:14px;padding:32px\"><h1>Inspection page unavailable</h1><p>This secure link has expired, was replaced, or is no longer available. Contact your inspection company for assistance.</p></div></main></body></html>";
 
 static async Task<AutoMateApi.ClientInspectionDisplay> LoadClientInspectionDisplayAsync(NpgsqlConnection conn,AutoMateApi.ClientPageAccess access,CancellationToken cancellationToken)
 {
+    var clientSettings=await AutoMateApi.ClientEngagementSupport.LoadSettingsAsync(conn,access.TenantId,cancellationToken);
     const string sql=@"SELECT COALESCE((SELECT i2.company_name FROM public.inspectors i2 WHERE i2.tenant_id::text=j.tenant_id::text ORDER BY i2.created_at LIMIT 1),''),
 COALESCE(NULLIF(j.inspector_name,''),i.email_from_name,''),COALESCE(NULLIF(j.inspector_phone,''),i.phone,''),COALESCE(NULLIF(j.inspector_email,''),i.email_from_address,''),
 COALESCE(j.contact1_display_name,''),COALESCE(j.amount_paid,0),j.terms_required,j.terms_signed,COALESCE(j.signnow_signing_link,''),COALESCE(j.unscheduled,false)
+,COALESCE((SELECT b.logo_sha256 FROM public.tenant_company_branding b WHERE b.tenant_id::text=j.tenant_id::text),'') company_logo_hash
+,(SELECT EXISTS(SELECT 1 FROM public.tenant_integration_action_defaults d WHERE d.tenant_id::text=j.tenant_id::text AND d.action_type='invoice' AND d.provider_key IN ('xero','myob'))) accounting_connected
 FROM public.jobs_staging j LEFT JOIN public.inspectors i ON i.inspector_id=j.inspector_id WHERE j.job_id=@job AND j.tenant_id::text=@tenant LIMIT 1";
     await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("job",access.JobId);cmd.Parameters.AddWithValue("tenant",access.TenantId.ToString());
     await using var reader=await cmd.ExecuteReaderAsync(cancellationToken);if(!await reader.ReadAsync(cancellationToken))throw new UnauthorizedAccessException();
-    return new(reader.GetString(0),"","",reader.GetString(1),reader.GetString(2),reader.GetString(3),reader.GetString(4),reader.GetDecimal(5),reader.GetBoolean(6),reader.GetBoolean(7),reader.GetString(8),reader.GetBoolean(9));
+    return new(reader.GetString(0),"","",reader.GetString(1),reader.GetString(2),reader.GetString(3),reader.GetString(4),reader.GetDecimal(5),reader.GetBoolean(6),reader.GetBoolean(7),reader.GetString(8),reader.GetBoolean(9),clientSettings.IntroductionText,clientSettings.PaymentInstruction,clientSettings.BankAccountName,clientSettings.BankAccountNumber,clientSettings.PaymentReferenceInstruction,clientSettings.ShowBankWithAccounting,clientSettings.BrandColour,CompanyLogoPublicUrl(access.TenantId,reader.GetString(10)),reader.GetBoolean(11));
 }
 
 static async Task<(bool Allowed, IResult? Error)> RequireAutomationOwnerAsync(HttpContext context, NpgsqlConnection conn, Guid tenantId)
@@ -7870,14 +9434,14 @@ static string NormalizeAutomationKey(string? value)
 static List<string> ValidateAutomationRule(AutomationRuleSaveRequest request)
 {
     var errors = new List<string>();
-    var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "pre_inspection_due", "inspection_cancelled", "price_changed", "service_changed" };
-    var validFields = new HashSet<string> { "lifecycle", "status", "primary_service", "all_services", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories" };
-    var validOperators = new HashSet<string> { "includes", "does_not_include" };
-    var validActions = new HashSet<string> { "send_email", "send_webhook", "upsert_calendar", "create_xero_draft", "send_signnow_agreement", "queue_report_communication", "set_workflow_state" };
+    var validEvents = new HashSet<string> { "inspection_scheduled", "inspection_rescheduled", "inspection_unscheduled", "inspection_cancelled", "pre_inspection_due", "price_changed", "service_changed", "report_review_ready", "report_publishing" };
+    var validFields = new HashSet<string> { "lifecycle", "status", "primary_service", "all_services", "service_category_ids", "service_ids", "modifier_group_ids", "modifier_values", "invoice_reconciliation", "site_address", "client_name", "inspector_name", "invoice_total", "change_categories", "agreement_status", "payment_status", "report_status" };
+    var validOperators = new HashSet<string> { "has", "does_not_have", "includes", "does_not_include", "equals", "not_equals", "greater_than", "less_than" };
+    var validActions = new HashSet<string> { "send_email", "send_webhook", "upsert_calendar", "create_xero_draft", "send_agreement", "queue_report_communication", "set_workflow_state" };
     if (request.TenantId == Guid.Empty) errors.Add("TenantId is required.");
     if (string.IsNullOrWhiteSpace(request.Name)) errors.Add("Rule name is required.");
     if (!validEvents.Contains(NormalizeAutomationKey(request.EventKey))) errors.Add("Event is not supported.");
-    if (request.Conditions != null) foreach (var condition in request.Conditions)
+    foreach(var group in request.ConditionGroups??new())foreach (var condition in group.Conditions??new())
     {
         if (!validFields.Contains(NormalizeAutomationKey(condition.FieldKey))) errors.Add("Condition field is not supported: " + condition.FieldKey);
         if (!validOperators.Contains(NormalizeAutomationKey(condition.Operator))) errors.Add("Condition operator is not supported: " + condition.Operator);
@@ -7895,6 +9459,12 @@ static List<string> ValidateAutomationRule(AutomationRuleSaveRequest request)
             action.Settings.TryGetValue("method", out var method);
             if (!new[] { "POST", "PUT", "PATCH" }.Contains((method ?? "POST").Trim().ToUpperInvariant())) errors.Add("Webhook method must be POST, PUT, or PATCH.");
         }
+        foreach(var group in action.ConditionGroups??new())foreach(var condition in group.Conditions??new())
+        {
+            if(!validFields.Contains(NormalizeAutomationKey(condition.FieldKey)))errors.Add("Action condition field is not supported: "+condition.FieldKey);
+            if(!validOperators.Contains(NormalizeAutomationKey(condition.Operator)))errors.Add("Action condition operator is not supported: "+condition.Operator);
+            if(string.IsNullOrWhiteSpace(condition.Value))errors.Add("Action condition value is required.");
+        }
     }
     return errors.Distinct().ToList();
 }
@@ -7907,8 +9477,27 @@ static List<AutomationConditionEvaluation> EvaluateAutomationConditions(List<Aut
         actual ??= "";
         var expected = condition.Value ?? "";
         bool contains = actual.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0;
-        bool matched = NormalizeAutomationKey(condition.Operator) == "includes" ? contains : !contains;
+        var op=NormalizeAutomationKey(condition.Operator);decimal actualNumber,expectedNumber;
+        bool matched = op switch
+        {
+            "has" or "includes" => contains,
+            "does_not_have" or "does_not_include" => !contains,
+            "equals" => string.Equals(actual.Trim(),expected.Trim(),StringComparison.OrdinalIgnoreCase),
+            "not_equals" => !string.Equals(actual.Trim(),expected.Trim(),StringComparison.OrdinalIgnoreCase),
+            "greater_than" => decimal.TryParse(actual,out actualNumber)&&decimal.TryParse(expected,out expectedNumber)&&actualNumber>expectedNumber,
+            "less_than" => decimal.TryParse(actual,out actualNumber)&&decimal.TryParse(expected,out expectedNumber)&&actualNumber<expectedNumber,
+            _ => false
+        };
         return new AutomationConditionEvaluation(condition.FieldKey ?? "", condition.Operator ?? "", expected, actual, matched);
+    }).ToList();
+}
+
+static List<AutomationConditionGroupEvaluation> EvaluateAutomationConditionGroups(List<AutomationConditionGroup> groups,Dictionary<string,string> fields)
+{
+    return (groups??new()).Select((group,index)=>
+    {
+        var evaluations=EvaluateAutomationConditions(group.Conditions??new(),fields);
+        return new AutomationConditionGroupEvaluation(index+1,evaluations,evaluations.Count==0||evaluations.All(value=>value.Matched));
     }).ToList();
 }
 
@@ -8157,12 +9746,15 @@ ALTER TABLE public.inspectors
 ADD COLUMN IF NOT EXISTS logo_url text NULL;
 
 ALTER TABLE public.inspectors
-ADD COLUMN IF NOT EXISTS email_sender_mode text NOT NULL DEFAULT 'microsoft';
+ADD COLUMN IF NOT EXISTS email_sender_mode text NOT NULL DEFAULT 'manual-smtp';
+
+ALTER TABLE public.inspectors
+ALTER COLUMN email_sender_mode SET DEFAULT 'manual-smtp';
 
 UPDATE public.inspectors
-SET email_sender_mode = 'microsoft'
+SET email_sender_mode = 'manual-smtp'
 WHERE email_sender_mode IS NULL
-   OR email_sender_mode NOT IN ('microsoft', 'threed-smtp', 'manual-smtp');
+   OR email_sender_mode <> 'manual-smtp';
 
 ALTER TABLE public.inspectors
 DROP CONSTRAINT IF EXISTS inspectors_tenant_id_unique;
@@ -8258,7 +9850,21 @@ ALTER TABLE public.jobs_staging
 ADD COLUMN IF NOT EXISTS signnow_webhook_status text NULL;
 
 ALTER TABLE public.jobs_staging
-ADD COLUMN IF NOT EXISTS signnow_webhook_last_error text NULL;";
+ADD COLUMN IF NOT EXISTS signnow_webhook_last_error text NULL;
+
+CREATE TABLE IF NOT EXISTS public.signnow_document_supersessions
+(
+    supersession_id uuid PRIMARY KEY,
+    tenant_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    previous_document_id text NOT NULL,
+    replacement_document_id text NULL,
+    reason text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_signnow_supersessions_job ON public.signnow_document_supersessions(tenant_id,job_id,created_at DESC);";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
@@ -8571,11 +10177,167 @@ WHERE inspector_id = @inspector_id
     return XeroAccountResult.Ok(accessToken, refreshToken, tenantId, tenantName);
 }
 
+static async Task EnsureXeroRepairAuditAsync(NpgsqlConnection conn,CancellationToken ct=default)
+{
+    await using var command=new NpgsqlCommand("""
+CREATE TABLE IF NOT EXISTS public.job_xero_repair_audit
+(
+ audit_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid NOT NULL, job_id uuid NOT NULL,
+ idempotency_key text NOT NULL, action_key text NOT NULL, actor text NOT NULL,
+ invoice_id text NOT NULL DEFAULT '', invoice_number text NOT NULL DEFAULT '', old_reference text NOT NULL DEFAULT '', new_reference text NOT NULL DEFAULT '',
+ provider_status text NOT NULL DEFAULT '', result_detail text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT NOW(),
+ UNIQUE(tenant_id,idempotency_key,action_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_job_xero_repair_idempotency
+ON public.job_xero_repair_audit(tenant_id,idempotency_key);
+""",conn);await command.ExecuteNonQueryAsync(ct);
+}
+
+static async Task<XeroRepairAuditReplay?> LoadXeroRepairReplayAsync(NpgsqlConnection conn,Guid tenantId,string idempotencyKey,CancellationToken ct=default)
+{
+    await using var command=new NpgsqlCommand("SELECT action_key,created_at FROM public.job_xero_repair_audit WHERE tenant_id=@tenant AND idempotency_key=@key ORDER BY created_at DESC LIMIT 1",conn);command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("key",idempotencyKey.Trim());await using var reader=await command.ExecuteReaderAsync(ct);return await reader.ReadAsync(ct)?new(reader.GetString(0),reader.GetFieldValue<DateTimeOffset>(1)):null;
+}
+
+static async Task<bool> TryReserveXeroRepairAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,string idempotencyKey,string action,string actor,string invoiceId,string invoiceNumber,CancellationToken ct=default)
+{
+    await using var command=new NpgsqlCommand("INSERT INTO public.job_xero_repair_audit(tenant_id,job_id,idempotency_key,action_key,actor,invoice_id,invoice_number,result_detail) VALUES(@tenant,@job,@key,@action,@actor,@invoice,@number,'Command reserved before provider mutation') ON CONFLICT DO NOTHING",conn);command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);command.Parameters.AddWithValue("key",idempotencyKey.Trim());command.Parameters.AddWithValue("action",action);command.Parameters.AddWithValue("actor",actor??"");command.Parameters.AddWithValue("invoice",invoiceId??"");command.Parameters.AddWithValue("number",invoiceNumber??"");return await command.ExecuteNonQueryAsync(ct)==1;
+}
+
+static async Task<JobReconciliationResponse> LoadJobReconciliationAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,IConfiguration configuration,CancellationToken ct=default)
+{
+    var state=await AutoMateApi.JobReconciliationSupport.LoadAsync(conn,tenantId,jobId,ct)??throw new KeyNotFoundException("The job does not belong to this company.");
+    var job=await LoadXeroInvoiceJobAsync(conn,jobId)??throw new KeyNotFoundException("The synchronized job is unavailable.");
+    if(job.TenantId!=tenantId)throw new KeyNotFoundException("The job does not belong to this company.");
+    if(string.IsNullOrWhiteSpace(job.XeroInvoiceId))throw new AutoMateApi.JobReconciliationException("xero_invoice_not_recorded","No original Xero invoice is recorded for this job.");
+    var account=await GetXeroAccountAsync(conn,job.InspectorId,configuration);if(!account.Success)throw new AutoMateApi.JobReconciliationException("xero_not_connected",account.ErrorMessage??"Xero is not connected.");
+    var original=await ReadXeroInvoiceEvidenceAsync(account,job.XeroInvoiceId,ct);if(!original.Success)throw new AutoMateApi.JobReconciliationException("xero_invoice_verification_failed","Xero could not verify the original invoice.");
+    var changes=state.Changes.ToList();
+    var storedAdditional=await AutoMateApi.JobReconciliationSupport.LoadAdditionalAsync(conn,tenantId,jobId,ct);var additional=new List<XeroAdditionalInvoiceView>();var providerVerified=true;
+    foreach(var stored in storedAdditional)
+    {
+        var live=await ReadXeroInvoiceEvidenceAsync(account,stored.InvoiceId,ct);
+        if(!live.Success){providerVerified=false;additional.Add(new(stored.InvoiceId,stored.InvoiceNumber,stored.Status,stored.Difference,stored.CreatedAt,stored.SentAt,false,stored.LastError));continue;}
+        additional.Add(new(live.InvoiceId,live.InvoiceNumber,live.Status,live.Total??stored.Difference,stored.CreatedAt,stored.SentAt,true,stored.LastError));
+    }
+    static bool Active(string status)=>!string.Equals(status,"VOIDED",StringComparison.OrdinalIgnoreCase)&&!string.Equals(status,"DELETED",StringComparison.OrdinalIgnoreCase);
+    var originalTotal=original.Total??0m;var additionalTotal=additional.Where(item=>item.Verified&&Active(item.Status)).Sum(item=>item.Total);var invoicedTotal=originalTotal+additionalTotal;var currentTotal=job.JobTotal??0m;
+    var addressChanged=changes.Any(change=>string.Equals(change.category,"address",StringComparison.OrdinalIgnoreCase));
+    var customerChanged=changes.Any(change=>string.Equals(change.category,"customer",StringComparison.OrdinalIgnoreCase));
+    var decision=providerVerified?AutoMateApi.ReconciliationDecision.Classify(currentTotal,invoicedTotal,addressChanged,customerChanged):new AutoMateApi.ReconciliationDecision("unavailable",0m,"One or more linked Xero invoices could not be verified. No accounting action is available until verification succeeds.");
+    var currentFingerprint=string.IsNullOrWhiteSpace(state.CurrentFingerprint)?JobChangeSupport.Fingerprint(state.CurrentSnapshot):state.CurrentFingerprint;
+    var targetMaterial=$"{tenantId:N}|{jobId:N}|{currentFingerprint}|{original.InvoiceId}|{invoicedTotal:0.00}|{currentTotal:0.00}|{string.Join(',',additional.Select(item=>$"{item.InvoiceId}:{item.Status}:{item.Total:0.00}"))}";
+    var targetFingerprint=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(targetMaterial))).ToLowerInvariant();
+    var needsUpdate=state.ChangeReviewPending&&changes.Count>0;
+    var creditReviewCompleted=decision.Action=="credit_review"&&await AutoMateApi.BasicChangeRunSupport.IsCompletedReviewForFingerprintAsync(conn,tenantId,jobId,currentFingerprint,"invoice","credit_review_completed|",ct);
+    var reconciliationMessage=creditReviewCompleted?$"Credit review completed and recorded. Xero remains {Math.Abs(decision.RemainingDifference):C} above the current THREED total.":decision.Message;
+    var exactEmail=!string.IsNullOrWhiteSpace(job.ContactEmail)&&!string.IsNullOrWhiteSpace(original.ContactEmail)&&string.Equals(job.ContactEmail.Trim(),original.ContactEmail.Trim(),StringComparison.OrdinalIgnoreCase);
+    var adjustmentChanges=changes.Select(change=>new AutoMateApi.InvoiceAdjustmentChange(change.field,change.oldValue,change.newValue)).ToArray();var changedLineDescriptions=AutoMateApi.InvoiceAdjustmentLineSupport.ChangedDescriptions(adjustmentChanges);var changedServiceNames=changes.Where(change=>change.field is "primaryService" or "additionalService1" or "additionalService2").Select(change=>change.newValue).Where(value=>!string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();var adjustmentNames=(changedLineDescriptions.Count>0?changedLineDescriptions:changedServiceNames).Distinct(StringComparer.OrdinalIgnoreCase).Take(8).ToList();if(adjustmentNames.Count==0&&decision.Action=="additional_invoice")adjustmentNames.Add("THREED invoice total adjustment");var adjustmentItems=adjustmentNames.Select(value=>new InvoiceAdjustmentItemView(value,changedLineDescriptions.Count>0?"Recorded THREED invoice-line change":"Recorded service change")).ToList();
+    return new(jobId,state.ApprovedVersion,currentFingerprint,targetFingerprint,needsUpdate,state.ChangeReviewPending,state.XeroReviewRequired&&!creditReviewCompleted,creditReviewCompleted,
+        JsonSerializer.Deserialize<JsonElement>(state.ApprovedSnapshot),JsonSerializer.Deserialize<JsonElement>(state.CurrentSnapshot),changes,
+        new(original.InvoiceId,original.InvoiceNumber,original.Status,original.Reference,originalTotal,original.ContactId,original.ContactName,original.ContactEmail),
+        additional,invoicedTotal,currentTotal,decision.RemainingDifference,decision.Action,reconciliationMessage,providerVerified,
+        decision.Action=="additional_invoice",!needsUpdate&&decision.Action=="reference_update"&&!string.Equals(original.Reference,job.SiteAddress,StringComparison.Ordinal),
+        !needsUpdate&&decision.Action=="contact_review"&&exactEmail,job.SiteAddress,job.ContactName,job.ContactEmail,adjustmentItems,DateTimeOffset.UtcNow);
+}
+
+static async Task<XeroLiveInvoiceEvidence> ReadXeroInvoiceEvidenceAsync(XeroAccountResult account,string invoiceId,CancellationToken ct=default)
+{
+    using var http=new HttpClient();http.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);http.DefaultRequestHeaders.Add("xero-tenant-id",account.TenantId);http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));using var response=await http.GetAsync("https://api.xero.com/api.xro/2.0/Invoices/"+Uri.EscapeDataString(invoiceId),ct);var body=await response.Content.ReadAsStringAsync(ct);if(!response.IsSuccessStatusCode)return new(false,invoiceId,"","","",null,"","","",body);try{using var document=JsonDocument.Parse(body);var root=document.RootElement;var invoice=root.TryGetProperty("Invoices",out var invoices)&&invoices.ValueKind==JsonValueKind.Array&&invoices.GetArrayLength()>0?invoices[0]:root;decimal? total=null;if(invoice.TryGetProperty("Total",out var totalElement)&&totalElement.TryGetDecimal(out var parsed))total=parsed;var contact=invoice.TryGetProperty("Contact",out var contactElement)&&contactElement.ValueKind==JsonValueKind.Object?contactElement:default;return new(true,GetJsonString(invoice,"InvoiceID"),GetJsonString(invoice,"InvoiceNumber"),GetJsonString(invoice,"Status").ToUpperInvariant(),GetJsonString(invoice,"Reference"),total,contact.ValueKind==JsonValueKind.Object?GetJsonString(contact,"ContactID"):"",contact.ValueKind==JsonValueKind.Object?GetJsonString(contact,"Name"):"",contact.ValueKind==JsonValueKind.Object?GetJsonString(contact,"EmailAddress"):"","");}catch(Exception ex){return new(false,invoiceId,"","","",null,"","","","Xero returned unreadable invoice evidence: "+ex.Message);}
+}
+
+static async Task RecordXeroRepairAuditAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,string? idempotencyKey,string action,string actor,string invoiceId,string invoiceNumber,string oldReference,string newReference,string providerStatus,string detail,CancellationToken ct=default)
+{
+    var key=string.IsNullOrWhiteSpace(idempotencyKey)?Guid.NewGuid().ToString("N"):idempotencyKey.Trim();await using var command=new NpgsqlCommand("INSERT INTO public.job_xero_repair_audit(tenant_id,job_id,idempotency_key,action_key,actor,invoice_id,invoice_number,old_reference,new_reference,provider_status,result_detail) VALUES(@tenant,@job,@key,@action,@actor,@invoice,@number,@old,@new,@status,@detail) ON CONFLICT(tenant_id,idempotency_key) DO UPDATE SET action_key=EXCLUDED.action_key,actor=EXCLUDED.actor,invoice_id=EXCLUDED.invoice_id,invoice_number=EXCLUDED.invoice_number,old_reference=EXCLUDED.old_reference,new_reference=EXCLUDED.new_reference,provider_status=EXCLUDED.provider_status,result_detail=EXCLUDED.result_detail",conn);command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);command.Parameters.AddWithValue("key",key);command.Parameters.AddWithValue("action",action);command.Parameters.AddWithValue("actor",actor??"");command.Parameters.AddWithValue("invoice",invoiceId??"");command.Parameters.AddWithValue("number",invoiceNumber??"");command.Parameters.AddWithValue("old",oldReference??"");command.Parameters.AddWithValue("new",newReference??"");command.Parameters.AddWithValue("status",providerStatus??"");command.Parameters.AddWithValue("detail",TravelRedact(detail??""));await command.ExecuteNonQueryAsync(ct);
+}
+
+static async Task<bool> ClearXeroReviewAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,string actor,CancellationToken ct=default)
+{
+    await using var command=new NpgsqlCommand("UPDATE public.jobs_staging SET xero_review_required=false,xero_last_error=NULL,workflow_updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job AND xero_review_required=true",conn);command.Parameters.AddWithValue("tenant",tenantId.ToString());command.Parameters.AddWithValue("job",jobId);return await command.ExecuteNonQueryAsync(ct)==1;
+}
+
+static async Task ResolveCoveredXeroAttentionAsync(NpgsqlConnection conn,Guid tenantId,IConfiguration configuration,CancellationToken ct=default)
+{
+    var jobs=new List<Guid>();
+    await using(var command=new NpgsqlCommand("SELECT job_id FROM public.jobs_staging WHERE tenant_id::text=@tenant AND xero_review_required=true AND invoice_sent=true AND automate_status='Scheduled' AND change_review_pending=false",conn))
+    {
+        command.Parameters.AddWithValue("tenant",tenantId.ToString("D"));
+        await using var reader=await command.ExecuteReaderAsync(ct);while(await reader.ReadAsync(ct))jobs.Add(reader.GetGuid(0));
+    }
+    foreach(var jobId in jobs)
+    {
+        try
+        {
+            var reconciliation=await LoadJobReconciliationAsync(conn,tenantId,jobId,configuration,ct);
+            await TryResolveCoveredXeroReviewAsync(conn,tenantId,jobId,reconciliation,"AutoMate verified reconciliation",ct);
+        }
+        catch(AutoMateApi.JobReconciliationException)
+        {
+            // Provider evidence is unavailable or incomplete. Keep Attention open.
+        }
+        catch(HttpRequestException)
+        {
+            // A transient read failure must not hide a genuine accounting review.
+        }
+    }
+}
+
+static async Task<bool> TryResolveCoveredXeroReviewAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,JobReconciliationResponse reconciliation,string actor,CancellationToken ct=default)
+{
+    await using var stateCommand=new NpgsqlCommand("SELECT automate_status,xero_review_required FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job",conn);
+    stateCommand.Parameters.AddWithValue("tenant",tenantId.ToString("D"));stateCommand.Parameters.AddWithValue("job",jobId);
+    bool inactiveLifecycle;
+    bool reviewRequired;
+    await using(var reader=await stateCommand.ExecuteReaderAsync(ct))
+    {
+        if(!await reader.ReadAsync(ct))return false;
+        inactiveLifecycle=reader.GetString(0) is "Unscheduled" or "Cancelled";reviewRequired=reader.GetBoolean(1);
+    }
+    if(!reviewRequired||!AutoMateApi.XeroRepairPolicySupport.CanResolveCoveredReview(reconciliation.ProviderVerified,reconciliation.NeedsUpdate,reconciliation.ChangeReviewPending,inactiveLifecycle,reconciliation.Action,reconciliation.RemainingDifference))return false;
+    if(!await ClearXeroReviewAsync(conn,tenantId,jobId,actor,ct))return false;
+    await AutoMateApi.BasicChangeRunSupport.ResolveCurrentReviewActionAsync(conn,tenantId,jobId,"invoice",reconciliation.OriginalInvoice.InvoiceId,ct);
+    await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,tenantId,jobId,"xero_review","invoice","resolved",ct);
+    await JobChangeSupport.AuditAsync(conn,jobId,tenantId,reconciliation.ApprovedVersion,"xero_review_resolved",reconciliation.TargetFingerprint,"[]","Verified Xero invoice coverage equals the current THREED total.",actor);
+    return true;
+}
+
+static async Task<bool> TryMigrateLegacyCreditReviewCompletionAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,JobReconciliationResponse reconciliation,CancellationToken ct=default)
+{
+    if(reconciliation.Action!="credit_review"||reconciliation.CreditReviewCompleted||reconciliation.RemainingDifference>=-0.01m)return false;
+    await EnsureXeroRepairAuditAsync(conn,ct);string actor="",detail="";
+    await using(var command=new NpgsqlCommand("""
+        SELECT x.actor,x.result_detail
+        FROM public.basic_job_change_run_actions a
+        JOIN public.basic_job_change_runs r ON r.run_id=a.run_id
+        JOIN LATERAL (
+          SELECT actor,result_detail FROM public.job_xero_repair_audit
+          WHERE tenant_id=@tenant AND job_id=@job AND action_key='no_correction_required'
+            AND created_at>=r.detected_at
+            AND result_detail ILIKE '%invoiced amount is above the current THREED total%'
+          ORDER BY created_at DESC LIMIT 1
+        ) x ON TRUE
+        WHERE a.tenant_id=@tenant AND a.job_id=@job AND a.source_fingerprint=@fingerprint
+          AND a.action_key='invoice' AND a.status IN ('review_required','failed','pending')
+        ORDER BY a.action_version DESC LIMIT 1;
+        """,conn))
+    {
+        command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);command.Parameters.AddWithValue("fingerprint",reconciliation.CurrentFingerprint);
+        await using var reader=await command.ExecuteReaderAsync(ct);if(!await reader.ReadAsync(ct))return false;actor=reader.GetString(0);detail=reader.GetString(1);
+    }
+    var outcome="Credit decision completion confirmed through the earlier AutoMate credit-review button.";
+    var transition=await AutoMateApi.BasicChangeRunSupport.ResolveReviewActionForFingerprintAsync(conn,tenantId,jobId,reconciliation.CurrentFingerprint,"invoice",reconciliation.OriginalInvoice.InvoiceId,"credit_review_completed|"+outcome,ct);
+    if(transition.Status!="completed")return false;
+    await ClearXeroReviewAsync(conn,tenantId,jobId,actor,ct);
+    await AutoMateApi.AuthoritativeAttentionSupport.ResolveAsync(conn,tenantId,jobId,"xero_review","invoice","resolved",ct);
+    await JobChangeSupport.AuditAsync(conn,jobId,tenantId,reconciliation.ApprovedVersion,"credit_review_completion_migrated",reconciliation.TargetFingerprint,"[]",$"{outcome} Prior audit: {TravelRedact(detail)}",actor);
+    return true;
+}
+
 static async Task<XeroInvoiceJobInput?> LoadXeroInvoiceJobAsync(NpgsqlConnection conn, Guid jobId)
 {
     const string sql = @"
 SELECT
     job_id,
+    tenant_id,
     inspector_id,
     job_name,
     site_address,
@@ -8610,6 +10372,7 @@ LIMIT 1;";
 
     return new XeroInvoiceJobInput(
         jobId,
+        ReadDatabaseGuid(reader["tenant_id"]),
         (Guid)reader["inspector_id"],
         reader["job_name"]?.ToString() ?? "",
         reader["site_address"]?.ToString() ?? "",
@@ -8780,6 +10543,7 @@ WHERE job_id = @job_id;";
 static async Task<ScheduleJobInput?> LoadScheduleJobAsync(NpgsqlConnection conn, Guid jobId)
 {
     await EnsureBasicJobProfileColumnsAsync(conn);
+    await TenantContactConfigurationSupport.EnsureAsync(conn);
     const string sql = @"
 SELECT
     j.job_id,
@@ -8824,6 +10588,12 @@ SELECT
     j.contact1_role_label,
     j.contact1_email,
     j.contact1_cellular,
+    COALESCE((SELECT company_name FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=0),'') AS contact1_company_name,
+    COALESCE((SELECT person_display_name FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=0),'') AS contact1_person_display_name,
+    COALESCE((SELECT address FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=0),'') AS contact1_address,
+    COALESCE((SELECT city FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=0),'') AS contact1_city,
+    COALESCE((SELECT state FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=0),'') AS contact1_state,
+    COALESCE((SELECT postal_code FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=0),'') AS contact1_postal_code,
     j.contact2_first_name,
     j.contact2_last_name,
     j.contact2_display_name,
@@ -8831,6 +10601,12 @@ SELECT
     j.contact2_role_label,
     j.contact2_email,
     j.contact2_cellular,
+    COALESCE((SELECT company_name FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=1),'') AS contact2_company_name,
+    COALESCE((SELECT person_display_name FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=1),'') AS contact2_person_display_name,
+    COALESCE((SELECT address FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=1),'') AS contact2_address,
+    COALESCE((SELECT city FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=1),'') AS contact2_city,
+    COALESCE((SELECT state FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=1),'') AS contact2_state,
+    COALESCE((SELECT postal_code FROM public.job_contacts jc WHERE jc.tenant_id::text=j.tenant_id::text AND jc.job_id=j.job_id AND jc.contact_index=1),'') AS contact2_postal_code,
     COALESCE(i.timezone, 'Pacific/Auckland') AS timezone,
     COALESCE((
         SELECT i2.company_name
@@ -8841,10 +10617,11 @@ SELECT
                  i2.created_at
         LIMIT 1
     ), '') AS company_name,
+    COALESCE((SELECT b.logo_sha256 FROM public.tenant_company_branding b WHERE b.tenant_id::text=j.tenant_id::text),'') AS company_logo_hash,
     i.email_from_name,
     COALESCE(NULLIF(j.inspector_email,''),i.email_from_address) AS email_from_address,
     COALESCE(NULLIF(j.inspector_phone,''),i.phone) AS phone,
-    COALESCE(i.email_sender_mode, 'microsoft') AS email_sender_mode
+    COALESCE(i.email_sender_mode, 'manual-smtp') AS email_sender_mode
 FROM public.jobs_staging j
 LEFT JOIN public.inspectors i
     ON i.inspector_id = j.inspector_id
@@ -8902,6 +10679,12 @@ LIMIT 1;";
         reader["contact1_role_label"]?.ToString() ?? "Client",
         reader["contact1_email"]?.ToString() ?? "",
         reader["contact1_cellular"]?.ToString() ?? "",
+        reader["contact1_company_name"]?.ToString() ?? "",
+        reader["contact1_person_display_name"]?.ToString() ?? "",
+        reader["contact1_address"]?.ToString() ?? "",
+        reader["contact1_city"]?.ToString() ?? "",
+        reader["contact1_state"]?.ToString() ?? "",
+        reader["contact1_postal_code"]?.ToString() ?? "",
         BuildPersonName(reader["contact2_first_name"]?.ToString(), reader["contact2_last_name"]?.ToString()),
         reader["contact2_first_name"]?.ToString() ?? "",
         reader["contact2_last_name"]?.ToString() ?? "",
@@ -8910,12 +10693,74 @@ LIMIT 1;";
         reader["contact2_role_label"]?.ToString() ?? "Buyers Agent",
         reader["contact2_email"]?.ToString() ?? "",
         reader["contact2_cellular"]?.ToString() ?? "",
+        reader["contact2_company_name"]?.ToString() ?? "",
+        reader["contact2_person_display_name"]?.ToString() ?? "",
+        reader["contact2_address"]?.ToString() ?? "",
+        reader["contact2_city"]?.ToString() ?? "",
+        reader["contact2_state"]?.ToString() ?? "",
+        reader["contact2_postal_code"]?.ToString() ?? "",
         reader["timezone"]?.ToString() ?? "Pacific/Auckland",
         reader["company_name"]?.ToString() ?? "",
+        CompanyLogoPublicUrl(ReadDatabaseGuid(reader["tenant_id"]),reader["company_logo_hash"]?.ToString()),
         reader["email_from_name"]?.ToString() ?? "",
         reader["email_from_address"]?.ToString() ?? "",
         reader["phone"]?.ToString() ?? "",
         NormalizeEmailSenderMode(reader["email_sender_mode"]?.ToString()));
+}
+
+static async Task<bool> IsControlledPilotJobAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,CancellationToken ct=default)
+{
+    await AutoMateApi.ControlledTestCycleSupport.EnsureAsync(conn,ct);
+    await using var command=new NpgsqlCommand("SELECT COALESCE(enabled,false) FROM public.controlled_test_jobs WHERE tenant_id=@tenant AND job_id=@job",conn);
+    command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);
+    return await command.ExecuteScalarAsync(ct) is bool enabled&&enabled;
+}
+
+static async Task<(int CycleNumber,bool FullRetest)> LoadActiveTestCycleAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,CancellationToken ct=default)
+{
+    await AutoMateApi.ControlledTestCycleSupport.EnsureAsync(conn,ct);
+    await using var command=new NpgsqlCommand("SELECT cycle_number,full_retest FROM public.job_test_cycles WHERE tenant_id=@tenant AND job_id=@job AND status='active' ORDER BY cycle_number DESC LIMIT 1",conn);
+    command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);
+    await using var reader=await command.ExecuteReaderAsync(ct);return await reader.ReadAsync(ct)?(reader.GetInt32(0),reader.GetBoolean(1)):(0,false);
+}
+
+static async Task EnsurePilotProviderCycleResultsAsync(NpgsqlConnection conn,CancellationToken ct=default)
+{
+    await using var command=new NpgsqlCommand("""
+        CREATE TABLE IF NOT EXISTS public.controlled_test_provider_results(
+            tenant_id uuid NOT NULL,job_id uuid NOT NULL,cycle_number integer NOT NULL,action_key text NOT NULL,
+            result_json jsonb NOT NULL,completed_at timestamptz NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(tenant_id,job_id,cycle_number,action_key));
+        """,conn);await command.ExecuteNonQueryAsync(ct);
+}
+
+static async Task<bool> HasPilotProviderCycleResultAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,int cycleNumber,string actionKey,CancellationToken ct)
+{
+    await using var command=new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM public.controlled_test_provider_results WHERE tenant_id=@tenant AND job_id=@job AND cycle_number=@cycle AND action_key=@action)",conn);
+    command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);command.Parameters.AddWithValue("cycle",cycleNumber);command.Parameters.AddWithValue("action",actionKey);
+    return Convert.ToBoolean(await command.ExecuteScalarAsync(ct));
+}
+
+static async Task RecordPilotProviderCycleResultAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId,int cycleNumber,string actionKey,ScheduleActionResult result,CancellationToken ct)
+{
+    await using var command=new NpgsqlCommand("INSERT INTO public.controlled_test_provider_results(tenant_id,job_id,cycle_number,action_key,result_json) VALUES(@tenant,@job,@cycle,@action,CAST(@result AS jsonb)) ON CONFLICT DO NOTHING",conn);
+    command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);command.Parameters.AddWithValue("cycle",cycleNumber);command.Parameters.AddWithValue("action",actionKey);command.Parameters.AddWithValue("result",JsonSerializer.Serialize(result));await command.ExecuteNonQueryAsync(ct);
+}
+
+static bool IsProviderPilotEnabled(IConfiguration configuration,Guid jobId)
+{
+    return Guid.TryParse(configuration["AUTOMATE_PROVIDER_PILOT_JOB_ID"],out var allowedJobId)&&allowedJobId==jobId;
+}
+
+static async Task<bool> TryAcquirePilotLockAsync(NpgsqlConnection conn,string key,CancellationToken ct=default)
+{
+    await using var command=new NpgsqlCommand("SELECT pg_try_advisory_lock(hashtextextended(@key,0))",conn);command.Parameters.AddWithValue("key",key);
+    return await command.ExecuteScalarAsync(ct) is bool acquired&&acquired;
+}
+
+static async Task ReleasePilotLockAsync(NpgsqlConnection conn,string key)
+{
+    await using var command=new NpgsqlCommand("SELECT pg_advisory_unlock(hashtextextended(@key,0))",conn);command.Parameters.AddWithValue("key",key);await command.ExecuteScalarAsync();
 }
 
 static async Task EnsureBasicJobProfileColumnsAsync(NpgsqlConnection conn)
@@ -8956,47 +10801,16 @@ static async Task<ScheduleActionResult> SendScheduleBookingEmailsAsync(
     if (services.Length == 0)
         return ScheduleActionResult.Skip("booking-email", "No schedulable services were found.");
 
-    if (IsSmtpEmailSenderMode(job.EmailSenderMode))
-    {
-        return ScheduleActionResult.Skip(
-            "booking-email",
-            "Booking email is pending for local SMTP sending in the desktop connector.",
-            new
-            {
-                senderMode = job.EmailSenderMode,
-                provider = GetEmailSenderModeLabel(job.EmailSenderMode),
-                pending = services.Select(service => service.Label).ToArray()
-            });
-    }
-
-    var account = await GetMicrosoftMailAccountAsync(conn, job.InspectorId, configuration);
-    if (!account.Success)
-    {
-        await MarkBookingEmailFailedAsync(conn, job.JobId, account.ErrorMessage ?? "Microsoft email is not connected.");
-        return ScheduleActionResult.Failed("booking-email", account.ErrorMessage ?? "Microsoft email is not connected.");
-    }
-
-    using var httpClient = new HttpClient();
-    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
-
-    var sent = new List<string>();
-    foreach (var service in services)
-    {
-        var subject = $"Booking confirmation - {service.Label}";
-        var body = BuildScheduleBookingEmailHtml(job, service);
-        var response = await SendMicrosoftMailAsync(httpClient, job.ClientEmail, subject, body);
-        if (!response.Success)
+    return ScheduleActionResult.Skip(
+        "booking-email",
+        "Booking email is pending for user SMTP sending in the desktop connector.",
+        new
         {
-            await MarkBookingEmailFailedAsync(conn, job.JobId, response.Message);
-            return ScheduleActionResult.Failed("booking-email", response.Message, new { sent });
-        }
-
-        await MarkWorkflowActionSentAsync(conn, job.JobId, BuildBookingActionKey(service.ServiceKey, service.Label));
-        sent.Add(service.Label);
-    }
-
-    await MarkBookingEmailSentAsync(conn, job.JobId);
-    return ScheduleActionResult.Ok("booking-email", $"Sent {sent.Count} booking email(s).", new { sent });
+            senderMode = "manual-smtp",
+            provider = "Company SMTP",
+            credentialsStoredLocally = true,
+            pending = services.Select(service => service.Label).ToArray()
+        });
 }
 
 static IEnumerable<ScheduleServiceInput> GetSchedulableServices(ScheduleJobInput job)
@@ -9043,22 +10857,17 @@ static string BuildScheduleBookingEmailHtml(ScheduleJobInput job, ScheduleServic
 static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
     NpgsqlConnection conn,
     Guid jobId,
-    IConfiguration configuration)
+    IConfiguration configuration,
+    bool forceDuplicate = false,
+    decimal? explicitAdditionalAmount = null,
+    decimal? verifiedInvoicedTotal = null,
+    bool allowAutomaticSend = true,
+    IReadOnlyList<AutoMateApi.InvoiceAdjustmentLine>? explicitAdjustmentLines = null)
 {
     var job = await LoadXeroInvoiceJobAsync(conn, jobId);
     if (job == null)
         return ScheduleActionResult.Failed("invoice", "Job was not found in Railway. Sync the selected job first.");
-
-    if (!string.IsNullOrWhiteSpace(job.XeroInvoiceId))
-    {
-        await MarkInvoiceSentAsync(conn, jobId);
-        return ScheduleActionResult.Skip("invoice", "Xero draft invoice already exists.", new
-        {
-            invoiceId = job.XeroInvoiceId,
-            invoiceNumber = job.XeroInvoiceNumber,
-            invoiceStatus = job.XeroInvoiceStatus
-        });
-    }
+    var xeroSettings=await AutoMateApi.IntegrationHubSupport.LoadXeroAsync(conn,job.TenantId);
 
     var account = await GetXeroAccountAsync(conn, job.InspectorId, configuration);
     if (!account.Success)
@@ -9071,6 +10880,32 @@ static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
     httpClient.DefaultRequestHeaders.Add("xero-tenant-id", account.TenantId);
     httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+    var updateExisting=false;
+    var existingStatus="";
+    decimal? existingTotal=null;
+    if(!string.IsNullOrWhiteSpace(job.XeroInvoiceId))
+    {
+        var existingResponse=await httpClient.GetAsync("https://api.xero.com/api.xro/2.0/Invoices/"+Uri.EscapeDataString(job.XeroInvoiceId));
+        var existingJson=await existingResponse.Content.ReadAsStringAsync();
+        if(!existingResponse.IsSuccessStatusCode)
+        {
+            var message="Xero could not verify the existing invoice before applying the THREED change: "+existingJson;
+            await StoreXeroJobErrorAsync(conn,jobId,message);
+            return ScheduleActionResult.Failed("invoice",message);
+        }
+        var existingDoc=JsonDocument.Parse(existingJson).RootElement;
+        var existingInvoice=existingDoc.TryGetProperty("Invoices",out var existingInvoices)&&existingInvoices.ValueKind==JsonValueKind.Array&&existingInvoices.GetArrayLength()>0?existingInvoices[0]:existingDoc;
+        existingStatus=GetJsonString(existingInvoice,"Status").ToUpperInvariant();
+        if(existingInvoice.TryGetProperty("Total",out var totalElement)&&totalElement.TryGetDecimal(out var parsedExistingTotal))existingTotal=parsedExistingTotal;
+        if(!forceDuplicate)return ScheduleActionResult.Skip("invoice","The existing Xero invoice was preserved. Changed totals require an explicit additional-invoice review action.",new{invoiceId=job.XeroInvoiceId,invoiceNumber=job.XeroInvoiceNumber,invoiceStatus=existingStatus});
+        if(existingStatus is "VOIDED" or "DELETED")
+        {
+            var message=$"Invoice adjustment required: Xero invoice {job.XeroInvoiceNumber} is {existingStatus}. AutoMate did not create an additional invoice.";
+            await StoreXeroJobErrorAsync(conn,jobId,message);
+            return ScheduleActionResult.Failed("invoice",message,new{reviewTarget="job.invoice",errorCode="xero_invoice_not_draft",invoiceId=job.XeroInvoiceId,invoiceNumber=job.XeroInvoiceNumber,invoiceStatus=existingStatus});
+        }
+    }
 
     var contactId = job.XeroContactId;
     if (string.IsNullOrWhiteSpace(contactId))
@@ -9099,38 +10934,55 @@ static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
         return ScheduleActionResult.Failed("invoice", message);
     }
 
-    var invoicePayload = new
+    var reconciledTotal=invoiceLines.Sum(line=>(line.Quantity<=0m?1m:line.Quantity)*line.UnitAmount);
+    if(job.JobTotal.HasValue&&Math.Abs(reconciledTotal-job.JobTotal.Value)>0.01m)
     {
-        Invoices = new[]
+        var lineDetail=string.Join("; ",invoiceLines.Select(line=>$"#{line.LineIndex} {line.Description}: {(line.Quantity<=0m?1m:line.Quantity):0.####} x {line.UnitAmount:0.00}"));
+        var message=$"Live THREED invoice mismatch: {invoiceLines.Count} lines total {reconciledTotal:0.00}, but THREED total is {job.JobTotal.Value:0.00}. Lines: {lineDetail}. Xero was not called.";
+        await StoreXeroJobErrorAsync(conn,jobId,message);return ScheduleActionResult.Failed("invoice",message);
+    }
+    if(string.Equals(xeroSettings.LineMode,"summary",StringComparison.OrdinalIgnoreCase))
+    {
+        var total=job.JobTotal??invoiceLines.Sum(line=>(line.Quantity<=0m?1m:line.Quantity)*line.UnitAmount);
+        invoiceLines=[new XeroInvoiceLineInput(BuildFallbackInvoiceDescription(job.PrimaryService,job.SiteAddress),1m,total,1)];
+    }
+    if(forceDuplicate&&existingTotal.HasValue)
+    {
+        var latest=job.JobTotal??reconciledTotal;var baseline=verifiedInvoicedTotal??existingTotal.Value;var difference=explicitAdditionalAmount??(latest-baseline);
+        if(difference< -0.01m)return ScheduleActionResult.Failed("invoice",$"Job total decreased by {Math.Abs(difference):C}. Accounting credit review required; AutoMate created no Xero record.",new{reviewTarget="job.automations.invoice",errorCode="credit_review_required",originalInvoiceId=job.XeroInvoiceId,previousTotal=baseline,currentTotal=latest,difference});
+        if(difference<=0.01m)return ScheduleActionResult.Skip("invoice","The THREED total has not increased. No additional invoice is required.",new{originalInvoiceId=job.XeroInvoiceId,previousTotal=baseline,currentTotal=latest,difference});
+        if(explicitAdjustmentLines is { Count: > 0 }&&Math.Abs(explicitAdjustmentLines.Sum(line=>line.Amount)-difference)<=0.01m)
+            invoiceLines=explicitAdjustmentLines.Select((line,index)=>new XeroInvoiceLineInput(line.Description,1m,line.Amount,index+1)).ToList();
+        else
+            invoiceLines=[new XeroInvoiceLineInput($"Services changed from original invoice {job.XeroInvoiceNumber}: THREED invoice total adjustment",1m,difference,1)];
+    }
+    var xeroLines=invoiceLines.Select(line=>
+    {
+        var item=new Dictionary<string,object>
         {
-            new
-            {
-                Type = "ACCREC",
-                Contact = new { ContactID = contactId },
-                DateString = DateTime.UtcNow.ToString("yyyy-MM-dd"),
-                DueDateString = (job.JobDate ?? DateTime.UtcNow).ToString("yyyy-MM-dd"),
-                Reference = string.IsNullOrWhiteSpace(job.SiteAddress) ? job.JobName : job.SiteAddress,
-                Status = "DRAFT",
-                SentToContact = false,
-                LineItems = invoiceLines.Select(line => new
-                {
-                    Description = line.Description,
-                    Quantity = line.Quantity <= 0m ? 1m : line.Quantity,
-                    UnitAmount = line.UnitAmount
-                }).ToArray()
-            }
-        }
+            ["Description"]=line.Description,["Quantity"]=line.Quantity<=0m?1m:line.Quantity,["UnitAmount"]=line.UnitAmount
+        };
+        if(!string.IsNullOrWhiteSpace(xeroSettings.SalesAccountCode))item["AccountCode"]=xeroSettings.SalesAccountCode;
+        return item;
+    }).ToArray();
+    // The Pro-Spect pilot always creates/updates a reviewable Draft. Sending or
+    // authorising invoices remains the accounting user's responsibility in Xero.
+    const string targetStatus="DRAFT";
+    var invoiceRecord = new Dictionary<string,object>
+    {
+        ["Type"]="ACCREC",["Contact"]=new{ContactID=contactId},["DateString"]=DateTime.UtcNow.ToString("yyyy-MM-dd"),["DueDateString"]=(job.JobDate??DateTime.UtcNow).ToString("yyyy-MM-dd"),["Reference"]=string.IsNullOrWhiteSpace(job.SiteAddress)?job.JobName:job.SiteAddress,["Status"]=targetStatus,["SentToContact"]=false,["LineAmountTypes"]="Inclusive",["LineItems"]=xeroLines
     };
+    if(!string.IsNullOrWhiteSpace(xeroSettings.BrandingThemeId))invoiceRecord["BrandingThemeID"]=xeroSettings.BrandingThemeId;
+    var invoicePayload=new{Invoices=new[]{invoiceRecord}};
 
-    var invoiceResponse = await httpClient.PostAsJsonAsync(
-        "https://api.xero.com/api.xro/2.0/Invoices",
-        invoicePayload);
+    var invoiceEndpoint="https://api.xero.com/api.xro/2.0/Invoices"+(updateExisting?"/"+Uri.EscapeDataString(job.XeroInvoiceId):"");
+    var invoiceResponse = await httpClient.PostAsJsonAsync(invoiceEndpoint,invoicePayload);
     var invoiceJson = await invoiceResponse.Content.ReadAsStringAsync();
 
     if (!invoiceResponse.IsSuccessStatusCode)
     {
         await StoreXeroJobErrorAsync(conn, jobId, invoiceJson);
-        return ScheduleActionResult.Failed("invoice", "Xero draft invoice creation failed: " + invoiceJson);
+        return ScheduleActionResult.Failed("invoice", (updateExisting?"Xero draft invoice update failed: ":"Xero invoice creation failed: ") + invoiceJson);
     }
 
     var invoiceDoc = JsonDocument.Parse(invoiceJson).RootElement;
@@ -9144,15 +10996,40 @@ static async Task<ScheduleActionResult> CreateXeroDraftInvoiceForJobAsync(
     var invoiceNumber = GetJsonString(invoice, "InvoiceNumber");
     var invoiceStatus = GetJsonString(invoice, "Status");
 
-    await StoreXeroInvoiceResultAsync(conn, jobId, contactId, invoiceId, invoiceNumber, invoiceStatus);
-    await MarkInvoiceSentAsync(conn, jobId);
+    if(string.IsNullOrWhiteSpace(invoiceId))
+    {
+        await StoreXeroJobErrorAsync(conn,jobId,"Xero accepted the request but returned no invoice ID.");
+        return ScheduleActionResult.Failed("invoice","Xero returned no invoice ID; creation is not recorded as complete.");
+    }
+    if(forceDuplicate&&existingTotal.HasValue)
+    {
+        await AutoMateApi.JobReconciliationSupport.EnsureAsync(conn);
+        var latest=job.JobTotal??reconciledTotal;var previous=verifiedInvoicedTotal??existingTotal.Value;var difference=explicitAdditionalAmount??(latest-previous);await using var evidence=new NpgsqlCommand("INSERT INTO public.job_additional_invoice_evidence(tenant_id,job_id,original_invoice_id,additional_invoice_id,additional_invoice_number,previous_total,current_total,difference,status) VALUES(@tenant,@job,@original,@additional,@number,@previous,@current,@difference,@status) ON CONFLICT DO NOTHING",conn);evidence.Parameters.AddWithValue("tenant",job.TenantId);evidence.Parameters.AddWithValue("job",jobId);evidence.Parameters.AddWithValue("original",job.XeroInvoiceId);evidence.Parameters.AddWithValue("additional",invoiceId);evidence.Parameters.AddWithValue("number",invoiceNumber);evidence.Parameters.AddWithValue("previous",previous);evidence.Parameters.AddWithValue("current",latest);evidence.Parameters.AddWithValue("difference",difference);evidence.Parameters.AddWithValue("status",invoiceStatus);await evidence.ExecuteNonQueryAsync();
+    }
+    else await StoreXeroInvoiceResultAsync(conn, jobId, contactId, invoiceId, invoiceNumber, invoiceStatus);
+    var sentToContact=false;
+    if(allowAutomaticSend&&string.Equals(xeroSettings.DeliveryMode,"send",StringComparison.OrdinalIgnoreCase)&&string.Equals(targetStatus,"AUTHORISED",StringComparison.OrdinalIgnoreCase))
+    {
+        var emailResponse=await httpClient.PostAsync("https://api.xero.com/api.xro/2.0/Invoices/"+Uri.EscapeDataString(invoiceId)+"/Email",null);
+        var emailJson=await emailResponse.Content.ReadAsStringAsync();
+        if(!emailResponse.IsSuccessStatusCode)
+        {
+            await StoreXeroJobErrorAsync(conn,jobId,"Invoice created but Xero email failed: "+emailJson);
+            return ScheduleActionResult.Failed("invoice","Xero invoice was created but could not be emailed. Review it in Xero; AutoMate will not create a duplicate.");
+        }
+        sentToContact=true;
+    }
+    if(!forceDuplicate)await MarkInvoiceSentAsync(conn, jobId);
 
-    return ScheduleActionResult.Ok("invoice", "Xero draft invoice created.", new
+    return ScheduleActionResult.Ok("invoice", forceDuplicate&&existingTotal.HasValue?"Additional Xero draft invoice created for the increased job total.":"Xero draft invoice created for review.", new
     {
         invoiceId,
         invoiceNumber,
         invoiceStatus,
-        sentToContact = false
+        sentToContact,
+        lineMode=xeroSettings.LineMode,
+        salesAccountCode=xeroSettings.SalesAccountCode,
+        updatedExisting=updateExisting
     });
 }
 
@@ -9160,16 +11037,29 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
     NpgsqlConnection conn,
     ScheduleJobInput job,
     IConfiguration configuration,
-    bool forceResend)
+    bool forceResend,
+    bool replaceUnsignedAgreement = false,
+    Guid? selectedPlanItemId = null)
 {
+    Guid? supersessionId = null;
     if (!job.TermsRequired)
         return ScheduleActionResult.Skip("terms", "Terms are not required for this job.");
 
-    if (job.TermsSigned && !forceResend)
-        return ScheduleActionResult.Skip("terms", "Terms are already signed.", new { documentId = job.SignNowDocumentId });
-
-    if (job.TermsSent && !job.TermsRetryRequested && !forceResend)
-        return ScheduleActionResult.Skip("terms", "Terms have already been sent.", new { documentId = job.SignNowDocumentId });
+    var agreementPlan=await AutoMateApi.TenantAgreementPolicySupport.LoadJobPlanAsync(conn,job.TenantId,job.JobId);
+    if(agreementPlan?.ReviewRequired==true)return ScheduleActionResult.Failed("terms","The frozen agreement plan requires review.");
+    var provider=AutoMateApi.AgreementProviderSupport.NormalizeProvider(agreementPlan?.Handler.ProviderKey??"signnow");
+    if(provider is "adobe_sign" or "docusign")return await SendAgreementProviderTermsForJobAsync(conn,job,agreementPlan!,provider,configuration,forceResend,replaceUnsignedAgreement,selectedPlanItemId);
+    if(agreementPlan?.Items.Count>1&&selectedPlanItemId is null)
+    {
+        var results=new List<ScheduleActionResult>();foreach(var item in agreementPlan.Items){var result=await SendSignNowTermsForJobAsync(conn,job,configuration,forceResend,replaceUnsignedAgreement,item.PlanItemId);results.Add(result);if(!result.Success){await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(conn,job.TenantId,job.JobId);return ScheduleActionResult.Failed("terms",$"SignNow stopped after {results.Count-1} of {agreementPlan.Items.Count} required agreements. Retry resumes without replaying completed items.",new{results});}}
+        await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(conn,job.TenantId,job.JobId);return ScheduleActionResult.Ok("terms",$"All {agreementPlan.Items.Count} required SignNow agreements were sent.",new{results});
+    }
+    var agreementItem=selectedPlanItemId.HasValue?agreementPlan?.Items.SingleOrDefault(x=>x.PlanItemId==selectedPlanItemId.Value):agreementPlan?.Items.SingleOrDefault();
+    if(agreementItem?.Status=="signed"&&!forceResend)return ScheduleActionResult.Skip("terms","The agreement is already signed.",new{documentId=agreementItem.ExternalDocumentId});
+    if(agreementItem?.Status=="invited"&&!forceResend&&!replaceUnsignedAgreement)return ScheduleActionResult.Skip("terms","The agreement has already been sent.",new{documentId=agreementItem.ExternalDocumentId,inviteId=agreementItem.ExternalInviteId});
+    if(job.TermsSigned&&!forceResend)return ScheduleActionResult.Skip("terms","The existing signed agreement evidence was retained and no second agreement was sent.",new{documentId=job.SignNowDocumentId});
+    if(job.TermsSent&&!job.TermsRetryRequested&&!forceResend&&!replaceUnsignedAgreement)return ScheduleActionResult.Skip("terms","The existing sent agreement evidence was retained and no second agreement was sent.",new{documentId=job.SignNowDocumentId});
+    if(agreementItem!=null&&!replaceUnsignedAgreement&&!forceResend&&!string.IsNullOrWhiteSpace(job.SignNowDocumentId)&&string.IsNullOrWhiteSpace(agreementItem.ExternalDocumentId))return ScheduleActionResult.Failed("terms","Legacy SignNow evidence exists but is not bound to the frozen agreement plan. Reconcile it before sending another agreement.");
 
     if (string.IsNullOrWhiteSpace(job.ClientEmail))
     {
@@ -9177,9 +11067,8 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         return ScheduleActionResult.Failed("terms", "Client email is missing.");
     }
 
-    var templateKey = ResolveSignNowTermsTemplateKey(job.BookingTemplateKey);
-
-    var mapping = await GetSignNowTemplateMappingAsync(conn, templateKey);
+    var templateKey = agreementItem==null?ResolveSignNowTermsTemplateKey(job.BookingTemplateKey):agreementItem.ServiceId.ToString("D");
+    var mapping = agreementItem==null?await GetSignNowTemplateMappingAsync(conn, templateKey):new SignNowTemplateMappingResult(templateKey,agreementItem.TemplateId,agreementItem.TemplateName,agreementPlan!.CapturedAt.ToString("O"));
     if (mapping == null || string.IsNullOrWhiteSpace(mapping.TemplateId))
     {
         var message = $"No SignNow template is mapped for service/template key '{templateKey}'. Open Setup / Settings > SignNow Templates and choose a template.";
@@ -9197,6 +11086,78 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
     using var httpClient = new HttpClient();
     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
     httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+    if (forceResend && job.TermsSigned && agreementItem!=null && !string.IsNullOrWhiteSpace(job.SignNowDocumentId))
+    {
+        supersessionId=Guid.NewGuid();
+        await using var audit=new NpgsqlCommand("INSERT INTO public.signnow_document_supersessions(supersession_id,tenant_id,job_id,previous_document_id,reason,status) VALUES(@id,@tenant,@job,@document,'signed_material_change_reviewed','signed_original_preserved')",conn);
+        audit.Parameters.AddWithValue("id",supersessionId.Value);audit.Parameters.AddWithValue("tenant",job.TenantId);audit.Parameters.AddWithValue("job",job.JobId);audit.Parameters.AddWithValue("document",job.SignNowDocumentId);await audit.ExecuteNonQueryAsync();
+        await using var reopen=new NpgsqlCommand("UPDATE public.jobs_staging SET terms_signed=false,terms_signed_at=NULL,terms_sent=false,terms_sent_at=NULL,updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job",conn);
+        reopen.Parameters.AddWithValue("tenant",job.TenantId.ToString("D"));reopen.Parameters.AddWithValue("job",job.JobId);await reopen.ExecuteNonQueryAsync();
+    }
+    if (replaceUnsignedAgreement && !job.TermsSigned)
+    {
+        var existingDocumentId = agreementItem?.ExternalDocumentId;
+        if (string.IsNullOrWhiteSpace(existingDocumentId)) existingDocumentId = job.SignNowDocumentId;
+        if (!string.IsNullOrWhiteSpace(existingDocumentId))
+        {
+            var currentResponse = await httpClient.GetAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(existingDocumentId)}");
+            var currentJson = await currentResponse.Content.ReadAsStringAsync();
+            if (currentResponse.IsSuccessStatusCode && !string.IsNullOrWhiteSpace(currentJson))
+            {
+                var currentRoot = JsonDocument.Parse(currentJson).RootElement;
+                var currentStatus = FirstNonEmptyJsonString(currentRoot, "status", "state", "invite_status");
+                if (string.IsNullOrWhiteSpace(currentStatus)) currentStatus = FindJsonStringRecursive(currentRoot, "status", "state", "invite_status");
+                if (LooksLikeSignNowCompleted(currentStatus))
+                {
+                    await StoreSignNowStatusAsync(conn, job.JobId, existingDocumentId, null, null, currentStatus, null, true, DateTime.UtcNow);
+                    return ScheduleActionResult.Failed("terms", "The existing agreement is now signed. It was preserved and the changed agreement requires review.");
+                }
+            }
+            else if (currentResponse.StatusCode != System.Net.HttpStatusCode.NotFound)
+            {
+                var message = "SignNow could not confirm whether the previous agreement is unsigned, so it was preserved: " + currentJson;
+                await MarkTermsFailedAsync(conn, job.JobId, message);
+                return ScheduleActionResult.Failed("terms", message);
+            }
+            var deleteResponse = await httpClient.DeleteAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(existingDocumentId)}");
+            var deleteJson = await deleteResponse.Content.ReadAsStringAsync();
+            if (!deleteResponse.IsSuccessStatusCode && deleteResponse.StatusCode != System.Net.HttpStatusCode.NotFound)
+            {
+                var message = "SignNow could not cancel the previous unsigned agreement, so no replacement was sent: " + deleteJson;
+                await MarkTermsFailedAsync(conn, job.JobId, message);
+                return ScheduleActionResult.Failed("terms", message);
+            }
+
+            supersessionId = Guid.NewGuid();
+            await using (var audit = new NpgsqlCommand("INSERT INTO public.signnow_document_supersessions(supersession_id,tenant_id,job_id,previous_document_id,reason,status) VALUES(@id,@tenant,@job,@document,'authoritative_threed_change','previous_unsigned_document_deleted')", conn))
+            {
+                audit.Parameters.AddWithValue("id", supersessionId.Value);
+                audit.Parameters.AddWithValue("tenant", job.TenantId);
+                audit.Parameters.AddWithValue("job", job.JobId);
+                audit.Parameters.AddWithValue("document", existingDocumentId);
+                await audit.ExecuteNonQueryAsync();
+            }
+
+            await using (var clearJob = new NpgsqlCommand(@"UPDATE public.jobs_staging SET
+terms_sent=false,terms_sent_at=NULL,terms_retry_requested=false,terms_retry_requested_at=NULL,
+signnow_document_id=NULL,signnow_invite_id=NULL,signnow_document_status='superseded-by-threed-change',
+signnow_signing_link=NULL,updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job AND terms_signed=false", conn))
+            {
+                clearJob.Parameters.AddWithValue("tenant", job.TenantId.ToString("D"));
+                clearJob.Parameters.AddWithValue("job", job.JobId);
+                await clearJob.ExecuteNonQueryAsync();
+            }
+            if (agreementItem != null)
+            {
+                await using var clearItem = new NpgsqlCommand("UPDATE public.job_agreement_items SET status='not_prepared',external_document_id='',external_invite_id='',updated_at=NOW() WHERE plan_item_id=@item AND tenant_id=@tenant AND job_id=@job AND status<>'signed'", conn);
+                clearItem.Parameters.AddWithValue("item", agreementItem.PlanItemId);
+                clearItem.Parameters.AddWithValue("tenant", job.TenantId);
+                clearItem.Parameters.AddWithValue("job", job.JobId);
+                await clearItem.ExecuteNonQueryAsync();
+            }
+        }
+    }
 
     var documentName = BuildSignNowDocumentName(job);
     var copyResponse = await httpClient.PostAsJsonAsync(
@@ -9296,6 +11257,18 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         mapping.TemplateId,
         "sent",
         signingLink);
+    if (supersessionId.HasValue)
+    {
+        await using var audit = new NpgsqlCommand("UPDATE public.signnow_document_supersessions SET replacement_document_id=@document,status='replacement_invited',updated_at=NOW() WHERE supersession_id=@id", conn);
+        audit.Parameters.AddWithValue("document", documentId);
+        audit.Parameters.AddWithValue("id", supersessionId.Value);
+        await audit.ExecuteNonQueryAsync();
+    }
+    if(agreementItem!=null)
+    {
+        await using var updateItem=new NpgsqlCommand("UPDATE public.job_agreement_items SET status='invited',external_document_id=@document,external_invite_id=@invite,updated_at=NOW() WHERE plan_item_id=@item AND tenant_id=@tenant AND job_id=@job AND status NOT IN ('invited','signed')",conn);
+        updateItem.Parameters.AddWithValue("document",documentId);updateItem.Parameters.AddWithValue("invite",inviteId);updateItem.Parameters.AddWithValue("item",agreementItem.PlanItemId);updateItem.Parameters.AddWithValue("tenant",job.TenantId);updateItem.Parameters.AddWithValue("job",job.JobId);await updateItem.ExecuteNonQueryAsync();
+    }
     await StoreSignNowWebhookResultAsync(conn, job.JobId, webhook);
 
     return ScheduleActionResult.Ok("terms", "SignNow terms sent to client.", new
@@ -9310,6 +11283,83 @@ static async Task<ScheduleActionResult> SendSignNowTermsForJobAsync(
         webhookSubscriptionId = webhook.SubscriptionId,
         webhookError = webhook.Error
     });
+}
+
+static async Task<ScheduleActionResult> SendAgreementProviderTermsForJobAsync(NpgsqlConnection conn,ScheduleJobInput job,AutoMateApi.JobAgreementPlanView plan,string provider,IConfiguration configuration,bool forceResend,bool replaceUnsignedAgreement,Guid? selectedPlanItemId)
+{
+    if(string.IsNullOrWhiteSpace(job.ClientEmail))return ScheduleActionResult.Failed("terms","Client email is missing.");var display=provider=="adobe_sign"?"Adobe Acrobat Sign":"DocuSign";var items=selectedPlanItemId.HasValue?plan.Items.Where(x=>x.PlanItemId==selectedPlanItemId.Value).ToList():plan.Items.ToList();if(items.Count==0)return ScheduleActionResult.Skip("terms","No agreement item is required.");var account=await GetAgreementProviderAccountAsync(conn,job.TenantId,provider,configuration,CancellationToken.None);if(!account.Success)return ScheduleActionResult.Failed("terms",account.Error);var webhookUrl=configuration[provider=="adobe_sign"?"ADOBE_SIGN_WEBHOOK_URL":"DOCUSIGN_WEBHOOK_URL"]??"";if(!AutoMateApi.ProviderIntegrationSupport.IsRealValue(webhookUrl))return ScheduleActionResult.Failed("terms",$"{display} live status callback is not configured. Add the Railway webhook URL before sending agreements.");if(provider=="docusign"&&!AutoMateApi.ProviderIntegrationSupport.IsRealValue(configuration["DOCUSIGN_CONNECT_HMAC_SECRET"]))return ScheduleActionResult.Failed("terms","DocuSign Connect HMAC is not configured. Add the DocuSign HMAC secret in Railway before sending agreements.");var results=new List<object>();var trackingWarnings=false;using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    foreach(var item in items)
+    {
+        if(item.Status=="signed"&&!forceResend){results.Add(new{item.PlanItemId,item.ServiceName,status="signed",skipped=true});continue;}if(item.Status=="invited"&&!forceResend&&!replaceUnsignedAgreement){results.Add(new{item.PlanItemId,item.ServiceName,status="invited",documentId=item.ExternalDocumentId,skipped=true});continue;}
+        if(replaceUnsignedAgreement&&!string.IsNullOrWhiteSpace(item.ExternalDocumentId)&&item.Status!="signed")
+        {
+            var cancellation=await CancelProviderAgreementAsync(client,provider,account,item.ExternalDocumentId);if(cancellation.Signed){await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"signed",item.ExternalDocumentId,item.ExternalInviteId,cancellation.ProviderStatus,"",CancellationToken.None);await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(conn,job.TenantId,job.JobId);return ScheduleActionResult.Failed("terms",$"{display} reports that {item.ServiceName} is signed. It was preserved and requires review.");}if(!cancellation.Success)return ScheduleActionResult.Failed("terms",$"{display} could not confirm and cancel the previous unsigned {item.ServiceName} agreement, so no replacement was sent: {cancellation.Error}");await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"superseded",item.ExternalDocumentId,item.ExternalInviteId,cancellation.ProviderStatus,"",CancellationToken.None);
+        }
+        var mapping=await AutoMateApi.AgreementProviderSupport.LoadMappingAsync(conn,job.TenantId,provider,item.ServiceId);var templateId=!string.IsNullOrWhiteSpace(item.TemplateId)?item.TemplateId:mapping?.TemplateId??"";var signerRole=mapping?.SignerRole??(provider=="adobe_sign"?"SIGNER":"Signer 1");if(string.IsNullOrWhiteSpace(templateId)){var message=$"No {display} template is frozen or mapped for {item.ServiceName}.";await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"failed","","","mapping_required",message,CancellationToken.None);return ScheduleActionResult.Failed("terms",message);}
+        await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"prepared","","","creating","",CancellationToken.None);HttpResponseMessage response;string json;var documentName=$"{job.JobName} - {item.ServiceName} - {job.ClientDisplayName}".Trim(' ','-');
+        if(provider=="adobe_sign")
+        {
+            response=await client.PostAsJsonAsync(account.ApiBaseUri+"/api/rest/v6/agreements",new{fileInfos=new[]{new{libraryDocumentId=templateId}},name=documentName,participantSetsInfo=new[]{new{memberInfos=new[]{new{email=job.ClientEmail.Trim()}},order=1,role="SIGNER"}},signatureType="ESIGN",state="IN_PROCESS",externalId=new{id=item.PlanItemId.ToString("D")}});json=await response.Content.ReadAsStringAsync();
+        }
+        else
+        {
+            response=await client.PostAsJsonAsync(account.ApiBaseUri+"/restapi/v2.1/accounts/"+Uri.EscapeDataString(account.ExternalAccountId)+"/envelopes",new{templateId,templateRoles=new[]{new{email=job.ClientEmail.Trim(),name=string.IsNullOrWhiteSpace(job.ClientDisplayName)?job.ClientName:job.ClientDisplayName,roleName=signerRole}},status="sent",emailSubject="Please sign "+item.ServiceName,transactionId=item.PlanItemId.ToString("D"),eventNotification=new{url=webhookUrl,loggingEnabled="true",requireAcknowledgment="true",useSoapInterface="false",includeDocuments="false",includeEnvelopeVoidReason="true",includeTimeZone="true",includeSenderAccountAsCustomField="false",includeDocumentFields="false",includeCertificateOfCompletion="false",includeHMAC="true",deliveryMode="SIM",envelopeEvents=new[]{new{envelopeEventStatusCode="sent",includeDocuments="false"},new{envelopeEventStatusCode="delivered",includeDocuments="false"},new{envelopeEventStatusCode="completed",includeDocuments="false"},new{envelopeEventStatusCode="declined",includeDocuments="false"},new{envelopeEventStatusCode="voided",includeDocuments="false"}},eventData=new{version="restv2.1",format="json",includeData=new[]{"recipients"}}}});json=await response.Content.ReadAsStringAsync();
+        }
+        if(!response.IsSuccessStatusCode){var message=$"{display} could not create and send {item.ServiceName}: {ProviderSafeError(json)}";await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"failed","","","send_failed",message,CancellationToken.None);await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(conn,job.TenantId,job.JobId);return ScheduleActionResult.Failed("terms",message,new{results});}
+        using var document=JsonDocument.Parse(json);var documentId=provider=="adobe_sign"?GetJsonString(document.RootElement,"id"):GetJsonString(document.RootElement,"envelopeId");var status=FirstNonEmptyJsonString(document.RootElement,"status","state");if(string.IsNullOrWhiteSpace(documentId)){var message=$"{display} accepted {item.ServiceName} but returned no document ID.";await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"failed","","",status,message,CancellationToken.None);return ScheduleActionResult.Failed("terms",message);}
+        await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"invited",documentId,"",status,"",CancellationToken.None);ProviderWebhookRegistrationResult webhook;if(provider=="adobe_sign")webhook=await CreateAdobeAgreementWebhookAsync(client,account.ApiBaseUri,documentId,item.ServiceName,webhookUrl);else webhook=new(true,"per-envelope","");await AutoMateApi.AgreementProviderSupport.RecordWebhookRegistrationAsync(conn,job.TenantId,job.JobId,item.PlanItemId,webhook.Success,webhook.SubscriptionId,webhook.Error,CancellationToken.None);trackingWarnings|=!webhook.Success;results.Add(new{item.PlanItemId,item.ServiceName,documentId,status,provider,webhookCreated=webhook.Success,webhookSubscriptionId=webhook.SubscriptionId,webhookError=webhook.Error});
+    }
+    await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(conn,job.TenantId,job.JobId);var summaryMessage=items.Count==1?$"{display} agreement sent to the client.":$"All {items.Count} required {display} agreements were sent.";if(trackingWarnings)summaryMessage+=" Live status tracking could not be registered for one or more agreements; use Refresh status while the provider issue is corrected.";return ScheduleActionResult.Ok("terms",summaryMessage,new{provider,results,trackingWarnings});
+}
+
+static async Task<ProviderWebhookRegistrationResult> CreateAdobeAgreementWebhookAsync(HttpClient client,string apiBaseUri,string agreementId,string serviceName,string webhookUrl)
+{
+    try
+    {
+        using var response=await client.PostAsJsonAsync(apiBaseUri.TrimEnd('/')+"/api/rest/v6/webhooks",new{name=("AutoMate - "+serviceName+" - "+agreementId).Length>255?("AutoMate - "+agreementId):("AutoMate - "+serviceName+" - "+agreementId),scope="RESOURCE",state="ACTIVE",webhookSubscriptionEvents=new[]{"AGREEMENT_ALL"},webhookUrlInfo=new{url=webhookUrl},resourceType="AGREEMENT",resourceId=agreementId,webhookConditionalParams=new{webhookAgreementEvents=new{includeDetailedInfo=false,includeDocumentsInfo=false,includeParticipantsInfo=false,includeSignedDocuments=false}}});
+        var json=await response.Content.ReadAsStringAsync();if(!response.IsSuccessStatusCode)return new(false,"",ProviderSafeError(json));var subscriptionId="";if(!string.IsNullOrWhiteSpace(json)){using var document=JsonDocument.Parse(json);subscriptionId=FirstNonEmptyJsonString(document.RootElement,"id","webhookId");}if(string.IsNullOrWhiteSpace(subscriptionId)&&response.Headers.Location is not null)subscriptionId=response.Headers.Location.Segments.LastOrDefault()?.Trim('/')??"";return new(true,subscriptionId,"");
+    }
+    catch(Exception ex){return new(false,"",ex.Message);}
+}
+
+static async Task<ProviderAgreementCancellationResult> CancelProviderAgreementAsync(HttpClient client,string provider,AgreementProviderAccessResult account,string documentId)
+{
+    try
+    {
+        var statusUrl=provider=="adobe_sign"?account.ApiBaseUri+"/api/rest/v6/agreements/"+Uri.EscapeDataString(documentId):account.ApiBaseUri+"/restapi/v2.1/accounts/"+Uri.EscapeDataString(account.ExternalAccountId)+"/envelopes/"+Uri.EscapeDataString(documentId);using var current=await client.GetAsync(statusUrl);var json=await current.Content.ReadAsStringAsync();if(!current.IsSuccessStatusCode&&current.StatusCode!=System.Net.HttpStatusCode.NotFound)return new(false,false,"",ProviderSafeError(json));var status="";if(current.IsSuccessStatusCode&&!string.IsNullOrWhiteSpace(json)){using var document=JsonDocument.Parse(json);status=FirstNonEmptyJsonString(document.RootElement,"status","state");}var signed=provider=="adobe_sign"?status.Equals("SIGNED",StringComparison.OrdinalIgnoreCase)||status.Equals("APPROVED",StringComparison.OrdinalIgnoreCase):status.Equals("completed",StringComparison.OrdinalIgnoreCase);if(signed)return new(false,true,status,"");if(current.StatusCode==System.Net.HttpStatusCode.NotFound)return new(true,false,"not_found","");HttpResponseMessage cancellation;if(provider=="adobe_sign")cancellation=await client.PutAsJsonAsync(statusUrl+"/state",new{state="CANCELLED",comment="Replaced by AutoMate after a confirmed THREED change"});else cancellation=await client.PutAsJsonAsync(statusUrl,new{status="voided",voidedReason="Replaced by AutoMate after a confirmed THREED change"});using(cancellation){var cancelJson=await cancellation.Content.ReadAsStringAsync();return cancellation.IsSuccessStatusCode?new(true,false,provider=="adobe_sign"?"CANCELLED":"voided",""):new(false,false,status,ProviderSafeError(cancelJson));}
+    }
+    catch(Exception ex){return new(false,false,"",ex.Message);}
+}
+
+static string ProviderSafeError(string json)
+{
+    if(string.IsNullOrWhiteSpace(json))return "The provider returned an empty error.";try{using var document=JsonDocument.Parse(json);var message=FindJsonStringRecursive(document.RootElement,"message","error_description","errorCode","error");return string.IsNullOrWhiteSpace(message)?"The provider rejected the request.":message;}catch{return json.Length>500?json[..500]:json;}
+}
+
+static async Task<ScheduleActionResult> CancelUnsignedSignNowTermsForJobAsync(NpgsqlConnection conn,ScheduleJobInput job,IConfiguration configuration)
+{
+    var plan=await AutoMateApi.TenantAgreementPolicySupport.LoadJobPlanAsync(conn,job.TenantId,job.JobId);var provider=AutoMateApi.AgreementProviderSupport.NormalizeProvider(plan?.Handler.ProviderKey??"signnow");if(provider is "adobe_sign" or "docusign")
+    {
+        var providerAccount=await GetAgreementProviderAccountAsync(conn,job.TenantId,provider,configuration,CancellationToken.None);if(!providerAccount.Success)return ScheduleActionResult.Failed("terms_cancel",providerAccount.Error);using var providerClient=new HttpClient();providerClient.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",providerAccount.AccessToken);var cancelled=new List<object>();foreach(var item in plan!.Items){if(item.Status=="signed"||string.IsNullOrWhiteSpace(item.ExternalDocumentId))continue;var result=await CancelProviderAgreementAsync(providerClient,provider,providerAccount,item.ExternalDocumentId);if(result.Signed){await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"signed",item.ExternalDocumentId,item.ExternalInviteId,result.ProviderStatus,"",CancellationToken.None);continue;}if(!result.Success)return ScheduleActionResult.Failed("terms_cancel","The provider could not confirm and cancel every unsigned agreement. Signed and uncertain documents were preserved: "+result.Error,new{cancelled});await AutoMateApi.AgreementProviderSupport.UpdateItemAsync(conn,job.TenantId,job.JobId,item.PlanItemId,"superseded",item.ExternalDocumentId,item.ExternalInviteId,result.ProviderStatus,"",CancellationToken.None);cancelled.Add(new{item.PlanItemId,item.ExternalDocumentId});}await AutoMateApi.AgreementProviderSupport.RefreshJobAggregateAsync(conn,job.TenantId,job.JobId);return ScheduleActionResult.Ok("terms_cancel",$"Cancelled {cancelled.Count} unsigned {(provider=="adobe_sign"?"Adobe Acrobat Sign":"DocuSign")} agreement(s). Signed agreements were preserved.",new{cancelled});
+    }
+    if(job.TermsSigned)return ScheduleActionResult.Skip("terms_cancel","The signed agreement was preserved.",new{documentId=job.SignNowDocumentId});
+    if(string.IsNullOrWhiteSpace(job.SignNowDocumentId))return ScheduleActionResult.Skip("terms_cancel","No unsigned SignNow agreement remained.",new{jobId=job.JobId});
+    var account=await GetSignNowAccountAsync(conn,configuration);if(!account.Success)return ScheduleActionResult.Failed("terms_cancel",account.ErrorMessage??"SignNow is not connected.");
+    using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    var current=await client.GetAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(job.SignNowDocumentId)}");var currentJson=await current.Content.ReadAsStringAsync();
+    if(current.IsSuccessStatusCode&&!string.IsNullOrWhiteSpace(currentJson))
+    {
+        var root=JsonDocument.Parse(currentJson).RootElement;var status=FirstNonEmptyJsonString(root,"status","state","invite_status");if(string.IsNullOrWhiteSpace(status))status=FindJsonStringRecursive(root,"status","state","invite_status");
+        if(LooksLikeSignNowCompleted(status)){await StoreSignNowStatusAsync(conn,job.JobId,job.SignNowDocumentId,null,null,status,null,true,DateTime.UtcNow);return ScheduleActionResult.Skip("terms_cancel","The agreement is signed and was preserved.",new{documentId=job.SignNowDocumentId});}
+    }
+    else if(current.StatusCode!=System.Net.HttpStatusCode.NotFound)return ScheduleActionResult.Failed("terms_cancel","SignNow could not confirm the agreement status, so it was preserved: "+currentJson);
+    var deletion=await client.DeleteAsync($"https://api.signnow.com/document/{Uri.EscapeDataString(job.SignNowDocumentId)}");var deleteJson=await deletion.Content.ReadAsStringAsync();
+    if(!deletion.IsSuccessStatusCode&&deletion.StatusCode!=System.Net.HttpStatusCode.NotFound)return ScheduleActionResult.Failed("terms_cancel","SignNow could not cancel the unsigned agreement: "+deleteJson);
+    await EnsureSignNowJobColumnsAsync(conn);
+    await using(var audit=new NpgsqlCommand("INSERT INTO public.signnow_document_supersessions(supersession_id,tenant_id,job_id,previous_document_id,reason,status) VALUES(gen_random_uuid(),@tenant,@job,@document,'threed_job_cancelled','unsigned_document_cancelled')",conn)){audit.Parameters.AddWithValue("tenant",job.TenantId);audit.Parameters.AddWithValue("job",job.JobId);audit.Parameters.AddWithValue("document",job.SignNowDocumentId);await audit.ExecuteNonQueryAsync();}
+    await using(var update=new NpgsqlCommand("UPDATE public.jobs_staging SET terms_sent=false,terms_retry_requested=false,signnow_document_status='cancelled-with-job',signnow_signing_link=NULL,updated_at=NOW() WHERE tenant_id::text=@tenant AND job_id=@job AND terms_signed=false",conn)){update.Parameters.AddWithValue("tenant",job.TenantId.ToString("D"));update.Parameters.AddWithValue("job",job.JobId);await update.ExecuteNonQueryAsync();}
+    await using(var item=new NpgsqlCommand("UPDATE public.job_agreement_items SET status='superseded',updated_at=NOW() WHERE tenant_id=@tenant AND job_id=@job AND status<>'signed'",conn)){item.Parameters.AddWithValue("tenant",job.TenantId);item.Parameters.AddWithValue("job",job.JobId);await item.ExecuteNonQueryAsync();}
+    return ScheduleActionResult.Ok("terms_cancel","Unsigned SignNow agreement cancelled.",new{documentId=job.SignNowDocumentId});
 }
 
 static async Task<SignNowWebhookRegistrationResult> CreateSignNowDocumentWebhookAsync(HttpClient httpClient, string documentId, IConfiguration configuration)
@@ -9538,9 +11588,11 @@ WHERE job_id = @job_id;";
 static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
     NpgsqlConnection conn,
     ScheduleJobInput job,
-    IConfiguration configuration)
+    IConfiguration configuration,
+    bool forceDuplicate = false)
 {
-    if (job.CalendarCreated)
+    var retainedProviderEvidence=forceDuplicate?null:await LoadActiveCalendarEvidenceAsync(conn,job.TenantId,job.JobId);var selectedProvider=retainedProviderEvidence?.Provider??"";if(string.IsNullOrWhiteSpace(selectedProvider)){await AutoMateApi.IntegrationHubSupport.EnsureAsync(conn);await using var providerCommand=new NpgsqlCommand("SELECT provider_key FROM public.tenant_integration_action_defaults WHERE tenant_id=@tenant AND action_type='calendar'",conn);providerCommand.Parameters.AddWithValue("tenant",job.TenantId);selectedProvider=Convert.ToString(await providerCommand.ExecuteScalarAsync())??"google_calendar";}if(selectedProvider is "microsoft" or "microsoft_calendar")return await CreateMicrosoftCalendarEventForJobAsync(conn,job,configuration,forceDuplicate,retainedProviderEvidence);
+    if (job.CalendarCreated && !forceDuplicate)
         return ScheduleActionResult.Skip("calendar", "Calendar event was already marked created.");
 
     if (!job.JobDate.HasValue)
@@ -9549,7 +11601,7 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
         return ScheduleActionResult.Failed("calendar", "Inspection date/time is missing.");
     }
 
-    var account = await GetGoogleCalendarAccountAsync(conn, job.InspectorId, configuration);
+    var companySettings=await AutoMateApi.CompanyGoogleCalendarSupport.LoadAsync(conn,job.TenantId,job.InspectorId);var calendarMapping=companySettings.Mappings.FirstOrDefault(x=>x.InspectorId==job.InspectorId&&x.Enabled);var account = await GetGoogleCalendarAccountAsync(conn, companySettings.CompanyAccountInspectorId, configuration);if(account.Success&&calendarMapping is not null)account=account with{TenantId=calendarMapping.CalendarId};
     if (!account.Success)
     {
         await MarkCalendarFailedAsync(conn, job.JobId, account.ErrorMessage ?? "Google Calendar is not connected.");
@@ -9560,26 +11612,49 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
 
     var calendarId = string.IsNullOrWhiteSpace(account.CalendarId) ? "primary" : account.CalendarId;
+    var retainedCalendar=forceDuplicate?null:await LoadActiveCalendarEvidenceAsync(conn,job.TenantId,job.JobId);
+    if(retainedCalendar.HasValue&&!string.Equals(retainedCalendar.Value.CalendarId,calendarId,StringComparison.OrdinalIgnoreCase))
+    {
+        var sourceCalendar=retainedCalendar.Value.CalendarId;
+        var retainedEvent=retainedCalendar.Value.EventId;
+        var moveUrl=$"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(sourceCalendar)}/events/{Uri.EscapeDataString(retainedEvent)}/move?destination={Uri.EscapeDataString(calendarId)}";
+        var moveResponse=await httpClient.PostAsync(moveUrl,null);
+        var moveJson=await moveResponse.Content.ReadAsStringAsync();
+        if(!moveResponse.IsSuccessStatusCode)
+        {
+            var message="Google Calendar could not move the existing inspection to the newly assigned inspector calendar: "+moveJson;
+            await MarkCalendarFailedAsync(conn,job.JobId,message);
+            return ScheduleActionResult.Failed("calendar",message,new{errorCode="google_calendar_move_failed",reviewTarget="integrations.google-calendar",sourceCalendar,destinationCalendar=calendarId,eventId=retainedEvent});
+        }
+        var moved=JsonDocument.Parse(moveJson).RootElement;
+        var movedEventId=GetJsonString(moved,"id");
+        if(string.IsNullOrWhiteSpace(movedEventId))movedEventId=retainedEvent;
+        await RecordCalendarEvidenceAsync(conn,job.TenantId,job.JobId,sourceCalendar,retainedEvent,"removed","");
+        await RecordCalendarEvidenceAsync(conn,job.TenantId,job.JobId,calendarId,movedEventId,"active",GetJsonString(moved,"htmlLink"));
+    }
     var privateProperty = Uri.EscapeDataString("automateJobId=" + job.JobId);
     var lookupUrl =
         $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events" +
-        $"?privateExtendedProperty={privateProperty}&singleEvents=true&maxResults=1";
-    var lookupResponse = await httpClient.GetAsync(lookupUrl);
-    var lookupJson = await lookupResponse.Content.ReadAsStringAsync();
-    if (lookupResponse.IsSuccessStatusCode)
+        $"?privateExtendedProperty={privateProperty}&singleEvents=true&maxResults=10";
+    var lookupResponse = forceDuplicate ? null : await httpClient.GetAsync(lookupUrl);
+    var lookupJson = lookupResponse is null ? "" : await lookupResponse.Content.ReadAsStringAsync();
+    if (lookupResponse?.IsSuccessStatusCode == true)
     {
         var lookupDoc = JsonDocument.Parse(lookupJson).RootElement;
-        if (lookupDoc.TryGetProperty("items", out var items) &&
-            items.ValueKind == JsonValueKind.Array &&
-            items.GetArrayLength() > 0)
+        if (lookupDoc.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
         {
-            var existingEventId = GetJsonString(items[0], "id");
+            JsonElement? inspectionItem=null;
+            foreach(var candidate in items.EnumerateArray())if(GetPrivateExtendedProperty(candidate,"automateEventType")!="travel"){inspectionItem=candidate;break;}
+            if(inspectionItem.HasValue)
+            {
+            var existing=inspectionItem.Value;var existingEventId = GetJsonString(existing, "id");
             var existingInvoiceLines = await LoadXeroInvoiceLinesAsync(conn, job.JobId);
             var existingSummary = string.IsNullOrWhiteSpace(job.PrimaryService) ? "Inspection" : job.PrimaryService.Trim();
             if (!string.IsNullOrWhiteSpace(job.SiteAddress)) existingSummary += " - " + job.SiteAddress.Trim();
+            var existingStart=job.JobDate.Value;var existingEnd=existingStart.AddMinutes(job.InspectionDurationMinutes<=0?60:job.InspectionDurationMinutes);
             var patchResponse = await httpClient.PatchAsJsonAsync(
                 $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events/{Uri.EscapeDataString(existingEventId)}",
-                new { summary = existingSummary, location = job.SiteAddress, description = BuildGoogleCalendarDescription(job, existingInvoiceLines) });
+                new { summary = existingSummary, location = job.SiteAddress, description = BuildGoogleCalendarDescription(job, existingInvoiceLines),start=new{dateTime=InJobTimezone(existingStart,job.Timezone).ToString("O"),timeZone=job.Timezone},end=new{dateTime=InJobTimezone(existingEnd,job.Timezone).ToString("O"),timeZone=job.Timezone},extendedProperties=new{@private=new Dictionary<string,string>{{"automateJobId",job.JobId.ToString()},{"automateEventType","inspection"}}} });
             var patchJson = await patchResponse.Content.ReadAsStringAsync();
             if (!patchResponse.IsSuccessStatusCode)
             {
@@ -9587,12 +11662,13 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
                 return ScheduleActionResult.Failed("calendar", "Google Calendar event update failed: " + patchJson);
             }
             await MarkCalendarCreatedAsync(conn, job.JobId);
-            await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, existingEventId, "active", GetJsonString(items[0], "htmlLink"));
+            await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, existingEventId, "active", GetJsonString(existing, "htmlLink"));
             return ScheduleActionResult.Ok("calendar", "Google Calendar event updated.", new
             {
                 eventId = existingEventId,
-                htmlLink = GetJsonString(items[0], "htmlLink")
+                htmlLink = GetJsonString(existing, "htmlLink")
             });
+            }
         }
     }
 
@@ -9614,19 +11690,21 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
         description = BuildGoogleCalendarDescription(job, invoiceLines),
         start = new
         {
-            dateTime = start.ToUniversalTime().ToString("O"),
+            dateTime = InJobTimezone(start,job.Timezone).ToString("O"),
             timeZone = string.IsNullOrWhiteSpace(job.Timezone) ? "Pacific/Auckland" : job.Timezone
         },
         end = new
         {
-            dateTime = end.ToUniversalTime().ToString("O"),
+            dateTime = InJobTimezone(end,job.Timezone).ToString("O"),
             timeZone = string.IsNullOrWhiteSpace(job.Timezone) ? "Pacific/Auckland" : job.Timezone
         },
         extendedProperties = new
         {
             @private = new Dictionary<string, string>
             {
-                ["automateJobId"] = job.JobId.ToString()
+                ["automateJobId"] = job.JobId.ToString(),
+                ["automateEventType"] = "inspection",
+                ["automateCycle"] = forceDuplicate ? "2" : "1"
             }
         }
     };
@@ -9643,13 +11721,178 @@ static async Task<ScheduleActionResult> CreateGoogleCalendarEventForJobAsync(
     }
 
     var created = JsonDocument.Parse(createJson).RootElement;
+    var createdEventId=GetJsonString(created,"id");
+    if(string.IsNullOrWhiteSpace(createdEventId))
+    {
+        await MarkCalendarFailedAsync(conn,job.JobId,"Google accepted the request but returned no event ID.");
+        return ScheduleActionResult.Failed("calendar","Google returned no event ID; creation is not recorded as complete.");
+    }
     await MarkCalendarCreatedAsync(conn, job.JobId);
-    await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, GetJsonString(created, "id"), "active", GetJsonString(created, "htmlLink"));
+    await RecordCalendarEvidenceAsync(conn, job.TenantId, job.JobId, calendarId, createdEventId, "active", GetJsonString(created, "htmlLink"));
     return ScheduleActionResult.Ok("calendar", "Google Calendar event created.", new
     {
-        eventId = GetJsonString(created, "id"),
+        eventId = createdEventId,
         htmlLink = GetJsonString(created, "htmlLink")
     });
+}
+
+static async Task<ScheduleActionResult> CreateMicrosoftCalendarEventForJobAsync(NpgsqlConnection conn,ScheduleJobInput job,IConfiguration configuration,bool forceDuplicate,(string Provider,string CalendarId,string EventId)? retainedEvidence)
+{
+    if(job.CalendarCreated&&!forceDuplicate)return ScheduleActionResult.Skip("calendar","Microsoft Calendar event was already marked created.");
+    if(!job.JobDate.HasValue){await MarkCalendarFailedAsync(conn,job.JobId,"Inspection date/time is missing.");return ScheduleActionResult.Failed("calendar","Inspection date/time is missing.");}
+    var settings=await AutoMateApi.MicrosoftCalendarSupport.LoadAsync(conn,job.TenantId);var mapping=settings.Mappings.FirstOrDefault(x=>x.InspectorId==job.InspectorId&&x.Enabled);if(mapping is null)return ScheduleActionResult.Failed("calendar","No company Microsoft calendar is mapped to the assigned inspector.");
+    var account=await GetMicrosoftCalendarAccountAsync(conn,job.TenantId,configuration,CancellationToken.None);if(!account.Success)return ScheduleActionResult.Failed("calendar",account.Error);
+    using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);var calendarId=mapping.CalendarId;var existing=forceDuplicate?null:retainedEvidence;
+    if(existing.HasValue&&existing.Value.Provider=="microsoft_calendar"&&!string.Equals(existing.Value.CalendarId,calendarId,StringComparison.OrdinalIgnoreCase))
+    {
+        using var remove=await client.DeleteAsync("https://graph.microsoft.com/v1.0/me/calendars/"+Uri.EscapeDataString(existing.Value.CalendarId)+"/events/"+Uri.EscapeDataString(existing.Value.EventId));
+        if(!remove.IsSuccessStatusCode&&remove.StatusCode!=System.Net.HttpStatusCode.NotFound&&remove.StatusCode!=System.Net.HttpStatusCode.Gone)return ScheduleActionResult.Failed("calendar","Microsoft Calendar could not remove the existing inspection from the previously assigned inspector calendar: "+ProviderSafeError(await remove.Content.ReadAsStringAsync()));
+        await RecordCalendarEvidenceAsync(conn,job.TenantId,job.JobId,existing.Value.CalendarId,existing.Value.EventId,"removed","","microsoft_calendar");await using(var clear=new NpgsqlCommand("UPDATE public.jobs_staging SET calendar_created=false,calendar_created_at=NULL WHERE job_id=@job",conn)){clear.Parameters.AddWithValue("job",job.JobId);await clear.ExecuteNonQueryAsync();}existing=null;
+    }
+    var start=job.JobDate.Value;var end=start.AddMinutes(job.InspectionDurationMinutes<=0?60:job.InspectionDurationMinutes);var summary=string.IsNullOrWhiteSpace(job.PrimaryService)?"Inspection":job.PrimaryService.Trim();if(!string.IsNullOrWhiteSpace(job.SiteAddress))summary+=" - "+job.SiteAddress.Trim();var invoiceLines=await LoadXeroInvoiceLinesAsync(conn,job.JobId);var description=WebUtility.HtmlEncode(BuildGoogleCalendarDescription(job,invoiceLines)).Replace("\r\n","<br>").Replace("\n","<br>");var graphTimeZone=string.Equals(job.Timezone,"Pacific/Auckland",StringComparison.OrdinalIgnoreCase)||string.IsNullOrWhiteSpace(job.Timezone)?"New Zealand Standard Time":job.Timezone;
+    var payload=new Dictionary<string,object?>{{"subject",summary},{"body",new{contentType="HTML",content=description+"<br><br>AutoMate Job ID: "+job.JobId.ToString("D")}},{"start",new{dateTime=InJobTimezone(start,job.Timezone).ToString("yyyy-MM-ddTHH:mm:ss"),timeZone=graphTimeZone}},{"end",new{dateTime=InJobTimezone(end,job.Timezone).ToString("yyyy-MM-ddTHH:mm:ss"),timeZone=graphTimeZone}},{"location",new{displayName=job.SiteAddress}},{"showAs","busy"},{"isReminderOn",true},{"reminderMinutesBeforeStart",30}};
+    HttpResponseMessage response;if(existing.HasValue&&existing.Value.Provider=="microsoft_calendar")response=await client.PatchAsJsonAsync("https://graph.microsoft.com/v1.0/me/calendars/"+Uri.EscapeDataString(calendarId)+"/events/"+Uri.EscapeDataString(existing.Value.EventId),payload);else{payload["transactionId"]=itemTransaction(job.JobId,forceDuplicate);response=await client.PostAsJsonAsync("https://graph.microsoft.com/v1.0/me/calendars/"+Uri.EscapeDataString(calendarId)+"/events",payload);}var json=await response.Content.ReadAsStringAsync();if(!response.IsSuccessStatusCode){await MarkCalendarFailedAsync(conn,job.JobId,TravelRedact(json));return ScheduleActionResult.Failed("calendar","Microsoft Calendar event save failed: "+ProviderSafeError(json));}using var document=JsonDocument.Parse(json);var eventId=GetJsonString(document.RootElement,"id");var webLink=GetJsonString(document.RootElement,"webLink");if(string.IsNullOrWhiteSpace(eventId))return ScheduleActionResult.Failed("calendar","Microsoft Calendar accepted the request but returned no event ID.");await MarkCalendarCreatedAsync(conn,job.JobId);await RecordCalendarEvidenceAsync(conn,job.TenantId,job.JobId,calendarId,eventId,"active",webLink,"microsoft_calendar");return ScheduleActionResult.Ok("calendar",existing.HasValue?"Microsoft Calendar event updated.":"Microsoft Calendar event created.",new{provider="microsoft_calendar",calendarId,eventId,webLink});
+}
+
+static string itemTransaction(Guid jobId,bool duplicate)=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("automate-calendar:"+jobId.ToString("D")+":"+(duplicate?"2":"1")))).ToLowerInvariant()[..32];
+
+static DateTimeOffset InJobTimezone(DateTime value,string timezone)
+{
+    var zoneId=string.IsNullOrWhiteSpace(timezone)?"Pacific/Auckland":timezone;
+    TimeZoneInfo zone;try{zone=TimeZoneInfo.FindSystemTimeZoneById(zoneId);}catch{zone=TimeZoneInfo.FindSystemTimeZoneById("Pacific/Auckland");}
+    // PostgreSQL timestamptz is an instant. Convert.ToDateTime can discard its Kind,
+    // so always restore UTC before converting to the job's display timezone.
+    var utc=DateTime.SpecifyKind(value,DateTimeKind.Utc);return TimeZoneInfo.ConvertTime(new DateTimeOffset(utc),zone);
+}
+
+static async Task TryUpsertScheduledTravelAsync(NpgsqlConnection conn,ScheduleJobInput job,IConfiguration configuration)
+{
+    try
+    {
+        var settings=await AutoMateApi.TravelCalendarSupport.LoadAsync(conn,job.TenantId);var inspector=settings.Inspectors.FirstOrDefault(x=>x.InspectorId==job.InspectorId);
+        if(inspector is null||!inspector.Enabled||string.IsNullOrWhiteSpace(inspector.EffectiveBaseAddress)||!job.JobDate.HasValue)return;
+        var input=new TravelJobInput(job.TenantId,job.JobId,job.InspectorId,"",job.SiteAddress,job.JobDate,job.InspectionDurationMinutes,job.Timezone);
+        var travel=await ComputeTravelAsync(input,inspector.EffectiveBaseAddress,configuration,CancellationToken.None);if(!travel.Success)return;
+        await UpsertTravelCalendarEventAsync(conn,input,travel,configuration,CancellationToken.None);
+    }
+    catch
+    {
+        // Inspection scheduling remains successful when optional route calculation is unavailable.
+    }
+}
+
+static async Task<TravelJobInput?> LoadTravelJobInputAsync(NpgsqlConnection conn, Guid tenantId, Guid jobId, CancellationToken ct)
+{
+    await using var command = new NpgsqlCommand("""
+        SELECT tenant_id::text,job_id,inspector_id,COALESCE(inspector_name,''),COALESCE(site_address,''),
+               job_date,COALESCE(inspection_duration_minutes,60),COALESCE(timezone,'Pacific/Auckland')
+        FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job LIMIT 1
+        """, conn);
+    command.Parameters.AddWithValue("tenant", tenantId.ToString()); command.Parameters.AddWithValue("job", jobId);
+    await using var reader = await command.ExecuteReaderAsync(ct); if (!await reader.ReadAsync(ct)) return null;
+    return new TravelJobInput(tenantId,reader.GetGuid(1),reader.IsDBNull(2)?Guid.Empty:reader.GetGuid(2),reader.GetString(3),reader.GetString(4),reader.IsDBNull(5)?null:reader.GetDateTime(5),reader.GetInt32(6),reader.GetString(7));
+}
+
+static async Task<TravelCalculation> ComputeTravelAsync(TravelJobInput job,string baseAddress,IConfiguration configuration,CancellationToken ct)
+{
+    var key=configuration["GOOGLE_MAPS_API_KEY"];
+    if(string.IsNullOrWhiteSpace(key))return TravelCalculation.Failed("Google Routes is not configured.");
+    var scheduled=job.JobDate.HasValue;var mode=scheduled?"predictive pessimistic":"traffic unaware";
+    var outboundDeparture=scheduled?new DateTimeOffset(DateTime.SpecifyKind(job.JobDate!.Value,DateTimeKind.Local)).AddMinutes(-30):DateTimeOffset.UtcNow;
+    var outbound=await LoadGoogleRouteLegAsync(baseAddress,job.SiteAddress,key,scheduled,outboundDeparture,ct);
+    if(!outbound.Success)return TravelCalculation.Failed(outbound.Error);
+    var returnDeparture=scheduled?new DateTimeOffset(DateTime.SpecifyKind(job.JobDate!.Value.AddMinutes(Math.Max(job.InspectionDurationMinutes,1)),DateTimeKind.Local)):DateTimeOffset.UtcNow;
+    var inbound=await LoadGoogleRouteLegAsync(job.SiteAddress,baseAddress,key,scheduled,returnDeparture,ct);
+    if(!inbound.Success)return TravelCalculation.Failed(inbound.Error);
+    return new(true,baseAddress,job.SiteAddress,outbound.DistanceMetres,outbound.DurationSeconds,inbound.DistanceMetres,inbound.DurationSeconds,outbound.DistanceMetres+inbound.DistanceMetres,mode,DateTimeOffset.UtcNow,AutoMateApi.TravelCalendarSupport.Fingerprint(baseAddress,job.SiteAddress,job.JobDate?.ToString("O"),job.InspectionDurationMinutes.ToString(),job.InspectorId.ToString()),"");
+}
+
+static async Task<TravelRouteLeg> LoadGoogleRouteLegAsync(string origin,string destination,string apiKey,bool predictive,DateTimeOffset departure,CancellationToken ct)
+{
+    if(string.IsNullOrWhiteSpace(origin)||string.IsNullOrWhiteSpace(destination))return TravelRouteLeg.Failed("A base and property address are required.");
+    using var client=new HttpClient();client.DefaultRequestHeaders.Add("X-Goog-Api-Key",apiKey);client.DefaultRequestHeaders.Add("X-Goog-FieldMask","routes.distanceMeters,routes.duration,routes.staticDuration");
+    object payload=predictive?new{origin=new{address=origin},destination=new{address=destination},travelMode="DRIVE",routingPreference="TRAFFIC_AWARE_OPTIMAL",departureTime=departure.ToUniversalTime().ToString("O"),routeModifiers=new{avoidTolls=false},computeAlternativeRoutes=false,languageCode="en-NZ",units="METRIC",trafficModel="PESSIMISTIC"}:new{origin=new{address=origin},destination=new{address=destination},travelMode="DRIVE",routingPreference="TRAFFIC_UNAWARE",computeAlternativeRoutes=false,languageCode="en-NZ",units="METRIC"};
+    using var response=await client.PostAsJsonAsync("https://routes.googleapis.com/directions/v2:computeRoutes",payload,ct);var json=await response.Content.ReadAsStringAsync(ct);
+    if(!response.IsSuccessStatusCode)return TravelRouteLeg.Failed("Google route calculation failed: "+TravelRedact(json));
+    using var document=JsonDocument.Parse(json);if(!document.RootElement.TryGetProperty("routes",out var routes)||routes.GetArrayLength()==0)return TravelRouteLeg.Failed("Google returned no route for these addresses.");
+    var route=routes[0];var distance=route.TryGetProperty("distanceMeters",out var d)?d.GetInt32():0;var duration=ParseGoogleDurationSeconds(GetJsonString(route,"duration"));
+    return new(true,distance,duration,"");
+}
+
+static int ParseGoogleDurationSeconds(string value)=>value.EndsWith('s')&&double.TryParse(value[..^1],System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,out var seconds)?Math.Max(0,(int)Math.Ceiling(seconds)):0;
+
+static async Task<TravelCalendarResult> UpsertTravelCalendarEventAsync(NpgsqlConnection conn,TravelJobInput job,TravelCalculation travel,IConfiguration configuration,CancellationToken ct)
+{
+    if(!job.JobDate.HasValue)return new(false,"An inspection date is required.","","");
+    var companySettings=await AutoMateApi.CompanyGoogleCalendarSupport.LoadAsync(conn,job.TenantId,job.InspectorId,ct);var mapping=companySettings.Mappings.FirstOrDefault(x=>x.InspectorId==job.InspectorId&&x.Enabled);if(mapping is null)return new(false,"No company Google calendar is mapped to the assigned inspector.","","");var account=await GetGoogleCalendarAccountAsync(conn,companySettings.CompanyAccountInspectorId,configuration);if(account.Success)account=account with{TenantId=mapping.CalendarId};if(!account.Success)return new(false,account.ErrorMessage??"Google Calendar is not connected.","","");
+    using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);var calendarId=string.IsNullOrWhiteSpace(account.CalendarId)?"primary":account.CalendarId;
+    var lookup=$"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events?privateExtendedProperty={Uri.EscapeDataString("automateJobId="+job.JobId)}&singleEvents=true&maxResults=10";
+    string eventId="",htmlLink="";using(var response=await client.GetAsync(lookup,ct)){var json=await response.Content.ReadAsStringAsync(ct);if(response.IsSuccessStatusCode){using var doc=JsonDocument.Parse(json);if(doc.RootElement.TryGetProperty("items",out var items))foreach(var item in items.EnumerateArray()){if(GetPrivateExtendedProperty(item,"automateEventType")=="travel"){eventId=GetJsonString(item,"id");htmlLink=GetJsonString(item,"htmlLink");break;}}}}
+    var end=job.JobDate.Value;var start=end.AddSeconds(-Math.Max(60,travel.OutboundDurationSeconds));var directions=$"https://www.google.com/maps/dir/?api=1&origin={Uri.EscapeDataString(travel.BaseAddress)}&destination={Uri.EscapeDataString(job.SiteAddress)}&travelmode=driving";
+    var payload=new{summary="Travel to "+job.SiteAddress,location=job.SiteAddress,description=$"Estimated distance: {travel.OutboundDistanceMetres/1000d:0.0} km\nEstimated at: {travel.CalculatedAt:O}\nDirections: {directions}",start=new{dateTime=start.ToUniversalTime().ToString("O"),timeZone=job.Timezone},end=new{dateTime=end.ToUniversalTime().ToString("O"),timeZone=job.Timezone},extendedProperties=new{@private=new Dictionary<string,string>{{"automateJobId",job.JobId.ToString()},{"automateEventType","travel"}}}};
+    HttpResponseMessage save=eventId.Length>0?await client.PatchAsJsonAsync($"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events/{Uri.EscapeDataString(eventId)}",payload,ct):await client.PostAsJsonAsync($"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events",payload,ct);var saveJson=await save.Content.ReadAsStringAsync(ct);if(!save.IsSuccessStatusCode)return new(false,"Travel Calendar event failed: "+TravelRedact(saveJson),"","");
+    using(var doc=JsonDocument.Parse(saveJson)){eventId=GetJsonString(doc.RootElement,"id");htmlLink=GetJsonString(doc.RootElement,"htmlLink");}
+    await AutoMateApi.TravelCalendarSupport.EnsureAsync(conn,ct);await using var command=new NpgsqlCommand("""INSERT INTO public.job_travel_calendar_evidence(tenant_id,job_id,inspector_id,calendar_id,event_id,html_link,route_fingerprint,distance_metres,duration_seconds,calculated_at,event_status) VALUES(@tenant,@job,@inspector,@calendar,@event,@link,@fingerprint,@distance,@duration,@calculated,'active') ON CONFLICT(tenant_id,job_id) DO UPDATE SET inspector_id=EXCLUDED.inspector_id,calendar_id=EXCLUDED.calendar_id,event_id=EXCLUDED.event_id,html_link=EXCLUDED.html_link,route_fingerprint=EXCLUDED.route_fingerprint,distance_metres=EXCLUDED.distance_metres,duration_seconds=EXCLUDED.duration_seconds,calculated_at=EXCLUDED.calculated_at,event_status='active',updated_at=NOW()""",conn);
+    command.Parameters.AddWithValue("tenant",job.TenantId);command.Parameters.AddWithValue("job",job.JobId);command.Parameters.AddWithValue("inspector",job.InspectorId);command.Parameters.AddWithValue("calendar",calendarId);command.Parameters.AddWithValue("event",eventId);command.Parameters.AddWithValue("link",htmlLink);command.Parameters.AddWithValue("fingerprint",travel.Fingerprint);command.Parameters.AddWithValue("distance",travel.OutboundDistanceMetres);command.Parameters.AddWithValue("duration",travel.OutboundDurationSeconds);command.Parameters.AddWithValue("calculated",travel.CalculatedAt);await command.ExecuteNonQueryAsync(ct);
+    return new(true,"Outbound travel event updated.",eventId,htmlLink);
+}
+
+static async Task<IReadOnlyList<object>> LoadGoogleCalendarRangeAsync(IntegrationAccountResult account,AutoMateApi.TravelInspectorView inspector,DateTimeOffset start,DateTimeOffset end,CancellationToken ct)
+{
+    var result=new List<object>();using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);var calendarId=string.IsNullOrWhiteSpace(account.CalendarId)?"primary":account.CalendarId;string? pageToken=null;
+    do{var url=$"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events?timeMin={Uri.EscapeDataString(start.ToUniversalTime().ToString("O"))}&timeMax={Uri.EscapeDataString(end.ToUniversalTime().ToString("O"))}&singleEvents=true&orderBy=startTime&showDeleted=false&maxResults=2500"+(pageToken is null?"":"&pageToken="+Uri.EscapeDataString(pageToken));using var response=await client.GetAsync(url,ct);var json=await response.Content.ReadAsStringAsync(ct);if(!response.IsSuccessStatusCode)throw new InvalidOperationException("Google Calendar returned "+(int)response.StatusCode+": "+TravelRedact(json));using var doc=JsonDocument.Parse(json);if(doc.RootElement.TryGetProperty("items",out var items))foreach(var item in items.EnumerateArray()){var visibility=GetJsonString(item,"visibility");var eventType=GetPrivateExtendedProperty(item,"automateEventType");var jobId=GetPrivateExtendedProperty(item,"automateJobId");var startValue=GetCalendarDateValue(item,"start");var endValue=GetCalendarDateValue(item,"end");result.Add(new{id=GetJsonString(item,"id"),inspectorId=inspector.InspectorId,inspectorName=inspector.Name,calendarId,title=visibility=="private"?"Busy":GetJsonString(item,"summary") is {Length:>0} title?title:"Busy",start=startValue.Value,end=endValue.Value,allDay=startValue.AllDay,location=visibility=="private"?"":GetJsonString(item,"location"),htmlLink=GetJsonString(item,"htmlLink"),status=GetJsonString(item,"status"),eventType=eventType.Length>0?eventType:"ordinary",jobId=Guid.TryParse(jobId,out var verifiedJob)?verifiedJob:(Guid?)null});}pageToken=GetJsonString(doc.RootElement,"nextPageToken");if(pageToken.Length==0)pageToken=null;}while(pageToken is not null);
+    return result;
+}
+
+static async Task<IReadOnlyList<object>> LoadMicrosoftCalendarRangeAsync(MicrosoftCalendarAccessResult account,string calendarId,AutoMateApi.TravelInspectorView inspector,DateTimeOffset start,DateTimeOffset end,CancellationToken ct)
+{
+    var result=new List<object>();using var client=new HttpClient();client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",account.AccessToken);client.DefaultRequestHeaders.TryAddWithoutValidation("Prefer","outlook.timezone=\"New Zealand Standard Time\"");var url="https://graph.microsoft.com/v1.0/me/calendars/"+Uri.EscapeDataString(calendarId)+"/calendarView?startDateTime="+Uri.EscapeDataString(start.ToUniversalTime().ToString("O"))+"&endDateTime="+Uri.EscapeDataString(end.ToUniversalTime().ToString("O"))+"&$select=id,subject,start,end,isAllDay,location,webLink,showAs,isCancelled&$orderby=start/dateTime&$top=1000";while(!string.IsNullOrWhiteSpace(url)){using var response=await client.GetAsync(url,ct);var json=await response.Content.ReadAsStringAsync(ct);if(!response.IsSuccessStatusCode)throw new InvalidOperationException("Microsoft Calendar returned "+(int)response.StatusCode+": "+TravelRedact(json));using var document=JsonDocument.Parse(json);if(document.RootElement.TryGetProperty("value",out var rows))foreach(var row in rows.EnumerateArray()){var location=row.TryGetProperty("location",out var locationValue)?GetJsonString(locationValue,"displayName"):"";var startValue=row.TryGetProperty("start",out var startItem)?GetJsonString(startItem,"dateTime"):"";var endValue=row.TryGetProperty("end",out var endItem)?GetJsonString(endItem,"dateTime"):"";result.Add(new{id=GetJsonString(row,"id"),inspectorId=inspector.InspectorId,inspectorName=inspector.Name,calendarId,title=GetJsonString(row,"subject") is {Length:>0} title?title:"Busy",start=startValue,end=endValue,allDay=row.TryGetProperty("isAllDay",out var allDay)&&allDay.ValueKind==JsonValueKind.True,location,htmlLink=GetJsonString(row,"webLink"),status=row.TryGetProperty("isCancelled",out var cancelled)&&cancelled.ValueKind==JsonValueKind.True?"cancelled":"confirmed",eventType="ordinary",jobId=(Guid?)null,provider="microsoft_calendar"});}url=GetJsonString(document.RootElement,"@odata.nextLink");}return result;
+}
+
+static string GetPrivateExtendedProperty(JsonElement item,string name){if(item.TryGetProperty("extendedProperties",out var extended)&&extended.TryGetProperty("private",out var privateValues)&&privateValues.TryGetProperty(name,out var value))return value.GetString()??"";return "";}
+static (string Value,bool AllDay) GetCalendarDateValue(JsonElement item,string name){if(!item.TryGetProperty(name,out var value))return("",false);var dateTime=GetJsonString(value,"dateTime");return dateTime.Length>0?(dateTime,false):(GetJsonString(value,"date"),true);}
+static string TravelRedact(string value)=>System.Text.RegularExpressions.Regex.Replace(value??"","(?i)(access_token|refresh_token|api[_-]?key|authorization|client_secret)(\\s*[:=]\\s*\"?)[^\",\\s}]+","$1$2[REDACTED]");
+
+static async Task<IReadOnlyList<CalendarDiscoveryEvent>> DiscoverExistingGoogleCalendarEventsAsync(
+    NpgsqlConnection conn, Guid tenantId, Guid jobId, IConfiguration configuration, CancellationToken cancellationToken)
+{
+    Guid inspectorId;
+    await using (var command = new NpgsqlCommand(
+        "SELECT inspector_id FROM public.jobs_staging WHERE tenant_id::text=@tenant AND job_id=@job LIMIT 1", conn))
+    {
+        command.Parameters.AddWithValue("tenant", tenantId.ToString());
+        command.Parameters.AddWithValue("job", jobId);
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        if (value is null || value == DBNull.Value || !Guid.TryParse(Convert.ToString(value), out inspectorId))
+            throw new UnauthorizedAccessException("The controlled job or assigned inspector was not found.");
+    }
+
+    var account = await GetGoogleCalendarAccountAsync(conn, inspectorId, configuration);
+    if (!account.Success)
+        throw new ControlledTestCycleException("calendar_discovery_unavailable", account.ErrorMessage ?? "Google Calendar is not connected.");
+
+    using var httpClient = new HttpClient();
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+    var calendarId = string.IsNullOrWhiteSpace(account.CalendarId) ? "primary" : account.CalendarId;
+    var privateProperty = Uri.EscapeDataString("automateJobId=" + jobId);
+    var lookupUrl = $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events" +
+                    $"?privateExtendedProperty={privateProperty}&singleEvents=true&showDeleted=false&maxResults=10";
+    using var response = await httpClient.GetAsync(lookupUrl, cancellationToken);
+    var json = await response.Content.ReadAsStringAsync(cancellationToken);
+    if (!response.IsSuccessStatusCode)
+        throw new ControlledTestCycleException("calendar_discovery_failed", "Google Calendar read-only discovery failed: " + json);
+
+    var result = new List<CalendarDiscoveryEvent>();
+    var root = JsonDocument.Parse(json).RootElement;
+    if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+        return result;
+    foreach (var item in items.EnumerateArray())
+    {
+        var eventId = GetJsonString(item, "id");
+        if (eventId.Length == 0) continue;
+        result.Add(new CalendarDiscoveryEvent(calendarId, eventId, GetJsonString(item, "status") is { Length: > 0 } status ? status : "active", GetJsonString(item, "htmlLink")));
+    }
+    return result;
 }
 
 static async Task<ScheduleActionResult> CancelGoogleCalendarEventForJobAsync(
@@ -9658,10 +11901,26 @@ static async Task<ScheduleActionResult> CancelGoogleCalendarEventForJobAsync(
     IConfiguration configuration)
 {
     if (!job.CalendarCreated) return ScheduleActionResult.Skip("calendar", "No active Calendar event was recorded.");
-    var account = await GetGoogleCalendarAccountAsync(conn, job.InspectorId, configuration);
+    var evidence=await LoadActiveCalendarEvidenceAsync(conn,job.TenantId,job.JobId);
+    if(evidence.HasValue&&evidence.Value.Provider=="microsoft_calendar")
+    {
+        var microsoftAccount=await GetMicrosoftCalendarAccountAsync(conn,job.TenantId,configuration,CancellationToken.None);if(!microsoftAccount.Success)return ScheduleActionResult.Failed("calendar",microsoftAccount.Error);using var microsoftClient=new HttpClient();microsoftClient.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",microsoftAccount.AccessToken);using var response=await microsoftClient.DeleteAsync("https://graph.microsoft.com/v1.0/me/calendars/"+Uri.EscapeDataString(evidence.Value.CalendarId)+"/events/"+Uri.EscapeDataString(evidence.Value.EventId));if(!response.IsSuccessStatusCode&&response.StatusCode!=System.Net.HttpStatusCode.NotFound&&response.StatusCode!=System.Net.HttpStatusCode.Gone)return ScheduleActionResult.Failed("calendar","Microsoft Calendar cancellation failed: "+ProviderSafeError(await response.Content.ReadAsStringAsync()));await RecordCalendarEvidenceAsync(conn,job.TenantId,job.JobId,evidence.Value.CalendarId,evidence.Value.EventId,"removed","","microsoft_calendar");await using var clear=new NpgsqlCommand("UPDATE public.jobs_staging SET calendar_created=false,calendar_created_at=NULL WHERE job_id=@job",conn);clear.Parameters.AddWithValue("job",job.JobId);await clear.ExecuteNonQueryAsync();return ScheduleActionResult.Ok("calendar","Microsoft Calendar event cancelled.",new{provider="microsoft_calendar",calendarId=evidence.Value.CalendarId,eventId=evidence.Value.EventId});
+    }
+    var companySettings=await AutoMateApi.CompanyGoogleCalendarSupport.LoadAsync(conn,job.TenantId,job.InspectorId);var mapping=companySettings.Mappings.FirstOrDefault(x=>x.InspectorId==job.InspectorId&&x.Enabled);
+    var retainedCalendarId=evidence?.CalendarId??mapping?.CalendarId??"";if(string.IsNullOrWhiteSpace(retainedCalendarId))return ScheduleActionResult.Failed("calendar","No retained Google Calendar event or current inspector calendar mapping was found.");
+    var account = await GetGoogleCalendarAccountAsync(conn, companySettings.CompanyAccountInspectorId, configuration);if(account.Success)account=account with{TenantId=retainedCalendarId};
     if (!account.Success) return ScheduleActionResult.Failed("calendar", account.ErrorMessage ?? "Google Calendar is not connected.");
     using var httpClient = new HttpClient(); httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
-    var calendarId = string.IsNullOrWhiteSpace(account.CalendarId) ? "primary" : account.CalendarId;
+    var calendarId = retainedCalendarId;
+    if(evidence.HasValue)
+    {
+        var id=evidence.Value.EventId;
+        var response=await httpClient.DeleteAsync($"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events/{Uri.EscapeDataString(id)}");
+        if(!response.IsSuccessStatusCode&&response.StatusCode!=System.Net.HttpStatusCode.Gone&&response.StatusCode!=System.Net.HttpStatusCode.NotFound)return ScheduleActionResult.Failed("calendar","Calendar cancellation failed: "+await response.Content.ReadAsStringAsync());
+        await RecordCalendarEvidenceAsync(conn,job.TenantId,job.JobId,calendarId,id,"removed","");
+        await using var clear=new NpgsqlCommand("UPDATE public.jobs_staging SET calendar_created=false,calendar_created_at=NULL WHERE job_id=@job",conn);clear.Parameters.AddWithValue("job",job.JobId);await clear.ExecuteNonQueryAsync();
+        return ScheduleActionResult.Ok("calendar","Calendar event cancelled.",new{calendarId,eventId=id});
+    }
     var privateProperty = Uri.EscapeDataString("automateJobId=" + job.JobId);
     var lookupUrl = $"https://www.googleapis.com/calendar/v3/calendars/{Uri.EscapeDataString(calendarId)}/events?privateExtendedProperty={privateProperty}&singleEvents=true&maxResults=10";
     var lookupResponse = await httpClient.GetAsync(lookupUrl); var lookupJson = await lookupResponse.Content.ReadAsStringAsync();
@@ -9679,25 +11938,35 @@ static async Task<ScheduleActionResult> CancelGoogleCalendarEventForJobAsync(
     }
     await using var cmd = new NpgsqlCommand("UPDATE public.jobs_staging SET calendar_created=false,calendar_created_at=NULL WHERE job_id=@job", conn);
     cmd.Parameters.AddWithValue("job", job.JobId); await cmd.ExecuteNonQueryAsync();
-    return ScheduleActionResult.Ok("calendar", "Calendar event cancelled.");
+    return ScheduleActionResult.Ok("calendar", "Calendar event cancelled.",new{calendarId,eventId=GetJsonString(items[0],"id")});
 }
 
-static async Task RecordCalendarEvidenceAsync(NpgsqlConnection conn, Guid tenantId, Guid jobId, string calendarId, string eventId, string status, string htmlLink)
+static async Task RecordCalendarEvidenceAsync(NpgsqlConnection conn, Guid tenantId, Guid jobId, string calendarId, string eventId, string status, string htmlLink,string provider="google")
 {
     if (tenantId == Guid.Empty || jobId == Guid.Empty || string.IsNullOrWhiteSpace(eventId)) return;
     await ControlledTestCycleSupport.EnsureAsync(conn);
     await using var command = new NpgsqlCommand("""
         INSERT INTO public.job_calendar_evidence
             (evidence_id,tenant_id,job_id,provider,calendar_id,event_id,event_status,metadata_json,removed_at)
-        VALUES(gen_random_uuid(),@tenant,@job,'google',@calendar,@event,@status,CAST(@metadata AS jsonb),CASE WHEN @status='removed' THEN NOW() ELSE NULL END)
+        VALUES(gen_random_uuid(),@tenant,@job,@provider,@calendar,@event,@status,CAST(@metadata AS jsonb),CASE WHEN @status='removed' THEN NOW() ELSE NULL END)
         ON CONFLICT(tenant_id,job_id,provider,calendar_id,event_id) DO UPDATE SET
             event_status=EXCLUDED.event_status,last_observed_at=NOW(),metadata_json=EXCLUDED.metadata_json,
             removed_at=CASE WHEN EXCLUDED.event_status='removed' THEN NOW() ELSE NULL END;
         """, conn);
     command.Parameters.AddWithValue("tenant", tenantId); command.Parameters.AddWithValue("job", jobId);
     command.Parameters.AddWithValue("calendar", calendarId ?? ""); command.Parameters.AddWithValue("event", eventId);
+    command.Parameters.AddWithValue("provider", provider);
     command.Parameters.AddWithValue("status", status); command.Parameters.AddWithValue("metadata", JsonSerializer.Serialize(new { htmlLink }));
     await command.ExecuteNonQueryAsync();
+}
+
+static async Task<(string Provider,string CalendarId,string EventId)?> LoadActiveCalendarEvidenceAsync(NpgsqlConnection conn,Guid tenantId,Guid jobId)
+{
+    await ControlledTestCycleSupport.EnsureAsync(conn);
+    await using var command=new NpgsqlCommand("SELECT provider,calendar_id,event_id FROM public.job_calendar_evidence WHERE tenant_id=@tenant AND job_id=@job AND event_status='active' ORDER BY last_observed_at DESC LIMIT 1",conn);
+    command.Parameters.AddWithValue("tenant",tenantId);command.Parameters.AddWithValue("job",jobId);
+    await using var reader=await command.ExecuteReaderAsync();
+    return await reader.ReadAsync()?(reader.GetString(0),reader.GetString(1),reader.GetString(2)):null;
 }
 
 static string BuildGoogleCalendarDescription(ScheduleJobInput job, List<XeroInvoiceLineInput> invoiceLines)
@@ -9777,23 +12046,14 @@ static string JoinNonEmpty(params string?[] values)
         .Where(value => !string.IsNullOrWhiteSpace(value)));
 }
 
-static async Task<IntegrationAccountResult> GetMicrosoftMailAccountAsync(
-    NpgsqlConnection conn,
-    Guid inspectorId,
-    IConfiguration configuration)
+static async Task<string> ResolveGoogleConnectedEmailAsync(HttpClient client,string storedEmail,CancellationToken ct)
 {
-    return await GetOAuthAccountAsync(
-        conn,
-        inspectorId,
-        "microsoft",
-        configuration["MS_CLIENT_ID"],
-        configuration["MS_CLIENT_SECRET"],
-        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-        new Dictionary<string, string>
-        {
-            ["scope"] = "offline_access Mail.Send User.Read"
-        },
-        null);
+    try
+    {
+        using var response=await client.GetAsync("https://www.googleapis.com/oauth2/v2/userinfo",ct);if(!response.IsSuccessStatusCode)return storedEmail;
+        using var document=JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));var email=GetJsonString(document.RootElement,"email");return string.IsNullOrWhiteSpace(email)?storedEmail:email.Trim();
+    }
+    catch{return storedEmail;}
 }
 
 static async Task<IntegrationAccountResult> GetGoogleCalendarAccountAsync(
@@ -9926,45 +12186,6 @@ WHERE inspector_id = @inspector_id
     await updateCmd.ExecuteNonQueryAsync();
 
     return IntegrationAccountResult.Ok(accessToken, refreshToken, tenantId ?? defaultTenantId, accountName);
-}
-
-static async Task<ScheduleActionResult> SendMicrosoftMailAsync(
-    HttpClient httpClient,
-    string toEmail,
-    string subject,
-    string htmlBody)
-{
-    var emailBody = new
-    {
-        message = new
-        {
-            subject,
-            body = new
-            {
-                contentType = "HTML",
-                content = htmlBody
-            },
-            toRecipients = new[]
-            {
-                new
-                {
-                    emailAddress = new
-                    {
-                        address = toEmail
-                    }
-                }
-            }
-        }
-    };
-
-    var response = await httpClient.PostAsJsonAsync(
-        "https://graph.microsoft.com/v1.0/me/sendMail",
-        emailBody);
-    var responseText = await response.Content.ReadAsStringAsync();
-
-    return response.IsSuccessStatusCode
-        ? ScheduleActionResult.Ok("booking-email", "Email sent.")
-        : ScheduleActionResult.Failed("booking-email", "Microsoft send mail failed: " + responseText);
 }
 
 static async Task MarkBookingEmailSentAsync(NpgsqlConnection conn, Guid jobId)
@@ -10864,7 +13085,7 @@ static string BuildAddOnPlaceholderKey(string serviceTypeKey)
 static string NormalizeEmailSenderMode(string? mode)
 {
     if (string.IsNullOrWhiteSpace(mode))
-        return "microsoft";
+        return "manual-smtp";
 
     var normalized = mode.Trim().ToLowerInvariant()
         .Replace(" ", "-")
@@ -10872,10 +13093,10 @@ static string NormalizeEmailSenderMode(string? mode)
 
     return normalized switch
     {
-        "microsoft" or "microsoft-test" or "microsoft-test-mode" or "test" => "microsoft",
+        "microsoft" or "microsoft-test" or "microsoft-test-mode" or "test" => "manual-smtp",
         "threed" or "3d" or "threed-smtp" or "3d-smtp" or "smtp-threed" => "threed-smtp",
         "manual" or "manual-smtp" or "smtp" => "manual-smtp",
-        _ => "microsoft"
+        _ => "manual-smtp"
     };
 }
 
@@ -10907,7 +13128,7 @@ static string GetEmailSenderModeLabel(string? mode)
     {
         "threed-smtp" => "THREED SMTP",
         "manual-smtp" => "Manual SMTP",
-        _ => "Microsoft Test Mode"
+        _ => "Company SMTP"
     };
 }
 
@@ -11082,20 +13303,13 @@ static string BuildDefaultBookingTemplateSubject(string? serviceTypeKey)
 
 static string BuildDefaultBookingTemplateHtml()
 {
-    return
-        "<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937;\">" +
-        "<p>Hi {{CLIENT_NAME}},</p>" +
-        "<p>Your booking has been scheduled. The confirmed details are below.</p>" +
-        "<table style=\"border-collapse:collapse;margin:16px 0;\">" +
-        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Service</td><td>{{PRIMARY_SERVICE}}</td></tr>" +
-        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Address</td><td>{{PROPERTY_ADDRESS}}</td></tr>" +
-        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Date/time</td><td>{{INSPECTION_DATE}} {{INSPECTION_TIME}}</td></tr>" +
-        "<tr><td style=\"font-weight:600;padding:4px 16px 4px 0;\">Inspector</td><td>{{INSPECTOR_NAME}}</td></tr>" +
-        "</table>" +
-        "<p>If any of these details need to change, please contact {{COMPANY_NAME}}.</p>" +
-        "<p>Regards,<br>{{COMPANY_NAME}}</p>" +
-        "</div>";
+    return BuildCleanPersonalLetter("{{CLIENT_SALUTATION}}","has been scheduled");
 }
+
+static string BuildCleanPersonalLetter(string greeting,string eventText)=>"""
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Inspection Details</title><style>@media only screen and (max-width:620px){.email-container{width:auto!important;margin:0!important}.email-header,.email-content,.email-footer{padding-left:24px!important;padding-right:24px!important}.company-logo{max-width:200px!important}}</style></head>
+<body style="margin:0;padding:0;background:#fff;font-family:Arial,Helvetica,sans-serif;color:#17212b"><div class="email-container" style="width:680px;max-width:100%;margin:24px auto;background:#fff"><div class="email-header" style="padding:22px 38px 18px"><img class="company-logo" src="{{COMPANY_LOGO_URL}}" alt="{{COMPANY_NAME}}" style="display:block;width:200px;max-width:55%;height:auto;border:0"><div style="height:3px;margin-top:20px;background:#0b5f86;line-height:3px">&nbsp;</div></div><div class="email-content" style="padding:25px 38px 38px"><p style="margin:0 0 8px;color:#0b5f86;font-size:12px;font-weight:bold;letter-spacing:1px;text-transform:uppercase">Property inspection</p><h1 style="margin:0 0 25px;color:#073f5b;font-size:26px;line-height:1.3">Confirmation of your booking</h1><p style="margin:0 0 18px;font-size:15px;line-height:1.7">Dear __GREETING__,</p><p style="margin:0 0 18px;font-size:15px;line-height:1.7">Thank you for asking {{COMPANY_NAME}} to carry out your property inspection.</p><p style="margin:0 0 18px;font-size:15px;line-height:1.7">Your inspection at <strong>{{PROPERTY_ADDRESS}}</strong> __EVENT__ for <strong>{{INSPECTION_DATE}}</strong> at <strong>{{INSPECTION_TIME}}</strong>.</p><p style="margin:0 0 18px;font-size:15px;line-height:1.7">Your scheduled inspector is <strong>{{INSPECTOR_NAME}}</strong>.</p><div style="margin:25px 0;padding:17px 19px;background:#e5f3f8;border-radius:5px"><p style="margin:0;color:#073f5b;font-size:14px;line-height:1.6"><strong>Please check the booking details above.</strong><br>Contact our office promptly if anything is incorrect.</p></div>{{INSPECTION_DETAILS_BUTTON}}<p style="margin:22px 0 0;font-size:15px;line-height:1.7">Kind regards,<br><strong>{{COMPANY_NAME}}</strong></p></div><div class="email-footer" style="padding:22px 38px 28px;border-top:1px solid #dfe5e9"><p style="margin:0;color:#64717d;font-size:11px;line-height:1.5">{{COMPANY_NAME}}</p></div></div></body></html>
+""".Replace("__GREETING__",greeting).Replace("__EVENT__",eventText);
 
 static async Task<(string Contact1, string Contact2)> LoadBasicContactLabelsAsync(NpgsqlConnection conn, Guid tenantId)
 {
@@ -11119,6 +13333,7 @@ static (string Subject, string HtmlBody) BuildDefaultBasicTemplate(string eventK
         "rescheduling" => "has been rescheduled",
         "cancellation" => "has been cancelled",
         "service_change" => "has updated services",
+        "publishing" => "has a report ready for your review",
         _ => "has been updated"
     };
     var subject = eventKey switch
@@ -11126,9 +13341,11 @@ static (string Subject, string HtmlBody) BuildDefaultBasicTemplate(string eventK
         "scheduling" => "Inspection scheduled - {{PROPERTY_ADDRESS}}",
         "rescheduling" => "Inspection rescheduled - {{PROPERTY_ADDRESS}}",
         "cancellation" => "Inspection cancelled - {{PROPERTY_ADDRESS}}",
-        _ => "Inspection services updated - {{PROPERTY_ADDRESS}}"
+        "service_change" => "Inspection services updated - {{PROPERTY_ADDRESS}}",
+        "publishing" => "Your inspection report is ready - {{PROPERTY_ADDRESS}}",
+        _ => "Inspection update - {{PROPERTY_ADDRESS}}"
     };
-    var html = $"<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937\"><p>Hi {greeting},</p><p>The inspection at <strong>{{{{PROPERTY_ADDRESS}}}}</strong> {eventText}.</p><p><strong>Date:</strong> {{{{INSPECTION_DATE}}}} {{{{INSPECTION_TIME}}}}<br><strong>Services:</strong> {{{{SERVICES}}}}</p><p>Regards,<br>{{{{COMPANY_NAME}}}}</p></div>";
+    var html=eventKey=="scheduling"&&recipientKey=="contact_1"?BuildCleanPersonalLetter(greeting,eventText):$"<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937\"><p>Hi {greeting},</p><p>The inspection at <strong>{{{{PROPERTY_ADDRESS}}}}</strong> {eventText}.</p><p><strong>Date:</strong> {{{{INSPECTION_DATE}}}} {{{{INSPECTION_TIME}}}}<br><strong>Services:</strong> {{{{SERVICES}}}}</p><p>Regards,<br>{{{{COMPANY_NAME}}}}</p></div>";
     return (subject, html);
 }
 
@@ -11166,6 +13383,7 @@ static async Task<RenderedEmailTemplate?> RenderBookingEmailTemplateAsync(
         htmlTemplate = BuildDefaultBookingTemplateHtml();
 
     var fields = BuildEmailTemplateFields(job, service);
+    MergeEmailTemplateFields(fields,await LoadRawCustomEmailFieldsAsync(conn,job.JobId));
     await EnsureJobInvoiceLinesTableAsync(conn);
     var invoiceContext = await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn, jobId);
     if (invoiceContext != null)
@@ -11190,17 +13408,42 @@ static async Task<RenderedEmailTemplate?> RenderBookingEmailTemplateAsync(
         fields);
 }
 
-static async Task<RenderedBasicEmail> RenderBasicEmailAsync(NpgsqlConnection conn, ScheduleJobInput job, string eventKey, string recipientKey, string? draftSubject=null, string? draftHtml=null)
+static async Task<RenderedBasicEmail> RenderBasicEmailAsync(NpgsqlConnection conn, ScheduleJobInput job, string eventKey, string recipientKey, string? draftSubject=null, string? draftHtml=null,IReadOnlyDictionary<string,string>? liveRawCustomFields=null)
 {
     if (!AutoMateApi.BasicAutomationSupport.IsValidEvent(eventKey) || !AutoMateApi.BasicAutomationSupport.IsValidRecipient(recipientKey)) throw new ArgumentException("Unsupported Basic template slot.");
+    if(eventKey=="scheduling"&&recipientKey=="contact_1"&&string.IsNullOrWhiteSpace(draftSubject)&&string.IsNullOrWhiteSpace(draftHtml))
+    {
+        var serviceTemplate=await RenderBookingEmailTemplateAsync(conn,job.JobId,new EmailTemplateRenderRequest
+        {
+            EmailType="booking-email",
+            ServiceTypeKey=job.BookingTemplateKey,
+            ToEmail=job.ClientEmail
+        },false);
+        if(serviceTemplate!=null)
+            return new RenderedBasicEmail(serviceTemplate.ToEmail,serviceTemplate.Subject,serviceTemplate.HtmlBody,string.IsNullOrWhiteSpace(job.ClientRoleLabel)?"Client":job.ClientRoleLabel);
+    }
     await AutoMateApi.BasicAutomationSupport.EnsureAsync(conn);
     var slot=(await AutoMateApi.BasicAutomationSupport.LoadAsync(conn,job.TenantId)).First(item=>item.EventKey==eventKey&&item.RecipientKey==recipientKey);
     var label=recipientKey=="contact_2" ? (string.IsNullOrWhiteSpace(job.AgentRoleLabel)?"Buyers Agent":job.AgentRoleLabel) : (string.IsNullOrWhiteSpace(job.ClientRoleLabel)?"Client":job.ClientRoleLabel);
     var defaults=BuildDefaultBasicTemplate(eventKey,recipientKey,label);
     var subjectTemplate=!string.IsNullOrWhiteSpace(draftSubject)?draftSubject:(!string.IsNullOrWhiteSpace(slot.Subject)?slot.Subject:defaults.Subject);
     var htmlTemplate=!string.IsNullOrWhiteSpace(draftHtml)?draftHtml:(!string.IsNullOrWhiteSpace(slot.HtmlBody)?slot.HtmlBody:defaults.HtmlBody);
-    var fields=BuildEmailTemplateFields(job,null); var invoice=await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn,job.JobId); if(invoice!=null) MergeEmailTemplateFields(fields,invoice.Tokens);
-    return new RenderedBasicEmail(recipientKey=="contact_2"?job.AgentEmail:job.ClientEmail,RenderTemplateTokens(subjectTemplate,fields,false),RenderTemplateTokens(CleanEditorHtml(htmlTemplate),fields,true),label);
+    var fields=BuildEmailTemplateFields(job,null);
+    MergeEmailTemplateFields(fields,await LoadRawCustomEmailFieldsAsync(conn,job.JobId));
+    if(liveRawCustomFields!=null)foreach(var item in liveRawCustomFields)if(item.Key.StartsWith("CustomText",StringComparison.OrdinalIgnoreCase)||item.Key.StartsWith("CustomDate",StringComparison.OrdinalIgnoreCase))fields[item.Key.ToUpperInvariant()]=FormatCustomEmailValue(item.Key,item.Value);
+    var recipientIsAgent=recipientKey=="contact_2";
+    fields["RECIPIENT_FIRST_NAME"]=recipientIsAgent?job.AgentFirstName:job.ClientFirstName;
+    fields["RECIPIENT_LAST_NAME"]=recipientIsAgent?job.AgentLastName:job.ClientLastName;
+    fields["RECIPIENT_DISPLAY_NAME"]=recipientIsAgent?job.AgentName:job.ClientName;
+    fields["RECIPIENT_SALUTATION"]=recipientIsAgent?job.AgentSalutation:job.ClientSalutation;
+    fields["RECIPIENT_EMAIL"]=recipientIsAgent?job.AgentEmail:job.ClientEmail;
+    fields["RECIPIENT_PHONE"]=recipientIsAgent?job.AgentPhone:job.ClientPhone;
+    fields["RECIPIENT_LABEL"]=label;
+    fields["RECIPIENT_COMPANY_NAME"]=recipientIsAgent?job.AgentCompanyName:job.ClientCompanyName;
+    fields["RECIPIENT_CONTACT_NAME"]=recipientIsAgent?job.AgentContactName:job.ClientContactName;
+    fields["RECIPIENT_ADDRESS"]=recipientIsAgent?ContactAddress(job.AgentAddress,job.AgentCity,job.AgentState,job.AgentPostalCode):ContactAddress(job.ClientAddress,job.ClientCity,job.ClientState,job.ClientPostalCode);
+    var invoice=await AutoMateApi.EmailInvoiceTemplateContext.LoadAsync(conn,job.JobId); if(invoice!=null) MergeEmailTemplateFields(fields,invoice.Tokens);
+    return new RenderedBasicEmail(recipientKey=="contact_2"?job.AgentEmail:job.ClientEmail,RenderTemplateTokens(subjectTemplate,fields,false),RemoveEmptyLogoImages(RenderTemplateTokens(CleanEditorHtml(htmlTemplate),fields,true)),label);
 }
 
 static ScheduleServiceInput ResolveTemplateService(ScheduleJobInput job, string serviceTypeKey)
@@ -11229,6 +13472,33 @@ static ScheduleServiceInput ResolveTemplateService(ScheduleJobInput job, string 
 
     return new ScheduleServiceInput(fallbackLabel, normalized, "primary");
 }
+
+static async Task<IReadOnlyDictionary<string,string>> LoadRawCustomEmailFieldsAsync(NpgsqlConnection conn,Guid jobId)
+{
+    var result=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+    await using var command=new NpgsqlCommand("SELECT COALESCE(NULLIF(raw_payload_json,''),approved_snapshot_json::text,'') FROM public.jobs_staging WHERE job_id=@job LIMIT 1",conn);command.Parameters.AddWithValue("job",jobId);var json=Convert.ToString(await command.ExecuteScalarAsync())??"";if(string.IsNullOrWhiteSpace(json))return result;
+    try
+    {
+        using var document=JsonDocument.Parse(json);JsonElement fields;if(!FindRawCustomFields(document.RootElement,out fields)||fields.ValueKind!=JsonValueKind.Object)return result;
+        foreach(var item in fields.EnumerateObject())
+        {
+            if(!(item.Name.StartsWith("CustomText",StringComparison.OrdinalIgnoreCase)||item.Name.StartsWith("CustomDate",StringComparison.OrdinalIgnoreCase)))continue;
+            var value=item.Value.ValueKind==JsonValueKind.String?item.Value.GetString()??"":item.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined?"":item.Value.ToString();
+            result[item.Name.ToUpperInvariant()]=FormatCustomEmailValue(item.Name,value);
+        }
+    }
+    catch(JsonException){ }
+    return result;
+}
+
+static bool FindRawCustomFields(JsonElement value,out JsonElement fields)
+{
+    fields=default;if(value.ValueKind!=JsonValueKind.Object)return false;
+    foreach(var property in value.EnumerateObject())if(string.Equals(property.Name,"rawCustomFields",StringComparison.OrdinalIgnoreCase)&&property.Value.ValueKind==JsonValueKind.Object){fields=property.Value;return true;}
+    foreach(var property in value.EnumerateObject())if(property.Value.ValueKind==JsonValueKind.Object&&FindRawCustomFields(property.Value,out fields))return true;
+    return false;
+}
+static string FormatCustomEmailValue(string key,string? value){var text=value??"";return key.StartsWith("CustomDate",StringComparison.OrdinalIgnoreCase)&&DateTimeOffset.TryParse(text,CultureInfo.InvariantCulture,DateTimeStyles.AllowWhiteSpaces,out var date)?date.ToString("dd MMM yyyy",CultureInfo.GetCultureInfo("en-NZ")):text;}
 
 static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job, ScheduleServiceInput? service)
 {
@@ -11268,24 +13538,28 @@ static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job,
         ["INSPECTION_DATE"] = start.HasValue ? start.Value.ToString("dd MMM yyyy") : "To be confirmed",
         ["INSPECTION_TIME"] = start.HasValue ? start.Value.ToString("h:mm tt") : "",
         ["INSPECTION_END_TIME"] = end.HasValue ? end.Value.ToString("h:mm tt") : "",
-        ["CLIENT_NAME"] = string.IsNullOrWhiteSpace(job.ClientDisplayName) ? job.ClientName : job.ClientDisplayName,
-        ["CLIENT_DISPLAY_NAME"] = string.IsNullOrWhiteSpace(job.ClientDisplayName) ? job.ClientName : job.ClientDisplayName,
+        ["CLIENT_NAME"] = job.ClientName,
+        ["CLIENT_DISPLAY_NAME"] = job.ClientName,
         ["CLIENT_FIRST_NAME"] = job.ClientFirstName,
         ["CLIENT_LAST_NAME"] = job.ClientLastName,
         ["CLIENT_SALUTATION"] = job.ClientSalutation,
-        ["CLIENT_ADDRESS"] = "",
+        ["CLIENT_COMPANY_NAME"] = job.ClientCompanyName,
+        ["CLIENT_CONTACT_NAME"] = job.ClientContactName,
+        ["CLIENT_ADDRESS"] = ContactAddress(job.ClientAddress,job.ClientCity,job.ClientState,job.ClientPostalCode),
         ["CLIENT_EMAIL"] = job.ClientEmail,
         ["CLIENT_PHONE"] = job.ClientPhone,
-        ["AGENT_NAME"] = string.IsNullOrWhiteSpace(job.AgentDisplayName) ? job.AgentName : job.AgentDisplayName,
-        ["AGENT_DISPLAY_NAME"] = string.IsNullOrWhiteSpace(job.AgentDisplayName) ? job.AgentName : job.AgentDisplayName,
+        ["AGENT_NAME"] = job.AgentName,
+        ["AGENT_DISPLAY_NAME"] = job.AgentName,
         ["AGENT_FIRST_NAME"] = job.AgentFirstName,
         ["AGENT_LAST_NAME"] = job.AgentLastName,
         ["AGENT_SALUTATION"] = job.AgentSalutation,
-        ["AGENT_FULL_ADDRESS"] = "",
-        ["AGENT_ADDRESS"] = "",
-        ["AGENT_CITY"] = "",
-        ["AGENT_STATE"] = "",
-        ["AGENT_ZIP"] = "",
+        ["AGENT_COMPANY_NAME"] = job.AgentCompanyName,
+        ["AGENT_CONTACT_NAME"] = job.AgentContactName,
+        ["AGENT_FULL_ADDRESS"] = ContactAddress(job.AgentAddress,job.AgentCity,job.AgentState,job.AgentPostalCode),
+        ["AGENT_ADDRESS"] = job.AgentAddress,
+        ["AGENT_CITY"] = job.AgentCity,
+        ["AGENT_STATE"] = job.AgentState,
+        ["AGENT_ZIP"] = job.AgentPostalCode,
         ["LISTING_AGENT_NAME"] = job.AgentName,
         ["LISTING_AGENT_FIRST_NAME"] = FirstWord(job.AgentName),
         ["LISTING_AGENT_FULL_ADDRESS"] = "",
@@ -11299,8 +13573,8 @@ static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job,
         ["INSPECTOR_EMAIL"] = job.EmailFromAddress,
         ["INSPECTORS_NAMES"] = inspector,
         ["COMPANY_NAME"] = company,
-        ["LOGO_URL"] = "",
-        ["COMPANY_LOGO_URL"] = "",
+        ["LOGO_URL"] = SafeHttpsUrl(job.CompanyLogoUrl),
+        ["COMPANY_LOGO_URL"] = SafeHttpsUrl(job.CompanyLogoUrl),
         ["JOB_NAME"] = job.JobName,
         ["INSPECTION_LINK"] = "",
         ["REPORT_LINK"] = "",
@@ -11316,6 +13590,26 @@ static Dictionary<string, string> BuildEmailTemplateFields(ScheduleJobInput job,
     }
 
     return fields;
+}
+
+static string ContactAddress(params string?[] parts) => string.Join(", ", parts.Where(value=>!string.IsNullOrWhiteSpace(value)).Select(value=>value!.Trim()));
+static string SafeHttpsUrl(string? value)=>Uri.TryCreate(value,UriKind.Absolute,out var uri)&&uri.Scheme==Uri.UriSchemeHttps?uri.ToString():"";
+static string CompanyLogoPublicUrl(Guid tenantId,string? hash){if(string.IsNullOrWhiteSpace(hash))return "";var root=(Environment.GetEnvironmentVariable("PUBLIC_BASE_URL")??"https://automate-api-production.up.railway.app").TrimEnd('/');return $"{root}/branding/{tenantId:D}/logo/{Uri.EscapeDataString(hash.Trim().ToLowerInvariant())}";}
+static string RemoveEmptyLogoImages(string html)=>Regex.Replace(html,"<img\\b(?=[^>]*(?:class=\\\"[^\\\"]*company-logo|alt=\\\"[^\\\"]*company))(?=[^>]*src=\\\"\\s*\\\")[^>]*>","",RegexOptions.IgnoreCase);
+
+static async Task EnsureTenantCompanyBrandingAsync(NpgsqlConnection conn,CancellationToken ct=default)
+{
+    const string sql=@"CREATE TABLE IF NOT EXISTS public.tenant_company_branding(tenant_id uuid PRIMARY KEY,company_name text NOT NULL DEFAULT '',logo_bytes bytea NOT NULL,logo_content_type text NOT NULL,logo_sha256 text NOT NULL,source_name text NOT NULL DEFAULT 'THREED',updated_at timestamptz NOT NULL DEFAULT NOW());CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_company_branding_hash ON public.tenant_company_branding(tenant_id,logo_sha256);";
+    await using var cmd=new NpgsqlCommand(sql,conn);await cmd.ExecuteNonQueryAsync(ct);
+}
+
+static async Task<(string CompanyName,string LogoUrl)> LoadTenantEmailBrandingAsync(NpgsqlConnection conn,Guid tenantId,CancellationToken ct)
+{
+    await EnsureTenantCompanyBrandingAsync(conn,ct);
+    const string sql=@"SELECT COALESCE(NULLIF(b.company_name,''),(SELECT NULLIF(i.company_name,'') FROM public.inspectors i WHERE i.tenant_id::text=b.tenant_id::text ORDER BY i.created_at LIMIT 1),''),b.logo_sha256 FROM public.tenant_company_branding b WHERE b.tenant_id=@tenant";
+    await using var cmd=new NpgsqlCommand(sql,conn);cmd.Parameters.AddWithValue("tenant",tenantId);
+    await using var reader=await cmd.ExecuteReaderAsync(ct);if(!await reader.ReadAsync(ct))return ("","");
+    return (reader.GetString(0),CompanyLogoPublicUrl(tenantId,reader.GetString(1)));
 }
 
 static string RenderTemplateTokens(string template, Dictionary<string, string> fields, bool htmlEncode)
@@ -11399,8 +13693,9 @@ static object[] GetBasicEmailTemplatePlaceholders() => new[]
 {
     P("PROPERTY_ADDRESS","Property Address"), P("INSPECTION_DATE","Inspection Date"), P("INSPECTION_TIME","Inspection Time"), P("INSPECTION_END_TIME","Inspection End Time"),
     P("SERVICES","Services"), P("PRIMARY_SERVICE","Primary Service"), P("ADDITIONAL_SERVICES","Additional Services"),
-    P("CLIENT_FIRST_NAME","Client First Name"), P("CLIENT_LAST_NAME","Client Last Name"), P("CLIENT_DISPLAY_NAME","Client Display Name"), P("CLIENT_SALUTATION","Client Salutation"), P("CLIENT_EMAIL","Client Email"), P("CLIENT_PHONE","Client Phone"),
-    P("AGENT_FIRST_NAME","Agent First Name"), P("AGENT_LAST_NAME","Agent Last Name"), P("AGENT_DISPLAY_NAME","Agent Display Name"), P("AGENT_SALUTATION","Agent Salutation"), P("AGENT_EMAIL","Agent Email"), P("AGENT_PHONE","Agent Phone"),
+    P("CLIENT_FIRST_NAME","Client First Name"), P("CLIENT_LAST_NAME","Client Last Name"), P("CLIENT_DISPLAY_NAME","Client Display Name"), P("CLIENT_SALUTATION","Client Salutation"), P("CLIENT_EMAIL","Client Email"), P("CLIENT_PHONE","Client Phone"), P("CLIENT_COMPANY_NAME","Client Company"), P("CLIENT_CONTACT_NAME","Client Company Contact"), P("CLIENT_ADDRESS","Client Address"),
+    P("AGENT_FIRST_NAME","Agent First Name"), P("AGENT_LAST_NAME","Agent Last Name"), P("AGENT_DISPLAY_NAME","Agent Display Name"), P("AGENT_SALUTATION","Agent Salutation"), P("AGENT_EMAIL","Agent Email"), P("AGENT_PHONE","Agent Phone"), P("AGENT_COMPANY_NAME","Agent Company"), P("AGENT_CONTACT_NAME","Agent Company Contact"), P("AGENT_FULL_ADDRESS","Agent Address"),
+    P("RECIPIENT_FIRST_NAME","Recipient First Name"), P("RECIPIENT_LAST_NAME","Recipient Last Name"), P("RECIPIENT_DISPLAY_NAME","Recipient Display Name"), P("RECIPIENT_SALUTATION","Recipient Salutation"), P("RECIPIENT_EMAIL","Recipient Email"), P("RECIPIENT_PHONE","Recipient Phone"), P("RECIPIENT_LABEL","Recipient Label"), P("RECIPIENT_COMPANY_NAME","Recipient Company"), P("RECIPIENT_CONTACT_NAME","Recipient Company Contact"), P("RECIPIENT_ADDRESS","Recipient Address"),
     P("INSPECTOR_NAME","Inspector Name"), P("INSPECTOR_FIRST_NAME","Inspector First Name"), P("INSPECTOR_EMAIL","Inspector Email"), P("INSPECTOR_PHONE","Inspector Phone"), P("COMPANY_NAME","Company Name"), P("COMPANY_LOGO_URL","Company Logo"),
     P("INVOICE_TOTAL","Invoice Total"), P("AMOUNT_PAID","Amount Paid"), P("BALANCE_DUE","Balance Due"), P("INVOICE_LINE_ITEMS","Invoice Line Items")
 };
@@ -11409,9 +13704,11 @@ static object[] GetBasicEmailTemplatePlaceholderCategories() => new object[]
 {
     new { category="Job Details", placeholders=new[]{ P("PROPERTY_ADDRESS","Property Address"),P("INSPECTION_DATE","Inspection Date"),P("INSPECTION_TIME","Inspection Time"),P("INSPECTION_END_TIME","Inspection End Time") } },
     new { category="Services", placeholders=new[]{ P("SERVICES","Services"),P("PRIMARY_SERVICE","Primary Service"),P("ADDITIONAL_SERVICES","Additional Services") } },
-    new { category="Client Contact", placeholders=new[]{ P("CLIENT_FIRST_NAME","First Name"),P("CLIENT_LAST_NAME","Last Name"),P("CLIENT_DISPLAY_NAME","Display Name"),P("CLIENT_SALUTATION","Salutation"),P("CLIENT_EMAIL","Email"),P("CLIENT_PHONE","Phone") } },
-    new { category="Agent Contact", placeholders=new[]{ P("AGENT_FIRST_NAME","First Name"),P("AGENT_LAST_NAME","Last Name"),P("AGENT_DISPLAY_NAME","Display Name"),P("AGENT_SALUTATION","Salutation"),P("AGENT_EMAIL","Email"),P("AGENT_PHONE","Phone") } },
+    new { category="Client Contact", placeholders=new[]{ P("CLIENT_FIRST_NAME","First Name"),P("CLIENT_LAST_NAME","Last Name"),P("CLIENT_DISPLAY_NAME","Display Name"),P("CLIENT_SALUTATION","Salutation"),P("CLIENT_EMAIL","Email"),P("CLIENT_PHONE","Phone"),P("CLIENT_COMPANY_NAME","Company"),P("CLIENT_CONTACT_NAME","Company Contact"),P("CLIENT_ADDRESS","Address") } },
+    new { category="Agent Contact", placeholders=new[]{ P("AGENT_FIRST_NAME","First Name"),P("AGENT_LAST_NAME","Last Name"),P("AGENT_DISPLAY_NAME","Display Name"),P("AGENT_SALUTATION","Salutation"),P("AGENT_EMAIL","Email"),P("AGENT_PHONE","Phone"),P("AGENT_COMPANY_NAME","Company"),P("AGENT_CONTACT_NAME","Company Contact"),P("AGENT_FULL_ADDRESS","Address") } },
+    new { category="Current Recipient", placeholders=new[]{ P("RECIPIENT_FIRST_NAME","First Name"),P("RECIPIENT_LAST_NAME","Last Name"),P("RECIPIENT_DISPLAY_NAME","Display Name"),P("RECIPIENT_SALUTATION","Salutation"),P("RECIPIENT_EMAIL","Email"),P("RECIPIENT_PHONE","Phone"),P("RECIPIENT_LABEL","THREED Label"),P("RECIPIENT_COMPANY_NAME","Company"),P("RECIPIENT_CONTACT_NAME","Company Contact"),P("RECIPIENT_ADDRESS","Address") } },
     new { category="Inspector and Company", placeholders=new[]{ P("INSPECTOR_NAME","Inspector Name"),P("INSPECTOR_FIRST_NAME","Inspector First Name"),P("INSPECTOR_EMAIL","Inspector Email"),P("INSPECTOR_PHONE","Inspector Phone"),P("COMPANY_NAME","Company Name"),P("COMPANY_LOGO_URL","Company Logo") } },
+    new { category="Buttons", placeholders=new[]{ P("INSPECTION_DETAILS_BUTTON","View inspection details button"),P("QUOTE_DETAILS_BUTTON","View quote button") } },
     new { category="Invoice Details", placeholders=new[]{ P("INVOICE_TOTAL","Invoice Total"),P("AMOUNT_PAID","Amount Paid"),P("BALANCE_DUE","Balance Due"),P("INVOICE_LINE_ITEMS","Invoice Line Items") } }
 };
 
@@ -12368,8 +14665,8 @@ static DateTime? ParseNullableDateTime(string? value)
     if (string.IsNullOrWhiteSpace(value))
         return null;
 
-    if (DateTime.TryParse(value, out var parsed))
-        return parsed;
+    if (DateTimeOffset.TryParse(value, out var parsed))
+        return parsed.UtcDateTime;
 
     return null;
 }
@@ -12682,6 +14979,7 @@ CREATE TABLE IF NOT EXISTS public.job_invoice_lines
 (
     job_id uuid NOT NULL,
     line_index integer NOT NULL,
+    item_id text NULL,
     description text NULL,
     quantity decimal(10,2) NOT NULL DEFAULT 1,
     unit_price decimal(10,2) NOT NULL DEFAULT 0,
@@ -12689,6 +14987,9 @@ CREATE TABLE IF NOT EXISTS public.job_invoice_lines
     updated_at timestamptz NOT NULL DEFAULT NOW(),
     PRIMARY KEY (job_id, line_index)
 );
+
+ALTER TABLE public.job_invoice_lines
+ADD COLUMN IF NOT EXISTS item_id text NULL;
 
 CREATE INDEX IF NOT EXISTS idx_job_invoice_lines_job_id
 ON public.job_invoice_lines(job_id);";
@@ -12715,6 +15016,7 @@ INSERT INTO public.job_invoice_lines
 (
     job_id,
     line_index,
+    item_id,
     description,
     quantity,
     unit_price,
@@ -12725,6 +15027,7 @@ VALUES
 (
     @job_id,
     @line_index,
+    @item_id,
     @description,
     @quantity,
     @unit_price,
@@ -12733,6 +15036,7 @@ VALUES
 )
 ON CONFLICT (job_id, line_index)
 DO UPDATE SET
+    item_id = EXCLUDED.item_id,
     description = EXCLUDED.description,
     quantity = EXCLUDED.quantity,
     unit_price = EXCLUDED.unit_price,
@@ -12740,15 +15044,21 @@ DO UPDATE SET
 
     foreach (var line in payload.InvoiceLines.OrderBy(line => line.LineIndex))
     {
-        var lineIndex = line.LineIndex <= 0 ? payload.InvoiceLines.IndexOf(line) + 1 : line.LineIndex;
+        // THREED uses valid zero-based invoice line indexes. Treating zero as
+        // missing collides with row 1 and overwrites the base-service line.
+        var lineIndex = line.LineIndex < 0 ? payload.InvoiceLines.IndexOf(line) : line.LineIndex;
         var quantity = line.Quantity <= 0m ? 1m : line.Quantity;
+        var unitPrice = line.Amount != 0m && (line.UnitPrice == 0m || Math.Abs(line.UnitPrice * quantity - line.Amount) > 0.01m)
+            ? line.Amount / quantity
+            : line.UnitPrice;
 
         await using var cmd = new NpgsqlCommand(insertSql, conn);
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("line_index", lineIndex);
+        cmd.Parameters.AddWithValue("item_id", (object?)line.ItemId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("description", line.Description ?? "");
         cmd.Parameters.AddWithValue("quantity", quantity);
-        cmd.Parameters.AddWithValue("unit_price", line.UnitPrice);
+        cmd.Parameters.AddWithValue("unit_price", unitPrice);
         await cmd.ExecuteNonQueryAsync();
     }
 }
@@ -13036,7 +15346,7 @@ static bool TryGetMappingGuardJobId(HttpRequest request, out Guid jobId)
     var path = request.Path.Value ?? "";
     var patterns = new[]
     {
-        @"^/jobs/(?<job>[0-9a-f-]{36})/(?:schedule|cancel-unschedule|email-templates/booking-email/send|communications/client-email/prepare)$",
+        @"^/jobs/(?<job>[0-9a-f-]{36})/(?:schedule|email-templates/booking-email/send|communications/client-email/prepare)$",
         @"^/jobs/(?<job>[0-9a-f-]{36})/automation/basic/(?:queue/[0-9a-f-]{36}/approve|production/[0-9a-f-]{36}/claim)$",
         @"^/integrations/(?:xero/jobs/(?<job>[0-9a-f-]{36})/create-draft-invoice|signnow/jobs/(?<job>[0-9a-f-]{36})/(?:send-terms|ensure-webhook))$"
     };
@@ -13284,6 +15594,7 @@ public record XeroAccountResult(
 
 public record XeroInvoiceJobInput(
     Guid JobId,
+    Guid TenantId,
     Guid InspectorId,
     string JobName,
     string SiteAddress,
@@ -13347,6 +15658,19 @@ public record IntegrationAccountResult(
         return new IntegrationAccountResult(false, null, null, null, null, errorMessage);
     }
 }
+
+public sealed record TravelCalendarRefreshRequest(Guid TenantId,bool Confirmed);
+public sealed record CompanyGoogleCalendarCreateRequest(Guid TenantId,string Name,bool Confirmed);
+public sealed record TravelJobInput(Guid TenantId,Guid JobId,Guid InspectorId,string InspectorName,string SiteAddress,DateTime? JobDate,int InspectionDurationMinutes,string Timezone);
+public sealed record TravelRouteLeg(bool Success,int DistanceMetres,int DurationSeconds,string Error)
+{
+    public static TravelRouteLeg Failed(string error)=>new(false,0,0,error);
+}
+public sealed record TravelCalculation(bool Success,string BaseAddress,string PropertyAddress,int OutboundDistanceMetres,int OutboundDurationSeconds,int ReturnDistanceMetres,int ReturnDurationSeconds,int RoundTripDistanceMetres,string EstimateType,DateTimeOffset CalculatedAt,string Fingerprint,string Error)
+{
+    public static TravelCalculation Failed(string error)=>new(false,"","",0,0,0,0,0,"unavailable",DateTimeOffset.UtcNow,"",error);
+}
+public sealed record TravelCalendarResult(bool Success,string Message,string EventId,string HtmlLink);
 
 public class SignNowTemplateMappingsRequest
 {
@@ -13585,15 +15909,15 @@ WHERE job_id=@job_id AND source=@source AND address_fingerprint=@fingerprint
 
 public static async Task StorePropertyFeaturesResultAsync(NpgsqlConnection conn, Guid jobId, PropertyFeaturesResult result)
 {
-    const string sql = @"UPDATE public.jobs_staging SET property_features_json=CASE WHEN @status='available' THEN CAST(@json AS jsonb) ELSE property_features_json END,
+    const string sql = @"UPDATE public.jobs_staging SET property_features_json=CASE WHEN @status='available' THEN CAST(@json AS jsonb) ELSE NULL END,
 property_features_status=@status,property_features_address_fingerprint=@fingerprint,property_features_retrieved_at=@retrieved,property_features_error=@error WHERE job_id=@job_id";
     await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("status", result.Status); cmd.Parameters.AddWithValue("json", JsonSerializer.Serialize(result)); cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint); cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt); cmd.Parameters.AddWithValue("error", result.Error); await cmd.ExecuteNonQueryAsync();
 }
 
 public static async Task StoreBranzResultAsync(NpgsqlConnection conn, Guid jobId, BranzLookupResult result)
 {
-    const string sql = @"UPDATE public.jobs_staging SET branz_wind_zone=CASE WHEN @status='available' THEN @wind ELSE branz_wind_zone END,
-branz_exposure_zone=CASE WHEN @status='available' THEN @exposure ELSE branz_exposure_zone END,branz_lookup_status=@status,branz_latitude=@latitude,branz_longitude=@longitude,
+    const string sql = @"UPDATE public.jobs_staging SET branz_wind_zone=CASE WHEN @status='available' THEN @wind ELSE NULL END,
+branz_exposure_zone=CASE WHEN @status='available' THEN @exposure ELSE NULL END,branz_lookup_status=@status,branz_latitude=@latitude,branz_longitude=@longitude,
 branz_address_fingerprint=@fingerprint,branz_retrieved_at=@retrieved,branz_lookup_error=@error WHERE job_id=@job_id";
     await using var cmd = new NpgsqlCommand(sql, conn); cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("status", result.Status); cmd.Parameters.AddWithValue("wind", result.WindZone); cmd.Parameters.AddWithValue("exposure", result.ExposureZone); cmd.Parameters.AddWithValue("latitude", result.Latitude.HasValue ? result.Latitude.Value : DBNull.Value); cmd.Parameters.AddWithValue("longitude", result.Longitude.HasValue ? result.Longitude.Value : DBNull.Value); cmd.Parameters.AddWithValue("fingerprint", result.AddressFingerprint); cmd.Parameters.AddWithValue("retrieved", result.RetrievedAt); cmd.Parameters.AddWithValue("error", result.Error); await cmd.ExecuteNonQueryAsync();
 }
@@ -13602,6 +15926,30 @@ public static async Task AuditOnlinePropertyLookupAsync(NpgsqlConnection conn, G
 {
     await using var cmd = new NpgsqlCommand("INSERT INTO public.online_property_lookup_audit(job_id,tenant_id,source,address_fingerprint,reason,outcome,error) VALUES(@job_id,@tenant_id,@source,@fingerprint,@reason,@outcome,@error)", conn);
     cmd.Parameters.AddWithValue("job_id", jobId); cmd.Parameters.AddWithValue("tenant_id", tenantId == Guid.Empty ? DBNull.Value : tenantId); cmd.Parameters.AddWithValue("source", source); cmd.Parameters.AddWithValue("fingerprint", fingerprint); cmd.Parameters.AddWithValue("reason", reason); cmd.Parameters.AddWithValue("outcome", outcome); cmd.Parameters.AddWithValue("error", error ?? ""); await cmd.ExecuteNonQueryAsync();
+}
+
+public static async Task<int> RepairMismatchedOnlinePropertyDataAsync(NpgsqlConnection conn)
+{
+    var invalid=new List<(Guid JobId,string SiteAddress,string MatchedAddress)>();
+    await using(var read=new NpgsqlCommand(@"SELECT job_id,site_address,property_features_json
+FROM public.jobs_staging WHERE property_features_status='available' AND property_features_json IS NOT NULL",conn))
+    await using(var reader=await read.ExecuteReaderAsync())
+    while(await reader.ReadAsync())
+    {
+        var site=reader["site_address"]?.ToString()??"";var json=reader["property_features_json"]?.ToString()??"";string matched="";
+        try{matched=JsonSerializer.Deserialize<PropertyFeaturesResult>(json)?.FormattedAddress??"";}catch(JsonException){}
+        if(string.IsNullOrWhiteSpace(matched)||!StructuredAddressResolver.IsAcceptableMatch(site,matched))invalid.Add(((Guid)reader["job_id"],site,matched));
+    }
+    foreach(var item in invalid)
+    {
+        const string errorPrefix="Stored property match rejected because it does not match the current THREED locality/postcode.";
+        await using var update=new NpgsqlCommand(@"UPDATE public.jobs_staging SET
+property_features_json=NULL,property_features_status='stale',property_features_retrieved_at=NULL,property_features_error=@error,
+branz_wind_zone=NULL,branz_exposure_zone=NULL,branz_lookup_status='stale',branz_latitude=NULL,branz_longitude=NULL,branz_retrieved_at=NULL,branz_lookup_error=@error
+WHERE job_id=@job_id",conn);
+        update.Parameters.AddWithValue("job_id",item.JobId);update.Parameters.AddWithValue("error",$"{errorPrefix} THREED: {item.SiteAddress}. Rejected: {item.MatchedAddress}.");await update.ExecuteNonQueryAsync();
+    }
+    return invalid.Count;
 }
 }
 
@@ -13654,6 +16002,12 @@ public record ScheduleJobInput(
     string ClientRoleLabel,
     string ClientEmail,
     string ClientPhone,
+    string ClientCompanyName,
+    string ClientContactName,
+    string ClientAddress,
+    string ClientCity,
+    string ClientState,
+    string ClientPostalCode,
     string AgentName,
     string AgentFirstName,
     string AgentLastName,
@@ -13662,8 +16016,15 @@ public record ScheduleJobInput(
     string AgentRoleLabel,
     string AgentEmail,
     string AgentPhone,
+    string AgentCompanyName,
+    string AgentContactName,
+    string AgentAddress,
+    string AgentCity,
+    string AgentState,
+    string AgentPostalCode,
     string Timezone,
     string CompanyName,
+    string CompanyLogoUrl,
     string EmailFromName,
     string EmailFromAddress,
     string Phone,
@@ -13679,7 +16040,9 @@ public class JobUploadRequest
     public List<InvoiceLineSection> InvoiceLines { get; set; } = new();
     public ContactFlat Contact1 { get; set; } = new ContactFlat();
     public ContactFlat Contact2 { get; set; } = new ContactFlat();
+    public List<ContactFlat> Contacts { get; set; } = new();
     public MetaSection Meta { get; set; } = new MetaSection();
+    public Dictionary<string,string> RawCustomFields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed class AuthenticatedAutomationIdentityException : Exception
@@ -13703,6 +16066,13 @@ public sealed class ClientEngagementSettingsRequest
     public Guid TenantId { get; set; }
     public bool OpenTrackingEnabled { get; set; }
     public bool ClientPageEnabled { get; set; }
+    public string IntroductionText { get; set; } = "Hello {{CLIENT_SALUTATION}}. Here are the approved details for your inspection.";
+    public string PaymentInstruction { get; set; } = "Your invoice will be sent to {{CLIENT_EMAIL}}. Payment is required to secure your booking time.";
+    public string BankAccountName { get; set; } = "";
+    public string BankAccountNumber { get; set; } = "";
+    public string PaymentReferenceInstruction { get; set; } = "";
+    public bool ShowBankWithAccounting { get; set; }
+    public string BrandColour { get; set; } = "#0b5f86";
     public int ExpectedVersion { get; set; }
     public string IdempotencyKey { get; set; } = "";
     public bool Confirmed { get; set; }
@@ -13755,6 +16125,7 @@ public sealed class BasicAutomationRenderRequest : BasicAutomationTemplateReques
 {
     public string EventKey { get; set; } = "";
     public string RecipientKey { get; set; } = "";
+    public Dictionary<string,string> RawCustomFields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed class BasicProductionArmRequest
@@ -13770,6 +16141,47 @@ public class BasicProductionCommandRequest
 {
     public Guid TenantId { get; set; }
     public bool Confirmed { get; set; }
+}
+
+public class BasicSchedulingModeRequest
+{
+    public Guid TenantId { get; set; }
+    public string Mode { get; set; } = "manual";
+    public bool Confirmed { get; set; }
+    public bool AutomaticDataWarningConfirmed { get; set; }
+}
+
+public class BasicChangeActionCommandRequest
+{
+    public Guid TenantId { get; set; }
+    public string ConfirmationText { get; set; } = "";
+}
+
+public sealed class LiveChangeActionCommandRequest : BasicChangeActionCommandRequest
+{
+    public string ExpectedFingerprint { get; set; } = "";
+}
+
+public sealed class BasicChangeActionCompleteRequest : BasicChangeActionCommandRequest
+{
+    public bool Succeeded { get; set; }
+    public string ExternalId { get; set; } = "";
+    public string ErrorCode { get; set; } = "";
+    public string ErrorMessage { get; set; } = "";
+}
+
+public sealed class PilotScheduleProviderRequest : BasicProductionCommandRequest
+{
+    public bool FullRetest { get; set; }
+    public bool ForceTestRerun { get; set; }
+    public bool ReplaceUnsignedAgreement { get; set; }
+    public string Action { get; set; } = "all";
+    public string ConfirmationText { get; set; } = "";
+}
+
+public sealed class SchedulingRerunRequest : BasicProductionCommandRequest
+{
+    public string Action { get; set; } = "all";
 }
 
 public sealed class BasicProductionCompleteRequest : BasicProductionCommandRequest
@@ -13839,6 +16251,7 @@ public class JobSection
     public string SourceUpdatedAtUtc { get; set; } = "";
     public string DateAddedUtc { get; set; } = "";
     public string Status { get; set; } = "";
+    public bool ThreedComplete { get; set; }
     public string ZapProcessed { get; set; } = "";
     public string ReportSent { get; set; } = "";
     public string InvoiceTotal { get; set; } = "";
@@ -13892,6 +16305,7 @@ public class JobDetailsSection
     public string Stories { get; set; } = "";
     public string Bedrooms { get; set; } = "";
     public string Bathrooms { get; set; } = "";
+    public string FloorArea { get; set; } = "";
     public string Monolithic { get; set; } = "";
     public string Outbuilding { get; set; } = "";
     public string Occupied { get; set; } = "";
@@ -13913,20 +16327,30 @@ public class ContactFlat
     public string ContactId { get; set; } = "";
     public int ContactIndex { get; set; } = -1;
     public string RoleLabel { get; set; } = "";
+    public string RoleId { get; set; } = "";
     public string DisplayName { get; set; } = "";
+    public string PersonDisplayName { get; set; } = "";
     public string Salutation { get; set; } = "";
     public string FirstName { get; set; } = "";
     public string LastName { get; set; } = "";
     public string Email { get; set; } = "";
     public string Cellular { get; set; } = "";
+    public string CompanyId { get; set; } = "";
+    public string CompanyName { get; set; } = "";
+    public string Address { get; set; } = "";
+    public string City { get; set; } = "";
+    public string State { get; set; } = "";
+    public string PostalCode { get; set; } = "";
 }
 
 public class InvoiceLineSection
 {
+    public string ItemId { get; set; } = "";
     public int LineIndex { get; set; }
     public string Description { get; set; } = "";
     public decimal Quantity { get; set; } = 1m;
     public decimal UnitPrice { get; set; }
+    public decimal Amount { get; set; }
 }
 
 public class MetaSection
@@ -13943,8 +16367,14 @@ public class AutomationRuleSaveRequest
     public string Name { get; set; } = "";
     public string EventKey { get; set; } = "";
     public bool Enabled { get; set; }
-    public List<AutomationCondition> Conditions { get; set; } = new();
+    public bool Confirmed { get; set; }
+    public List<AutomationConditionGroup> ConditionGroups { get; set; } = new();
     public List<AutomationActionDefinition> Actions { get; set; } = new();
+}
+
+public class AutomationConditionGroup
+{
+    public List<AutomationCondition> Conditions { get; set; } = new();
 }
 
 public class AutomationCondition
@@ -13959,6 +16389,7 @@ public class AutomationActionDefinition
     public string ActionKey { get; set; } = "";
     public string Timing { get; set; } = "immediate";
     public Dictionary<string, string> Settings { get; set; } = new();
+    public List<AutomationConditionGroup> ConditionGroups { get; set; } = new();
 }
 
 public class AutomationRulePreviewRequest
@@ -13976,6 +16407,38 @@ public class AutomationEventRequest
     public Dictionary<string, string> Fields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
+public sealed class ThreeDCompanyLogoRequest
+{
+    public Guid TenantId { get; set; }
+    public string CompanyName { get; set; } = "";
+    public string ContentType { get; set; } = "";
+    public string Base64Data { get; set; } = "";
+}
+
 public record AutomationConditionEvaluation(string FieldKey, string Operator, string Expected, string Actual, bool Matched);
-public record AutomationRuleMatch(Guid RuleId, string RuleName, List<AutomationConditionEvaluation> Conditions, List<AutomationActionDefinition> Actions);
+public record AutomationConditionGroupEvaluation(int Group,List<AutomationConditionEvaluation> Conditions,bool Matched);
+public record AutomationRuleMatch(Guid RuleId, string RuleName,int Version,List<AutomationConditionGroupEvaluation> ConditionGroups, List<AutomationActionDefinition> Actions);
+public sealed record AdvancedWorkflowModeRequest(Guid TenantId,string Mode,int ExpectedVersion,bool Confirmed);
 public record SignNowWebhookRegistrationResult(bool Success, string SubscriptionId, string Error);
+public record ProviderWebhookRegistrationResult(bool Success,string SubscriptionId,string Error);
+public sealed record XeroReferenceUpdateRequest(Guid TenantId,string ExpectedInvoiceId,string ExpectedReference,string NewReference,string IdempotencyKey,bool Confirmed);
+public sealed record XeroReferenceResendRequest(Guid TenantId,string ExpectedInvoiceId,string IdempotencyKey,bool Confirmed);
+public sealed record XeroNoCorrectionRequest(Guid TenantId,string Reason,string IdempotencyKey,bool Confirmed);
+public sealed record JobReconciliationAcceptRequest(Guid TenantId,string ExpectedCurrentFingerprint,string IdempotencyKey,bool Confirmed);
+public sealed record CreditReviewCompleteRequest(Guid TenantId,string ExpectedCurrentFingerprint,string ExpectedTargetFingerprint,string Outcome,string IdempotencyKey,bool Confirmed);
+public sealed record AdditionalInvoiceCommandRequest(Guid TenantId,string ExpectedTargetFingerprint,string IdempotencyKey,bool Confirmed);
+public sealed record AdditionalInvoiceSendRequest(Guid TenantId,string InvoiceId,string IdempotencyKey,bool Confirmed);
+public sealed record XeroContactCorrectionRequest(Guid TenantId,string ExpectedInvoiceId,string ExpectedContactId,string ExpectedEmail,string NewName,string IdempotencyKey,bool Confirmed);
+public sealed record XeroLiveInvoiceEvidence(bool Success,string InvoiceId,string InvoiceNumber,string Status,string Reference,decimal? Total,string ContactId,string ContactName,string ContactEmail,string Error);
+public sealed record XeroRepairAuditReplay(string ActionKey,DateTimeOffset CreatedAt);
+public sealed record XeroOriginalInvoiceView(string InvoiceId,string InvoiceNumber,string Status,string Reference,decimal Total,string ContactId,string ContactName,string ContactEmail);
+public sealed record ActionLedgerMigrationRequest(Guid TenantId,bool Confirmed);
+public sealed record XeroAdditionalInvoiceView(string InvoiceId,string InvoiceNumber,string Status,decimal Total,DateTimeOffset CreatedAt,DateTimeOffset? SentAt,bool Verified,string LastError);
+public sealed record InvoiceAdjustmentItemView(string Description,string Evidence);
+public sealed record JobReconciliationResponse(Guid JobId,int ApprovedVersion,string CurrentFingerprint,string TargetFingerprint,bool NeedsUpdate,bool ChangeReviewPending,bool AttentionRequired,bool CreditReviewCompleted,JsonElement AcceptedSnapshot,JsonElement CurrentSnapshot,IReadOnlyList<JobFieldChange> Changes,XeroOriginalInvoiceView OriginalInvoice,IReadOnlyList<XeroAdditionalInvoiceView> AdditionalInvoices,decimal TotalInvoiced,decimal CurrentThreeDTotal,decimal RemainingDifference,string Action,string Message,bool ProviderVerified,bool CanCreateAdditionalInvoice,bool CanUpdateReference,bool CanCorrectContact,string ProposedReference,string ProposedContactName,string ProposedContactEmail,IReadOnlyList<InvoiceAdjustmentItemView> AdjustmentItems,DateTimeOffset VerifiedAt);
+public sealed record GoogleDriveRoot(string Id,string Name,string WebUrl);
+public sealed record GoogleDriveAccessResult(bool Success,string AccessToken,string Error);
+public sealed record AgreementProviderAccessResult(bool Success,string AccessToken,string ApiBaseUri,string ExternalAccountId,string Error);
+public sealed record ProviderAgreementCancellationResult(bool Success,bool Signed,string ProviderStatus,string Error);
+public sealed record AgreementWebhookApplyResult(Guid? TenantId,string Error);
+public sealed record MicrosoftCalendarAccessResult(bool Success,string AccessToken,string AccountEmail,string Error);

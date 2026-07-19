@@ -12,7 +12,7 @@ public static class BasicAutomationSupport
     public const string TemplateType = "basic_automation";
 
     public static readonly IReadOnlyList<string> EventKeys =
-        new[] { "scheduling", "rescheduling", "cancellation", "service_change" };
+        new[] { "scheduling", "rescheduling", "cancellation", "service_change", "publishing" };
 
     public static readonly IReadOnlyList<string> RecipientKeys =
         new[] { "contact_1", "contact_2" };
@@ -38,6 +38,7 @@ public static class BasicAutomationSupport
             "rescheduling" => "Rescheduling",
             "cancellation" => "Cancellation",
             "service_change" => "Service Change",
+            "publishing" => "Publishing",
             _ => throw new InvalidOperationException()
         };
         return $"{eventLabel} - {CleanLabel(recipientLabel)}";
@@ -59,7 +60,7 @@ public static class BasicAutomationSupport
                 setting_version integer NOT NULL DEFAULT 1,
                 PRIMARY KEY (tenant_id, event_key, recipient_key),
                 CONSTRAINT ck_basic_automation_event
-                    CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change')),
+                    CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change','publishing')),
                 CONSTRAINT ck_basic_automation_recipient
                     CHECK (recipient_key IN ('contact_1','contact_2'))
             );
@@ -82,7 +83,7 @@ public static class BasicAutomationSupport
                 updated_at timestamptz NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (tenant_id, job_id, revision_key, event_key, recipient_key),
                 CONSTRAINT ck_basic_execution_event
-                    CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change')),
+                    CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change','publishing')),
                 CONSTRAINT ck_basic_execution_recipient
                     CHECK (recipient_key IN ('contact_1','contact_2')),
                 CONSTRAINT ck_basic_execution_state
@@ -93,6 +94,13 @@ public static class BasicAutomationSupport
             ALTER TABLE public.email_templates ADD COLUMN IF NOT EXISTS archived_at timestamptz NULL;
             ALTER TABLE public.email_templates ADD COLUMN IF NOT EXISTS basic_event_key text NULL;
             ALTER TABLE public.email_templates ADD COLUMN IF NOT EXISTS basic_recipient_key text NULL;
+
+            ALTER TABLE public.basic_automation_settings DROP CONSTRAINT IF EXISTS ck_basic_automation_event;
+            ALTER TABLE public.basic_automation_settings ADD CONSTRAINT ck_basic_automation_event
+                CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change','publishing'));
+            ALTER TABLE public.basic_automation_executions DROP CONSTRAINT IF EXISTS ck_basic_execution_event;
+            ALTER TABLE public.basic_automation_executions ADD CONSTRAINT ck_basic_execution_event
+                CHECK (event_key IN ('scheduling','rescheduling','cancellation','service_change','publishing'));
 
             CREATE UNIQUE INDEX IF NOT EXISTS uq_email_templates_basic_tenant_slot
                 ON public.email_templates(tenant_id, basic_event_key, basic_recipient_key)
@@ -106,7 +114,7 @@ public static class BasicAutomationSupport
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    /// <summary>Creates all eight settings rows. Only Scheduling/Contact 1 is enabled initially.</summary>
+    /// <summary>Creates the eight legacy recipient slots plus Client-only Publishing. Only Scheduling/Contact 1 is enabled initially.</summary>
     public static async Task EnsureTenantDefaultsAsync(
         NpgsqlConnection connection,
         Guid tenantId,
@@ -119,6 +127,8 @@ public static class BasicAutomationSupport
                    (event_key='scheduling' AND recipient_key='contact_1')
             FROM unnest(ARRAY['scheduling','rescheduling','cancellation','service_change']) event_key
             CROSS JOIN unnest(ARRAY['contact_1','contact_2']) recipient_key
+            UNION ALL
+            SELECT @tenant,'publishing','contact_1',false
             ON CONFLICT (tenant_id,event_key,recipient_key) DO NOTHING;
             """;
         await using var command = new NpgsqlCommand(sql, connection);
@@ -140,7 +150,7 @@ public static class BasicAutomationSupport
             LEFT JOIN public.email_templates t
               ON t.template_id=s.template_id AND t.tenant_id=s.tenant_id AND t.archived_at IS NULL
             WHERE s.tenant_id=@tenant
-            ORDER BY array_position(ARRAY['scheduling','rescheduling','cancellation','service_change'],s.event_key),
+            ORDER BY array_position(ARRAY['scheduling','rescheduling','cancellation','service_change','publishing'],s.event_key),
                      array_position(ARRAY['contact_1','contact_2'],s.recipient_key);
             """;
         await using var command = new NpgsqlCommand(sql, connection);
